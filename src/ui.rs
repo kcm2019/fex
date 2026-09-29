@@ -740,7 +740,7 @@ fn render_sheet(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_widget(para, layout[0]);
 
         let status = format!(
-            "Row {}/{} · Col {}/{} · Enter edit · Tab next · a row · A column · Ctrl+S save · Esc close",
+            "Row {}/{} · Col {}/{} · Enter edit · Tab next · a row · A column · Ctrl+S/O save · Esc close",
             sh.row + 1,
             sh.rows.len(),
             sh.col + 1,
@@ -1136,26 +1136,45 @@ fn render_editor(frame: &mut Frame, app: &mut App, area: Rect) {
         } else {
             0
         };
+        // Text width inside the border and gutter: long lines wrap to it.
+        ed.wrap_w = (layout[0].width as usize)
+            .saturating_sub(2 + gutter_w as usize)
+            .max(1);
 
-        let visible = ed.highlight_visible(&th, ed.offset, ed.view_h);
+        let visible = ed.highlight_visible_wrapped(&th, ed.offset, ed.view_h);
         let text: Vec<Line> = visible
             .into_iter()
-            .enumerate()
-            .map(|(j, spans)| {
-                let lineno = ed.offset + j + 1;
+            .map(|w| {
+                // Only a line's first segment gets its number; continuation
+                // segments get a blank gutter so wrapped lines read as one.
                 let mut v = if ed.show_line_numbers {
-                    vec![Span::styled(
-                        format!("{lineno:>num_w$} "),
-                        Style::default().fg(th.dim),
-                    )]
+                    vec![if w.first {
+                        Span::styled(
+                            format!("{:>num_w$} ", w.buf_row + 1),
+                            Style::default().fg(th.dim),
+                        )
+                    } else {
+                        Span::styled(" ".repeat(num_w + 1), Style::default().fg(th.dim))
+                    }]
                 } else {
                     Vec::new()
                 };
                 // Mouse selections render reversed; the gutter is never part
-                // of the selection, so it can't be copied by accident.
-                let spans = match sel_range_for_row(ed, ed.offset + j) {
-                    Some((s, e)) => apply_selection(spans, s, e),
-                    None => spans,
+                // of the selection, so it can't be copied by accident. The
+                // selection's buffer-column range is intersected with this
+                // segment's range.
+                let spans = match sel_range_for_row(ed, w.buf_row) {
+                    Some((s, e)) => {
+                        let (ss, se) = w.seg;
+                        let a = s.clamp(ss, se);
+                        let b = e.clamp(ss, se);
+                        if a < b {
+                            apply_selection(w.spans, a - ss, b - ss)
+                        } else {
+                            w.spans
+                        }
+                    }
+                    None => w.spans,
                 };
                 v.extend(spans);
                 Line::from(v)
@@ -1175,7 +1194,7 @@ fn render_editor(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_widget(para, layout[0]);
 
         let status = format!(
-            "Ln {}, Col {} · {} lines · Ctrl+S save · Ctrl+Z/Y undo/redo · Shift+arrows select · Esc close",
+            "Ln {}, Col {} · {} lines · Ctrl+S/O save · Ctrl+Z/Y undo/redo · Shift+arrows select · Esc close",
             ed.row + 1,
             ed.col + 1,
             ed.lines.len()
@@ -1189,9 +1208,11 @@ fn render_editor(frame: &mut Frame, app: &mut App, area: Rect) {
             layout[2],
         );
 
-        // Put the real terminal cursor on the editor cursor.
-        let cx = layout[0].x + 1 + gutter_w + ed.col.min(10_000) as u16;
-        let cy = layout[0].y + 1 + ed.row.saturating_sub(ed.offset) as u16;
+        // Put the real terminal cursor on the editor cursor's visual position
+        // (a wrapped line's later segments sit on later screen rows).
+        let (vrow, vcol) = ed.cursor_visual();
+        let cx = layout[0].x + 1 + gutter_w + vcol.min(10_000) as u16;
+        let cy = layout[0].y + 1 + vrow.saturating_sub(ed.offset) as u16;
         frame.set_cursor_position(Position::new(cx, cy));
     }
 
@@ -1428,7 +1449,7 @@ fn render_help_popup(frame: &mut Frame, ws: &Workspace, area: Rect) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "Enter on a file opens it with the system default app. Terminal tabs run your $SHELL (PowerShell on Windows) — almost every key goes straight to it (Ctrl+C is SIGINT there); Ctrl+T / Ctrl+N / Ctrl+W / Ctrl+PgUp/PgDn / Alt+1-9 / Ctrl+G still manage tabs. Ctrl+N opens a new blank text document in its own tab; Ctrl+S on it opens a save dialog where you browse to a folder, type a name, and Enter saves (existing files ask to overwrite). In the editor: arrows/Home/End/PgUp/PgDn move · Shift+arrows (or Shift+Home/End) selects text, plain arrows collapse the selection · Ctrl+Left/Right jump by word (Ctrl+Shift+Left/Right selects by word) · type to edit · paste is instant and undoes as one step (Ctrl+Z removes the whole paste, even when the terminal delivers it character by character) · Ctrl+S save · Ctrl+Z/Y undo/redo (fast typing undoes as one burst) · Ctrl+A select all (Ctrl+E works too, for terminals that grab Ctrl+A) · Ctrl+C/X/V copy/cut/paste (selection, never line numbers; copies also land on the system clipboard, so Cmd+V works anywhere — the terminal itself intercepts Cmd+C, it never reaches fex) · Esc clears selection, then closes (asks if unsaved). In the CSV viewer: arrows move · Enter edits a cell · Tab next cell · a adds a row · A adds a column · Ctrl+S saves ·  Tabs are saved between launches: quitting brings back your browser tabs, editors (including unsaved changes), and terminal tabs (a fresh shell in the same folder). Closing a tab with Ctrl+W discards its saved state for good.Esc closes.",
+        "Enter on a file opens it with the system default app. Terminal tabs run your $SHELL (PowerShell on Windows) — almost every key goes straight to it (Ctrl+C is SIGINT there); Ctrl+T / Ctrl+N / Ctrl+W / Ctrl+PgUp/PgDn / Alt+1-9 / Ctrl+G still manage tabs. Ctrl+N opens a new blank text document in its own tab; Ctrl+S on it opens a save dialog where you browse to a folder, type a name, and Enter saves (existing files ask to overwrite). In the editor: arrows/Home/End/PgUp/PgDn move · Shift+arrows (or Shift+Home/End) selects text, plain arrows collapse the selection · Ctrl+Left/Right jump by word (Ctrl+Shift+Left/Right selects by word) · type to edit · paste is instant and undoes as one step (Ctrl+Z removes the whole paste, even when the terminal delivers it character by character) · Ctrl+S/O save · Ctrl+Z/Y undo/redo (fast typing undoes as one burst) · Ctrl+A select all (Ctrl+E works too, for terminals that grab Ctrl+A) · Ctrl+C/X/V copy/cut/paste (selection, never line numbers; copies also land on the system clipboard, so Cmd+V works anywhere — the terminal itself intercepts Cmd+C, it never reaches fex) · Esc clears selection, then closes (asks if unsaved). In the CSV viewer: arrows move · Enter edits a cell · Tab next cell · a adds a row · A adds a column · Ctrl+S (or Ctrl+O) saves ·  Tabs are saved between launches: quitting brings back your browser tabs, editors (including unsaved changes), and terminal tabs (a fresh shell in the same folder). Closing a tab with Ctrl+W discards its saved state for good.Esc closes.",
         Style::default().fg(Color::DarkGray),
     )));
     let help = Paragraph::new(lines).block(

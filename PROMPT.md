@@ -31,7 +31,7 @@ Additional features:
   under the Type sort, which groups folders first, then files by extension)
 - Built-in text editor: `e` opens the selected text file; arrow keys, Home/End,
   PgUp/PgDn navigate; type to insert, Enter splits lines, Backspace/Delete edit;
-  `Ctrl+S` saves (terminals can't see the Cmd key, so no Cmd+S), `Esc` closes and
+  `Ctrl+S` saves (`Ctrl+O` too, for terminals that grab Ctrl+S), `Esc` closes and
   asks about unsaved changes; `Ctrl+C` / `Ctrl+X` / `Ctrl+V` copy, cut, and paste
   the current line (also synced with the system clipboard via pbcopy/pbpaste);
   syntax highlighting for Rust, Python, JS/TS, Go, C/C++, Java, C#, Ruby,
@@ -75,11 +75,12 @@ Deliverable: a working binary I can run with `cargo run`
   plain arrows collapse the selection; `Ctrl+C`/`Ctrl+X` copy/cut the exact
   selection (never the line-number gutter), typing replaces the selection;
   `Esc` clears the selection first;
-  `Ctrl+A` (or `Ctrl+E`, for terminals that grab `Ctrl+A`) selects the whole file; `Ctrl+Left`/`Ctrl+Right` jump by word.
+  `Ctrl+A` (or `Ctrl+E`, for terminals that grab `Ctrl+A`) selects the whole file; `Ctrl+Left`/`Ctrl+Right` jump by word;
+  long lines word-wrap to the window (up/down move by visual row).
 - **CSV viewer** (`e` on a `.csv`): table view with header row and visible
   grid lines; arrows move, `Enter` edits a cell, `Tab` next cell, `a` adds a
   row, `A` adds a column after the current one (popup asks for the name),
-  `Ctrl+S` saves, `Esc` closes (asks if unsaved); mouse click selects cells,
+  `Ctrl+S` (or `Ctrl+O`) saves, `Esc` closes (asks if unsaved); mouse click selects cells,
   wheel scrolls. CSVs also preview as an aligned table; `C` copies preview
   CSV text.
 - **No image thumbnails**: removed — too laggy and useless in a plain text
@@ -138,3 +139,9 @@ Deliverable: a working binary I can run with `cargo run`
   (masked, memory-only); `m` adds a host by hand; a failed share listing
   falls back to typing the share name.
 - **README.md documents every feature** and is updated with each change.
+- **Word wrap in the editor**: long lines wrap at word boundaries to the
+  text width (line numbers only on a line's first segment); `Up`/`Down`
+  move by visual row, scrolling/clicks are visual-row based. `Ctrl+O`
+  saves as an alternative to `Ctrl+S` (editor + CSV viewer) for terminals
+  that intercept `Ctrl+S`; unbound `Ctrl`+letter combos no longer insert
+  their letter into the document.

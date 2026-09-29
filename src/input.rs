@@ -186,7 +186,15 @@ fn handle_editor(app: &mut App, key: KeyEvent) {
         app.save_dialog_key(key);
         return;
     }
-    if ctrl && !shift && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S')) {
+    // Ctrl+S saves; Ctrl+O is a second save binding (nano-style) for
+    // terminals that intercept Ctrl+S before the app sees it.
+    if ctrl
+        && !shift
+        && matches!(
+            key.code,
+            KeyCode::Char('s') | KeyCode::Char('S') | KeyCode::Char('o') | KeyCode::Char('O')
+        )
+    {
         let untitled = app.editor.as_ref().is_some_and(|ed| ed.is_untitled());
         if untitled {
             // No path yet: browse for a location and file name.
@@ -290,7 +298,7 @@ fn handle_editor(app: &mut App, key: KeyEvent) {
         return;
     };
     match key.code {
-        KeyCode::Char(c) => ed.insert_char(c),
+        KeyCode::Char(c) if !ctrl => ed.insert_char(c),
         KeyCode::Enter => ed.newline(),
         KeyCode::Backspace => ed.backspace(),
         KeyCode::Delete => ed.delete(),
@@ -357,7 +365,15 @@ fn handle_sheet(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    if ctrl && !shift && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S')) {
+    // Ctrl+S saves; Ctrl+O is a second save binding for terminals that
+    // intercept Ctrl+S before the app sees it.
+    if ctrl
+        && !shift
+        && matches!(
+            key.code,
+            KeyCode::Char('s') | KeyCode::Char('S') | KeyCode::Char('o') | KeyCode::Char('O')
+        )
+    {
         if let Some(sh) = app.sheet.as_mut() {
             if let Err(e) = sh.save() {
                 sh.message = format!("Save failed: {e}");
@@ -856,6 +872,38 @@ mod tests {
         browser_mut(&mut ws).mode = Mode::ConfirmDelete;
         handle_key(&mut ws, ctrl('c'));
         assert!(ws.should_quit);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ctrl_s_and_ctrl_o_save_the_editor() {
+        let (mut ws, dir) = test_app();
+        browser_mut(&mut ws).open_editor();
+        assert!(matches!(browser(&ws).mode, Mode::Editor));
+        // Type, then Ctrl+S: the file on disk is updated and dirty clears.
+        handle_key(&mut ws, key(KeyCode::Char('!'), KeyModifiers::NONE));
+        assert!(browser(&ws).editor.as_ref().unwrap().dirty);
+        handle_key(&mut ws, ctrl('s'));
+        let ed = browser(&ws).editor.as_ref().unwrap();
+        assert!(!ed.dirty, "save clears the dirty flag");
+        assert!(
+            ed.message.starts_with("Saved "),
+            "message was {:?}",
+            ed.message
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "!hello\nworld\n"
+        );
+        // Ctrl+O is the alternate save binding for terminals that grab
+        // Ctrl+S before it reaches the app.
+        handle_key(&mut ws, key(KeyCode::Char('?'), KeyModifiers::NONE));
+        handle_key(&mut ws, ctrl('o'));
+        assert!(!browser(&ws).editor.as_ref().unwrap().dirty);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "!?hello\nworld\n"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

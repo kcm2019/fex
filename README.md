@@ -231,7 +231,11 @@ events to the app and you want the terminal's native text selection.)
     selection.
   - With no selection: VS Code style — the whole current line is
     copied/cut, and paste inserts below the current line.
-- **Save / close** — `Ctrl+S` saves, `Esc` closes (asks about unsaved
+- **Word wrap** — long lines wrap at word boundaries to fit the window
+  (only the first visual row shows the line number). `↑`/`↓` move by
+  visual row, so the cursor walks through a wrapped line's segments.
+- **Save / close** — `Ctrl+S` saves (`Ctrl+O` does the same, for terminals
+  that intercept `Ctrl+S` before it reaches fex), `Esc` closes (asks about unsaved
   changes first). On a new blank document (`Ctrl+N` tab) `Ctrl+S` opens a
   save dialog instead: browse folders (`↑↓` select, `→` open, `←` up),
   type a file name, `Enter` saves (`Enter` again to overwrite an existing
@@ -262,7 +266,7 @@ grid lines.
 | `Tab` / `Shift+Tab` | Next / previous cell |
 | `a` | Add an empty row below the current one |
 | `A` (`Shift+A`) | Add a column after the current one (a popup asks for the column name; blank becomes `colN`) |
-| `Ctrl+S` | Save back to the CSV file |
+| `Ctrl+S` / `Ctrl+O` | Save back to the CSV file |
 | `Esc` | Close (asks about unsaved changes first) |
 | Mouse | Click a cell to select it; wheel scrolls |
 

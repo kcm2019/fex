@@ -917,7 +917,6 @@ struct UndoSnap {
 
 /// Cap on the undo history (each entry clones the buffer).
 const MAX_UNDO: usize = 200;
-
 /// Window in which consecutive character inserts share one undo entry: a
 /// paste arriving as individual key events (no bracketed paste, e.g. under
 /// tmux) and fast typing undo as a unit instead of character by character.
@@ -928,8 +927,13 @@ pub struct Editor {
     pub lines: Vec<String>,
     pub row: usize, // line index
     pub col: usize, // char index within the line
+    /// First visible row, in *visual* rows (buffer lines split by word wrap).
     pub offset: usize,
     pub view_h: usize,
+    /// Wrap width in characters for the text area (inside border + gutter),
+    /// set by the renderer each frame (like `view_h`). `usize::MAX` before
+    /// the first render means "no wrapping".
+    pub wrap_w: usize,
     pub dirty: bool,
     pub message: String,
     pub clipboard: Vec<String>, // lines copied/cut for pasting
@@ -958,6 +962,17 @@ pub struct Editor {
     last_insert: Option<Instant>,
 }
 
+/// One rendered visual row of the editor: the buffer line it comes from,
+/// whether it is that line's first segment (only the first gets the line
+/// number in the gutter), the segment's char range, and the highlighted
+/// spans sliced to the segment.
+pub struct WrappedRow {
+    pub buf_row: usize,
+    pub first: bool,
+    pub seg: (usize, usize),
+    pub spans: Vec<Span<'static>>,
+}
+
 impl Editor {
     pub fn open(path: &Path) -> io::Result<Editor> {
         let meta = fs::metadata(path)?;
@@ -984,6 +999,7 @@ impl Editor {
             col: 0,
             offset: 0,
             view_h: 24,
+            wrap_w: usize::MAX,
             dirty: false,
             message: String::new(),
             clipboard: Vec::new(),
@@ -1025,6 +1041,7 @@ impl Editor {
             col: 0,
             offset: 0,
             view_h: 24,
+            wrap_w: usize::MAX,
             dirty: false,
             message: String::new(),
             clipboard: Vec::new(),
@@ -1478,28 +1495,29 @@ impl Editor {
         (self.lines.len().to_string().len().max(2) + 1) as u16
     }
 
-    /// Move the cursor to a terminal click at (x, y).
+    /// Move the cursor to a terminal click at (x, y). The y coordinate maps
+    /// to a visual (wrapped) row, the x coordinate to a column within that
+    /// row's segment.
     pub fn click_at(&mut self, x: u16, y: u16) {
         let tx = self.view_x + 1 + self.gutter_w();
         let ty = self.view_y + 1;
         if x < tx || y < ty {
             return;
         }
-        let row = (self.offset + (y - ty) as usize).min(self.lines.len().saturating_sub(1));
-        let col = (x - tx) as usize;
-        self.row = row;
-        self.col = col.min(self.lines[row].chars().count());
-        self.ensure_visible();
+        let vrow = self.offset + (y - ty) as usize;
+        let vcol = (x - tx) as usize;
+        self.set_cursor_visual(vrow, vcol);
     }
 
-    /// Scroll the view by `delta` lines (mouse wheel).
+    /// Scroll the view by `delta` visual rows (mouse wheel).
     pub fn scroll_by(&mut self, delta: isize) {
-        let max_off = self.lines.len().saturating_sub(1);
+        let max_off = self.visual_len().saturating_sub(1);
         let new = (self.offset as isize + delta).clamp(0, max_off as isize) as usize;
         self.offset = new;
-        if self.row < self.offset || self.row >= self.offset + self.view_h.max(1) {
-            self.row = self.offset;
-            self.clamp_col();
+        // Keep the cursor on screen, preserving its visual column.
+        let (vrow, vcol) = self.cursor_visual();
+        if vrow < self.offset || vrow >= self.offset + self.view_h.max(1) {
+            self.set_cursor_visual(self.offset, vcol);
         }
     }
 
@@ -1518,13 +1536,12 @@ impl Editor {
             self.row = max_row;
             self.clamp_col();
         }
-        if self.row < self.offset {
-            self.offset = self.row;
-        } else if self.row >= self.offset + self.view_h {
-            self.offset = self.row - self.view_h + 1;
-        }
-        if self.offset > self.row {
-            self.offset = self.row;
+        // Scrolling is in visual (wrapped) rows.
+        let (vrow, _) = self.cursor_visual();
+        if vrow < self.offset {
+            self.offset = vrow;
+        } else if vrow >= self.offset + self.view_h {
+            self.offset = vrow - self.view_h + 1;
         }
     }
 
@@ -1629,19 +1646,20 @@ impl Editor {
         }
     }
 
+    /// Up/Down move by visual (wrapped) row, keeping the visual column, so
+    /// the cursor walks through a wrapped line's segments instead of
+    /// jumping over them.
     pub fn move_up(&mut self) {
-        if self.row > 0 {
-            self.row -= 1;
-            self.clamp_col();
-            self.ensure_visible();
+        let (vrow, vcol) = self.cursor_visual();
+        if vrow > 0 {
+            self.set_cursor_visual(vrow - 1, vcol);
         }
     }
 
     pub fn move_down(&mut self) {
-        if self.row + 1 < self.lines.len() {
-            self.row += 1;
-            self.clamp_col();
-            self.ensure_visible();
+        let (vrow, vcol) = self.cursor_visual();
+        if vrow + 1 < self.visual_len() {
+            self.set_cursor_visual(vrow + 1, vcol);
         }
     }
 
@@ -1655,16 +1673,113 @@ impl Editor {
 
     pub fn page_up(&mut self) {
         let h = self.view_h.max(1);
-        self.row = self.row.saturating_sub(h);
+        let (vrow, vcol) = self.cursor_visual();
         self.offset = self.offset.saturating_sub(h);
-        self.clamp_col();
+        self.set_cursor_visual(vrow.saturating_sub(h), vcol);
     }
 
     pub fn page_down(&mut self) {
         let h = self.view_h.max(1);
-        self.row = (self.row + h).min(self.lines.len().saturating_sub(1));
-        self.clamp_col();
+        let (vrow, vcol) = self.cursor_visual();
+        self.set_cursor_visual(vrow + h, vcol);
+    }
+
+    // -- word wrap ----------------------------------------------------------
+
+    /// Split a buffer line into visual segments of at most `width` characters,
+    /// breaking at the last space when possible and hard-breaking words that
+    /// are longer than the width. Returns char-index ranges; an empty line
+    /// yields one empty segment so it still takes a visual row.
+    fn wrap_segments(line: &str, width: usize) -> Vec<(usize, usize)> {
+        let width = width.max(1);
+        let chars: Vec<char> = line.chars().collect();
+        let mut segs = Vec::new();
+        let mut start = 0;
+        while start < chars.len() {
+            let mut end = (start + width).min(chars.len());
+            if end < chars.len() {
+                // Prefer to break after the last space in the segment so the
+                // next one starts cleanly; hard-break when there is no space.
+                if let Some(sp) = chars[start..end].iter().rposition(|&c| c == ' ') {
+                    end = start + sp + 1;
+                }
+            }
+            segs.push((start, end));
+            start = end;
+        }
+        if segs.is_empty() {
+            segs.push((0, 0));
+        }
+        segs
+    }
+
+    /// Total visual (wrapped) rows in the buffer.
+    fn visual_len(&self) -> usize {
+        self.lines
+            .iter()
+            .map(|l| Self::wrap_segments(l, self.wrap_w).len())
+            .sum()
+    }
+
+    /// Visual (row, column) of the buffer cursor.
+    pub fn cursor_visual(&self) -> (usize, usize) {
+        let mut vrow = 0;
+        for line in self.lines.iter().take(self.row) {
+            vrow += Self::wrap_segments(line, self.wrap_w).len();
+        }
+        let segs = Self::wrap_segments(&self.lines[self.row], self.wrap_w);
+        for (k, &(s, e)) in segs.iter().enumerate() {
+            // A cursor sitting exactly on a segment boundary belongs to the
+            // next segment (except past the last one, which can't happen).
+            if self.col < e || k + 1 == segs.len() {
+                return (vrow + k, self.col - s);
+            }
+        }
+        (vrow, self.col) // unreachable; keeps the compiler happy
+    }
+
+    /// Move the buffer cursor to visual position (`vrow`, `vcol`), clamping
+    /// past the end of the buffer, and scroll it into view.
+    fn set_cursor_visual(&mut self, vrow: usize, vcol: usize) {
+        let mut v = 0;
+        for (i, line) in self.lines.iter().enumerate() {
+            let segs = Self::wrap_segments(line, self.wrap_w);
+            if vrow < v + segs.len() {
+                let (s, e) = segs[vrow - v];
+                self.row = i;
+                self.col = (s + vcol).min(e);
+                self.ensure_visible();
+                return;
+            }
+            v += segs.len();
+        }
+        self.row = self.lines.len().saturating_sub(1);
+        self.col = self.lines[self.row].chars().count();
         self.ensure_visible();
+    }
+
+    /// Slice a line's styled spans down to the char range [start, end).
+    fn slice_spans(spans: &[Span<'static>], start: usize, end: usize) -> Vec<Span<'static>> {
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+        for sp in spans {
+            let n = sp.content.chars().count();
+            let (s0, s1) = (pos, pos + n);
+            pos = s1;
+            if s1 <= start || s0 >= end {
+                continue;
+            }
+            let chars: Vec<char> = sp.content.chars().collect();
+            let a = start.saturating_sub(s0);
+            let b = (end - s0).min(n);
+            if a < b {
+                out.push(Span::styled(
+                    chars[a..b].iter().collect::<String>(),
+                    sp.style,
+                ));
+            }
+        }
+        out
     }
 
     // -- highlighting -------------------------------------------------------
@@ -1689,24 +1804,64 @@ impl Editor {
         self.hl_valid = upto.max(self.hl_valid);
     }
 
-    /// Highlighted spans for the visible window [offset, offset+height).
-    pub fn highlight_visible(
+    /// One rendered visual row: the buffer line it comes from, whether it is
+    /// that line's first segment (gets the line number in the gutter), the
+    /// segment's char range, and the highlighted spans sliced to the segment.
+    pub fn highlight_visible_wrapped(
         &mut self,
         theme: &Theme,
         offset: usize,
         height: usize,
-    ) -> Vec<Vec<Span<'static>>> {
-        let end = (offset + height).min(self.lines.len());
-        self.ensure_hl(end);
+    ) -> Vec<WrappedRow> {
+        let end_vis = offset + height;
+        // Buffer lines spanned by the visual window.
+        let mut v = 0usize;
+        let mut first = 0usize;
+        let mut last = 0usize; // exclusive
+        let mut found = false;
+        for (i, line) in self.lines.iter().enumerate() {
+            let n = Self::wrap_segments(line, self.wrap_w).len();
+            if !found && v + n > offset {
+                first = i;
+                found = true;
+            }
+            if v >= end_vis {
+                break;
+            }
+            last = i + 1;
+            v += n;
+        }
+        if !found {
+            return Vec::new();
+        }
+        self.ensure_hl(last);
+        // Visual row of `first`.
+        let mut v = 0usize;
+        for line in self.lines.iter().take(first) {
+            v += Self::wrap_segments(line, self.wrap_w).len();
+        }
         let mut out = Vec::new();
-        for i in offset..end {
+        for i in first..last {
             let start_state = if i == 0 { false } else { self.block_end[i - 1] };
             let (segs, _) = scan_line(&self.lines[i], self.lang, start_state);
-            out.push(
-                segs.into_iter()
-                    .map(|(k, s)| span_for(theme, k, s))
-                    .collect(),
-            );
+            let spans: Vec<Span<'static>> = segs
+                .into_iter()
+                .map(|(k, s)| span_for(theme, k, s))
+                .collect();
+            for (k, &(s, e)) in Self::wrap_segments(&self.lines[i], self.wrap_w)
+                .iter()
+                .enumerate()
+            {
+                if v >= offset && v < end_vis {
+                    out.push(WrappedRow {
+                        buf_row: i,
+                        first: k == 0,
+                        seg: (s, e),
+                        spans: Self::slice_spans(&spans, s, e),
+                    });
+                }
+                v += 1;
+            }
         }
         out
     }
@@ -2170,6 +2325,95 @@ mod tests {
         assert_eq!(ed.lines, vec!["ab"]);
         ed.undo();
         assert_eq!(ed.lines, vec![""]);
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn wrap_segments_breaks_at_spaces() {
+        // "aa " | "bb " | "cc"
+        assert_eq!(
+            Editor::wrap_segments("aa bb cc", 4),
+            vec![(0, 3), (3, 6), (6, 8)]
+        );
+    }
+
+    #[test]
+    fn wrap_segments_hard_breaks_long_words() {
+        assert_eq!(
+            Editor::wrap_segments("abcdefgh", 3),
+            vec![(0, 3), (3, 6), (6, 8)]
+        );
+    }
+
+    #[test]
+    fn wrap_segments_short_and_empty_lines() {
+        assert_eq!(Editor::wrap_segments("", 10), vec![(0, 0)]);
+        assert_eq!(Editor::wrap_segments("hi", 10), vec![(0, 2)]);
+    }
+
+    #[test]
+    fn cursor_visual_maps_through_wrapped_segments() {
+        let mut ed = Editor::untitled();
+        ed.lines = vec!["aa bb cc".to_string(), "z".to_string()];
+        ed.wrap_w = 4;
+        // Visual rows: "aa "(0), "bb "(1), "cc"(2), "z"(3).
+        ed.row = 0;
+        ed.col = 4; // start of "bb"
+        assert_eq!(ed.cursor_visual(), (1, 1));
+        // A cursor exactly on a segment boundary belongs to the next segment.
+        ed.row = 0;
+        ed.col = 3;
+        assert_eq!(ed.cursor_visual(), (1, 0));
+        ed.row = 1;
+        ed.col = 1;
+        assert_eq!(ed.cursor_visual(), (3, 1));
+    }
+
+    #[test]
+    fn move_up_down_walks_wrapped_segments() {
+        let mut ed = Editor::untitled();
+        ed.lines = vec!["aa bb cc".to_string()];
+        ed.wrap_w = 4;
+        ed.view_h = 24;
+        ed.row = 0;
+        ed.col = 0;
+        ed.move_down();
+        assert_eq!((ed.row, ed.col), (0, 3), "down to the bb segment");
+        ed.move_down();
+        assert_eq!((ed.row, ed.col), (0, 6), "down to the cc segment");
+        ed.move_down();
+        assert_eq!((ed.row, ed.col), (0, 6), "down at the end is a no-op");
+        ed.move_up();
+        assert_eq!((ed.row, ed.col), (0, 3), "up keeps the visual column");
+        ed.move_up();
+        assert_eq!((ed.row, ed.col), (0, 0));
+        ed.move_up();
+        assert_eq!((ed.row, ed.col), (0, 0), "up at the top is a no-op");
+    }
+
+    #[test]
+    fn wrapped_highlight_slices_spans_per_segment() {
+        let p = tmpfile("wrap.txt", b"aa bb cc\n");
+        let mut ed = Editor::open(&p).unwrap();
+        ed.wrap_w = 4;
+        let theme = &crate::theme::THEMES[0];
+        let rows = ed.highlight_visible_wrapped(theme, 0, 10);
+        assert_eq!(rows.len(), 3);
+        assert!(rows[0].first);
+        assert!(!rows[1].first);
+        assert_eq!(rows[0].buf_row, 0);
+        // The sliced spans still spell out the segment text.
+        let text: String = rows
+            .iter()
+            .map(|r| {
+                r.spans
+                    .iter()
+                    .map(|s| s.content.clone().into_owned())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+        assert_eq!(text, "aa |bb |cc");
         std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
     }
 }
