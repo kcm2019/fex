@@ -3,13 +3,16 @@
 
 use crate::editor::Editor;
 use crate::fs::{self, Entry, Preview, SearchResult};
+use crate::net::{self, Drive, NetDevice};
 use crate::sheet::{self, Sheet};
 use crate::shell::ShellTab;
 use crate::theme;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::ListState;
 use std::cmp::Ordering;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::time::SystemTime;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +57,14 @@ pub enum InputKind {
     Filter,
     CsvCell,
     CsvColumn,
+    /// Manual network host (IP or hostname) in the Network view.
+    NetHost,
+    /// Share name typed by hand when listing shares fails.
+    NetShare,
+    /// SMB username for a share that needs credentials.
+    SmbUser,
+    /// SMB password for a share that needs credentials.
+    SmbPass,
 }
 
 impl InputKind {
@@ -65,7 +76,16 @@ impl InputKind {
             InputKind::Filter => "Filter (live — Esc clears)",
             InputKind::CsvCell => "Edit cell",
             InputKind::CsvColumn => "New column name",
+            InputKind::NetHost => "Network host (IP or name)",
+            InputKind::NetShare => "Share name",
+            InputKind::SmbUser => "Username",
+            InputKind::SmbPass => "Password",
         }
+    }
+
+    /// True for the password prompt, whose text is masked on screen.
+    pub fn is_secret(&self) -> bool {
+        matches!(self, InputKind::SmbPass)
     }
 }
 
@@ -79,6 +99,8 @@ pub enum Mode {
     ConfirmDiscard,
     Search,
     Sheet,
+    /// Network device browser (mDNS discovery + SMB mounting).
+    Network,
 }
 
 /// List view (file list + preview pane) or Miller-column view.
@@ -169,6 +191,8 @@ pub struct App {
     pub status: String,
     preview_cache: (PathBuf, bool, Preview),
     pub editor: Option<Editor>,
+    /// Save-as dialog for never-saved documents (None when closed).
+    pub save_dialog: Option<SaveDialog>,
     pub view: ViewMode,
     pub columns: Vec<Column>,
     pub col_active: usize,
@@ -184,6 +208,14 @@ pub struct App {
     pub theme_idx: usize,
     /// Editor line-number gutter toggle (persisted).
     pub show_line_numbers: bool,
+    /// Preview pane visibility in list view (`P` toggles; off by default).
+    pub show_preview: bool,
+    /// Network device browser (`G`); None when closed.
+    pub net: Option<NetView>,
+    /// Mount point owned by this tab (macOS); unmounted on tab close.
+    pub mount_point: Option<PathBuf>,
+    /// Display name for a network tab, e.g. `//nas/Media`.
+    pub network_name: Option<String>,
 }
 
 fn char_index_to_byte(s: &str, char_idx: usize) -> usize {
@@ -215,6 +247,7 @@ impl App {
             status: String::new(),
             preview_cache: (PathBuf::new(), false, Preview::Text(String::new())),
             editor: None,
+            save_dialog: None,
             view: ViewMode::List,
             columns: Vec::new(),
             col_active: 0,
@@ -226,6 +259,10 @@ impl App {
             list_origin: (0, 0),
             theme_idx: 0,
             show_line_numbers: true,
+            show_preview: false,
+            net: None,
+            mount_point: None,
+            network_name: None,
         };
         app.refresh();
         app
@@ -444,8 +481,104 @@ impl App {
     /// Close the editor, discarding the buffer.
     pub fn close_editor(&mut self) {
         self.editor = None;
+        self.save_dialog = None;
         self.mode = Mode::Normal;
         self.refresh(); // the file may have changed on disk
+    }
+
+    /// Open the save-as dialog for a never-saved document, starting in the
+    /// tab's current directory.
+    pub fn open_save_dialog(&mut self) {
+        let cwd = self.cwd.clone();
+        self.save_dialog = Some(SaveDialog::new(cwd));
+    }
+
+    /// Open the Network view: live mDNS discovery of SMB devices.
+    pub fn open_network(&mut self) {
+        match NetView::new() {
+            Ok(nv) => {
+                self.net = Some(nv);
+                self.mode = Mode::Network;
+            }
+            Err(e) => self.status = format!("Network discovery unavailable: {e}"),
+        }
+    }
+
+    /// Close the Network view (stops discovery).
+    pub fn close_network(&mut self) {
+        self.net = None;
+        self.mode = Mode::Normal;
+    }
+
+    /// Enter on the network selection: list shares or mount one.
+    pub fn net_enter(&mut self) {
+        if let Some(nv) = self.net.as_mut() {
+            nv.enter();
+        }
+    }
+
+    /// Back out of the network view (or close it at the top level).
+    pub fn net_back(&mut self) {
+        let close = self.net.as_mut().is_some_and(|nv| nv.back());
+        if close {
+            self.close_network();
+        }
+    }
+
+    /// Drain network worker messages; returns mounts ready to open.
+    pub fn poll_net(&mut self) -> (bool, Vec<(String, String, net::MountedShare)>) {
+        let mut changed = false;
+        let mut mounts = Vec::new();
+        if let Some(nv) = self.net.as_mut() {
+            let (c, msgs) = nv.poll();
+            changed |= c;
+            for m in msgs {
+                if let Some((host, share, mounted)) = nv.apply_msg(m) {
+                    mounts.push((host, share, mounted));
+                }
+            }
+        }
+        (changed, mounts)
+    }
+
+    /// Route a key to the open save-as dialog, carrying out saves.
+    pub fn save_dialog_key(&mut self, key: KeyEvent) {
+        let action = match self.save_dialog.as_mut() {
+            Some(d) => d.key(key),
+            None => return,
+        };
+        match action {
+            SaveAction::None => {}
+            SaveAction::Cancel => {
+                self.save_dialog = None;
+            }
+            SaveAction::Save(target) => {
+                // A typed sub-path ("notes/todo.txt") may name folders
+                // that don't exist yet — create them.
+                if let Some(parent) = target.parent() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        if let Some(d) = self.save_dialog.as_mut() {
+                            d.message = format!("Cannot create folder: {e}");
+                        }
+                        return;
+                    }
+                }
+                match self.editor.as_mut().map(|ed| ed.save_to(&target)) {
+                    Some(Ok(())) => {
+                        self.save_dialog = None;
+                        self.refresh(); // the new file appears in the listing
+                    }
+                    Some(Err(e)) => {
+                        if let Some(d) = self.save_dialog.as_mut() {
+                            d.message = format!("Save failed: {e}");
+                        }
+                    }
+                    None => {
+                        self.save_dialog = None;
+                    }
+                }
+            }
+        }
     }
 
     /// Open the selected CSV file in the table viewer.
@@ -778,6 +911,16 @@ impl App {
         };
     }
 
+    /// Toggle the preview pane in list view / Miller columns.
+    pub fn toggle_preview(&mut self) {
+        self.show_preview = !self.show_preview;
+        self.status = if self.show_preview {
+            String::from("Preview on")
+        } else {
+            String::from("Preview off")
+        };
+    }
+
     pub fn cycle_sort_key(&mut self) {
         self.sort.cycle_key();
         self.reapply_sort();
@@ -820,6 +963,7 @@ impl App {
                 self.cursor = self.input.chars().count();
             }
             InputKind::NewFile | InputKind::NewDir | InputKind::CsvColumn => {}
+            InputKind::NetHost | InputKind::NetShare | InputKind::SmbUser | InputKind::SmbPass => {}
             InputKind::CsvCell => {
                 if let Some(sh) = &self.sheet {
                     if let Some(cell) = sh.rows.get(sh.row).and_then(|r| r.get(sh.col)) {
@@ -933,6 +1077,34 @@ impl App {
                     format!("Filter: {}", self.filter)
                 };
             }
+            InputKind::NetHost => {
+                let host = value.clone();
+                self.mode = Mode::Network;
+                if let Some(nv) = self.net.as_mut() {
+                    nv.add_manual_host(&host);
+                }
+            }
+            InputKind::NetShare => {
+                self.mode = Mode::Network;
+                if let Some(nv) = self.net.as_mut() {
+                    nv.submit_manual_share(&value);
+                }
+            }
+            InputKind::SmbUser => {
+                // Chain straight into the password prompt.
+                if let Some(nv) = self.net.as_mut() {
+                    nv.submit_credentials(InputKind::SmbUser, &value);
+                }
+                self.input.clear();
+                self.cursor = 0;
+                self.mode = Mode::Input(InputKind::SmbPass);
+            }
+            InputKind::SmbPass => {
+                self.mode = Mode::Network;
+                if let Some(nv) = self.net.as_mut() {
+                    nv.submit_credentials(InputKind::SmbPass, &value);
+                }
+            }
             InputKind::CsvCell => {
                 // Use the raw input: cell values may legitimately have
                 // leading/trailing spaces, so don't trim.
@@ -968,9 +1140,15 @@ impl App {
         if kind == InputKind::Filter {
             self.clear_filter();
         }
-        // Cancelling a cell/column edit returns to the table viewer.
+        // Cancelling a cell/column edit returns to the table viewer;
+        // cancelling a network prompt returns to the Network view.
         self.mode = if matches!(kind, InputKind::CsvCell | InputKind::CsvColumn) {
             Mode::Sheet
+        } else if matches!(
+            kind,
+            InputKind::NetHost | InputKind::NetShare | InputKind::SmbUser | InputKind::SmbPass
+        ) {
+            Mode::Network
         } else {
             Mode::Normal
         };
@@ -1053,6 +1231,565 @@ pub struct Workspace {
     pub should_quit: bool,
     /// Tab-bar hit ranges recorded during render: (x_start, x_end, tab).
     pub tab_hits: Vec<(u16, u16, usize)>,
+}
+
+/// Max characters shown in a tab title; longer names get an ellipsis so
+/// one long file name can't crowd the whole tab strip.
+const TAB_TITLE_CHARS: usize = 24;
+
+fn short_tab_title(name: &str) -> String {
+    if name.chars().count() <= TAB_TITLE_CHARS {
+        return name.to_owned();
+    }
+    let mut s: String = name.chars().take(TAB_TITLE_CHARS - 1).collect();
+    s.push('…');
+    s
+}
+
+/// What the save-as dialog wants the app to do after a key.
+pub enum SaveAction {
+    None,
+    Cancel,
+    Save(PathBuf),
+}
+
+/// A save-as dialog: pick a directory by browsing, type a file name.
+/// Opened by Ctrl+S on a never-saved ("untitled") document.
+pub struct SaveDialog {
+    pub cwd: PathBuf,
+    pub dirs: Vec<PathBuf>,
+    pub selected: usize,
+    pub filename: String,
+    /// Char index of the text cursor inside `filename`.
+    pub fcursor: usize,
+    pub message: String,
+    confirm_overwrite: bool,
+}
+
+impl SaveDialog {
+    pub fn new(cwd: PathBuf) -> Self {
+        let mut dlg = Self {
+            cwd,
+            dirs: Vec::new(),
+            selected: 0,
+            filename: String::new(),
+            fcursor: 0,
+            message: String::new(),
+            confirm_overwrite: false,
+        };
+        dlg.read_dirs();
+        dlg
+    }
+
+    fn read_dirs(&mut self) {
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&self.cwd) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    dirs.push(p);
+                }
+            }
+        }
+        dirs.sort_by(|a, b| a.file_name().cmp(&b.file_name()).then_with(|| a.cmp(b)));
+        self.dirs = dirs;
+        self.selected = 0;
+    }
+
+    fn move_selection(&mut self, delta: i32) {
+        if self.dirs.is_empty() {
+            return;
+        }
+        let n = self.dirs.len() as i32;
+        self.selected = (self.selected as i32 + delta).rem_euclid(n) as usize;
+    }
+
+    fn enter_selected(&mut self) {
+        if let Some(d) = self.dirs.get(self.selected).cloned() {
+            self.cwd = d;
+            self.read_dirs();
+        }
+    }
+
+    fn go_parent(&mut self) {
+        if let Some(p) = self.cwd.parent() {
+            self.cwd = p.to_path_buf();
+            self.read_dirs();
+        }
+    }
+
+    /// The full path that would be written, or None when no name typed.
+    pub fn target(&self) -> Option<PathBuf> {
+        if self.filename.is_empty() {
+            None
+        } else {
+            Some(self.cwd.join(&self.filename))
+        }
+    }
+
+    pub fn key(&mut self, key: KeyEvent) -> SaveAction {
+        // Any edit to the name restarts the overwrite confirmation.
+        let name_edit = matches!(key.code, KeyCode::Char(_) | KeyCode::Backspace);
+        match key.code {
+            KeyCode::Esc => return SaveAction::Cancel,
+            KeyCode::Up => self.move_selection(-1),
+            KeyCode::Down => self.move_selection(1),
+            KeyCode::Right => self.enter_selected(),
+            KeyCode::Left => self.go_parent(),
+            KeyCode::Home => self.selected = 0,
+            KeyCode::End => {
+                self.selected = self.dirs.len().saturating_sub(1);
+            }
+            KeyCode::Backspace => {
+                if self.fcursor > 0 {
+                    self.fcursor -= 1;
+                    let at = char_index_to_byte(&self.filename, self.fcursor);
+                    self.filename.remove(at);
+                }
+            }
+            KeyCode::Char(c) => {
+                let at = char_index_to_byte(&self.filename, self.fcursor);
+                self.filename.insert(at, c);
+                self.fcursor += 1;
+            }
+            KeyCode::Enter => {
+                let Some(target) = self.target() else {
+                    self.message = String::from("Type a file name first");
+                    return SaveAction::None;
+                };
+                if target.exists() && !self.confirm_overwrite {
+                    self.confirm_overwrite = true;
+                    self.message = format!(
+                        "\"{}\" exists — Enter again to overwrite, Esc to cancel",
+                        self.filename
+                    );
+                    return SaveAction::None;
+                }
+                return SaveAction::Save(target);
+            }
+            _ => {}
+        }
+        if name_edit {
+            self.confirm_overwrite = false;
+            self.message.clear();
+        }
+        SaveAction::None
+    }
+}
+
+/// Messages from network worker threads to the UI.
+pub enum NetMsg {
+    Shares {
+        host: String,
+        result: io::Result<Vec<String>>,
+    },
+    Mounted {
+        host: String,
+        share: String,
+        result: io::Result<net::MountedShare>,
+    },
+}
+
+/// Where the Network view is: the device list, loading a host's shares,
+/// the share list, or mounting a share.
+pub enum NetState {
+    Devices,
+    LoadingShares { host: String },
+    Shares { host: String, shares: Vec<String> },
+    Mounting { host: String, share: String },
+}
+
+/// The two sections of the combined Drives & network list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetSection {
+    Drives,
+    Network,
+}
+
+impl NetSection {
+    pub fn label(self) -> &'static str {
+        match self {
+            NetSection::Drives => "Drives",
+            NetSection::Network => "Network",
+        }
+    }
+}
+
+/// One row of the combined list. Headers are separator lines and are
+/// never selectable; `Hint` is the empty-network-devices note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetRow {
+    Header(NetSection),
+    Drive(usize),
+    Device(usize),
+    Hint,
+}
+
+impl NetRow {
+    fn selectable(self) -> bool {
+        matches!(self, NetRow::Drive(_) | NetRow::Device(_))
+    }
+}
+
+/// The Network view (`G`): local drives plus live mDNS device list and
+/// SMB share browsing. Dropping it stops discovery.
+pub struct NetView {
+    /// Local drives/volumes, loaded once when the view opens.
+    pub drives: Vec<Drive>,
+    /// Discovered + hand-added devices, merged and sorted.
+    pub devices: Vec<NetDevice>,
+    manual: Vec<NetDevice>,
+    /// Index into [`NetView::rows`] (headers/hints included).
+    pub selected: usize,
+    pub state: NetState,
+    pub message: String,
+    /// Hosts with a share currently mounted in some tab, for tagging.
+    pub mounted_hosts: Vec<String>,
+    tx: mpsc::Sender<NetMsg>,
+    rx: mpsc::Receiver<NetMsg>,
+    discovery: net::Discovery,
+    /// Mount waiting on credentials: (host, share, user).
+    pending_auth: Option<(String, String, String)>,
+    /// Host waiting on a hand-typed share name.
+    pending_host: Option<String>,
+    /// Input prompt the workspace should open next (set by worker
+    /// messages, drained once).
+    next_prompt: Option<InputKind>,
+}
+
+impl NetView {
+    pub fn new() -> io::Result<Self> {
+        let (tx, rx) = mpsc::channel();
+        let mut nv = Self {
+            drives: net::list_drives(),
+            devices: Vec::new(),
+            manual: Vec::new(),
+            selected: 0,
+            state: NetState::Devices,
+            message: String::from("Scanning for devices…"),
+            mounted_hosts: Vec::new(),
+            tx,
+            rx,
+            discovery: net::Discovery::start()?,
+            pending_auth: None,
+            pending_host: None,
+            next_prompt: None,
+        };
+        nv.selected = nv.first_selectable();
+        Ok(nv)
+    }
+
+    /// Flat rows of the combined list: a "Drives" separator, the drives,
+    /// a "Network" separator, then the devices (or a hint when empty).
+    pub fn rows(&self) -> Vec<NetRow> {
+        let mut rows = vec![NetRow::Header(NetSection::Drives)];
+        rows.extend((0..self.drives.len()).map(NetRow::Drive));
+        rows.push(NetRow::Header(NetSection::Network));
+        if self.devices.is_empty() {
+            rows.push(NetRow::Hint);
+        } else {
+            rows.extend((0..self.devices.len()).map(NetRow::Device));
+        }
+        rows
+    }
+
+    /// Index of the first selectable row (never a header).
+    fn first_selectable(&self) -> usize {
+        self.rows().iter().position(|r| r.selectable()).unwrap_or(0)
+    }
+
+    /// Step `selected` to a selectable row, wrapping around.
+    fn step_selection(&mut self, delta: i32) {
+        let rows = self.rows();
+        if !rows.iter().any(|r| r.selectable()) {
+            return;
+        }
+        let n = rows.len();
+        let mut i = self.selected as i32;
+        loop {
+            i = (i + delta).rem_euclid(n as i32);
+            if rows[i as usize].selectable() {
+                self.selected = i as usize;
+                break;
+            }
+        }
+    }
+
+    /// Jump to the i-th selectable row.
+    fn jump_to_selectable(&mut self, i: usize) {
+        let rows = self.rows();
+        let selectable: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.selectable())
+            .map(|(idx, _)| idx)
+            .collect();
+        if !selectable.is_empty() {
+            self.selected = selectable[i.min(selectable.len() - 1)];
+        }
+    }
+
+    /// Return to the top-level list, resetting the selection past the
+    /// section headers.
+    fn to_devices(&mut self) {
+        self.state = NetState::Devices;
+        self.selected = self.first_selectable();
+    }
+
+    /// Drain discovery snapshots and worker messages. Returns
+    /// (changed, worker messages for the workspace to act on).
+    pub fn poll(&mut self) -> (bool, Vec<NetMsg>) {
+        let mut changed = false;
+        if let Some(found) = self.discovery.poll() {
+            let mut merged = found;
+            merged.extend(self.manual.iter().cloned());
+            merged.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            merged.dedup_by(|a, b| a.host == b.host);
+            if merged != self.devices {
+                self.devices = merged;
+                // Keep the selection if it still lands on a selectable
+                // row; otherwise fall back to the first one.
+                let rows = self.rows();
+                if self.selected >= rows.len() || !rows[self.selected].selectable() {
+                    self.selected = self.first_selectable();
+                }
+                self.message.clear();
+                changed = true;
+            }
+        }
+        let mut msgs = Vec::new();
+        while let Ok(m) = self.rx.try_recv() {
+            msgs.push(m);
+            changed = true;
+        }
+        (changed, msgs)
+    }
+
+    pub fn move_selection(&mut self, delta: i32) {
+        match self.state {
+            NetState::Devices => self.step_selection(delta),
+            NetState::Shares { ref shares, .. } => {
+                if shares.is_empty() {
+                    return;
+                }
+                self.selected =
+                    (self.selected as i32 + delta).rem_euclid(shares.len() as i32) as usize;
+            }
+            _ => return,
+        }
+        self.message.clear();
+    }
+
+    pub fn jump_to(&mut self, i: usize) {
+        match self.state {
+            NetState::Devices => self.jump_to_selectable(i),
+            NetState::Shares { ref shares, .. } => {
+                if !shares.is_empty() {
+                    self.selected = i.min(shares.len() - 1);
+                }
+            }
+            _ => return,
+        }
+        self.message.clear();
+    }
+
+    fn selected_device(&self) -> Option<&NetDevice> {
+        match self.rows().get(self.selected) {
+            Some(NetRow::Device(i)) => self.devices.get(*i),
+            _ => None,
+        }
+    }
+
+    /// The drive under the cursor, if the Devices list is on a drive row.
+    /// Opening it as a tab is handled by the input layer.
+    pub fn selected_drive(&self) -> Option<&Drive> {
+        if !matches!(self.state, NetState::Devices) {
+            return None;
+        }
+        match self.rows().get(self.selected) {
+            Some(NetRow::Drive(i)) => self.drives.get(*i),
+            _ => None,
+        }
+    }
+
+    fn selected_share(&self) -> Option<(String, String)> {
+        match &self.state {
+            NetState::Shares { host, shares } => {
+                shares.get(self.selected).map(|s| (host.clone(), s.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    /// Enter on the selection: list a device's shares, or mount a share.
+    /// Drives are opened by the input layer (see `selected_drive`); Enter
+    /// here ignores them.
+    pub fn enter(&mut self) {
+        match self.state {
+            NetState::Devices => {
+                let Some(dev) = self.selected_device() else {
+                    return;
+                };
+                let host = dev.host.clone();
+                self.state = NetState::LoadingShares { host: host.clone() };
+                self.message = format!("Listing shares on {host}…");
+                let tx = self.tx.clone();
+                std::thread::spawn(move || {
+                    let result = net::list_shares(&host);
+                    let _ = tx.send(NetMsg::Shares { host, result });
+                });
+            }
+            NetState::Shares { .. } => {
+                let Some((host, share)) = self.selected_share() else {
+                    return;
+                };
+                self.start_mount(host, share, String::new(), String::new());
+            }
+            _ => {}
+        }
+    }
+
+    /// Go back a level. Returns true when the view should close.
+    pub fn back(&mut self) -> bool {
+        match self.state {
+            NetState::Devices => true,
+            _ => {
+                // A late worker reply for the abandoned level is ignored by
+                // matching on the host (see apply_msg).
+                self.to_devices();
+                self.message.clear();
+                false
+            }
+        }
+    }
+
+    pub fn add_manual_host(&mut self, host: &str) {
+        let host = host.trim().to_string();
+        if host.is_empty() {
+            return;
+        }
+        if !self.manual.iter().any(|d| d.host == host) {
+            self.manual.push(NetDevice::manual(&host));
+            let mut merged = self.devices.clone();
+            merged.push(NetDevice::manual(&host));
+            merged.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            self.devices = merged;
+        }
+        self.message.clear();
+    }
+
+    /// Apply a worker message. Returns a mount ready to open, if any.
+    pub fn apply_msg(&mut self, msg: NetMsg) -> Option<(String, String, net::MountedShare)> {
+        match msg {
+            NetMsg::Shares { host, result } => {
+                // Ignore stale replies after backing out.
+                if !matches!(&self.state, NetState::LoadingShares { host: h } if h == &host) {
+                    return None;
+                }
+                match result {
+                    Ok(shares) if !shares.is_empty() => {
+                        self.state = NetState::Shares { host, shares };
+                        self.selected = 0;
+                        self.message.clear();
+                    }
+                    Ok(_) => {
+                        self.to_devices();
+                        self.message = format!("No shares found on {host}");
+                    }
+                    Err(e) => {
+                        // Fall back to typing the share name by hand.
+                        self.pending_host = Some(host.clone());
+                        self.to_devices();
+                        self.message = format!("Could not list shares on {host}: {e}");
+                        self.next_prompt = Some(InputKind::NetShare);
+                    }
+                }
+                None
+            }
+            NetMsg::Mounted {
+                host,
+                share,
+                result,
+            } => {
+                if !matches!(&self.state, NetState::Mounting { host: h, share: s } if h == &host && s == &share)
+                {
+                    return None;
+                }
+                match result {
+                    Ok(mounted) => {
+                        self.to_devices();
+                        Some((host, share, mounted))
+                    }
+                    Err(e) => {
+                        self.to_devices();
+                        if net::is_auth_error(&e) {
+                            self.pending_auth = Some((host.clone(), share.clone(), String::new()));
+                            self.message = format!("{host} needs a login — enter your username");
+                            self.next_prompt = Some(InputKind::SmbUser);
+                        } else {
+                            self.message = format!("Could not mount {host}/{share}: {e}");
+                        }
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    fn start_mount(&mut self, host: String, share: String, user: String, pass: String) {
+        self.pending_auth = None;
+        self.pending_host = None;
+        self.state = NetState::Mounting {
+            host: host.clone(),
+            share: share.clone(),
+        };
+        self.message = format!("Mounting {host}/{share}…");
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = net::mount_share(&host, &share, &user, &pass);
+            let _ = tx.send(NetMsg::Mounted {
+                host,
+                share,
+                result,
+            });
+        });
+    }
+
+    /// The share name typed by hand after listing failed.
+    pub fn submit_manual_share(&mut self, share: &str) {
+        let share = share.trim().to_string();
+        let Some(host) = self.pending_host.take() else {
+            return;
+        };
+        if share.is_empty() {
+            self.message = String::from("Share name cannot be empty");
+            return;
+        }
+        self.start_mount(host, share, String::new(), String::new());
+    }
+
+    /// Credentials entered after an auth failure. `user` empty means the
+    /// username prompt just completed — the password prompt is next.
+    pub fn submit_credentials(&mut self, kind: InputKind, value: &str) {
+        let Some((host, share, user)) = self.pending_auth.take() else {
+            return;
+        };
+        match kind {
+            InputKind::SmbUser => {
+                // Next: the password prompt.
+                self.pending_auth = Some((host, share, value.to_string()));
+            }
+            _ => {
+                self.start_mount(host, share, user, value.to_string());
+            }
+        }
+    }
+
+    /// True when the username step just finished and the password prompt
+    /// should open next.
+    pub fn take_next_prompt(&mut self) -> Option<InputKind> {
+        self.next_prompt.take()
+    }
 }
 
 impl Workspace {
@@ -1152,6 +1889,111 @@ impl Workspace {
         self.push_browser_tab(cwd);
     }
 
+    /// Open a new tab with a blank, unsaved text document. Ctrl+S on it
+    /// opens the save-as dialog to pick a location and file name.
+    pub fn new_text_tab(&mut self) {
+        let cwd = self.new_tab_cwd();
+        let mut app = App::new(cwd);
+        app.theme_idx = self.theme_idx;
+        app.show_line_numbers = self.show_line_numbers;
+        let mut ed = Editor::untitled();
+        ed.show_line_numbers = app.show_line_numbers;
+        app.editor = Some(ed);
+        app.mode = Mode::Editor;
+        self.tabs.push(Tab::Browser(app));
+        self.active = self.tabs.len() - 1;
+    }
+
+    /// Open a browser tab on a freshly mounted network share.
+    pub fn open_mounted_tab(&mut self, host: &str, share: &str, mounted: net::MountedShare) {
+        let mut app = App::new(mounted.path.clone());
+        app.theme_idx = self.theme_idx;
+        app.show_line_numbers = self.show_line_numbers;
+        app.mount_point = if mounted.needs_unmount {
+            Some(mounted.path)
+        } else {
+            None
+        };
+        app.network_name = Some(format!("//{host}/{share}"));
+        app.status = format!("Mounted //{host}/{share}");
+        self.tabs.push(Tab::Browser(app));
+        self.active = self.tabs.len() - 1;
+    }
+
+    /// Open a browser tab on a local drive picked in the Network view.
+    /// Drives are never mounted by fex, so there is nothing to unmount.
+    pub fn open_drive_tab(&mut self, path: &Path, name: &str) {
+        let mut app = App::new(path.to_path_buf());
+        app.theme_idx = self.theme_idx;
+        app.show_line_numbers = self.show_line_numbers;
+        app.status = format!("Opened {name}");
+        self.tabs.push(Tab::Browser(app));
+        self.active = self.tabs.len() - 1;
+    }
+
+    /// Drain network worker messages for the active tab's Network view.
+    /// Opens mounted shares as new tabs and raises input prompts for
+    /// credentials or hand-typed share names. Returns true when the UI
+    /// changed.
+    pub fn poll_network(&mut self) -> bool {
+        let mut changed = false;
+        let mut mounts: Vec<(String, String, net::MountedShare)> = Vec::new();
+        let mut prompts: Vec<InputKind> = Vec::new();
+        // Hosts with a share open in some tab, so the device list can tag
+        // them as mounted.
+        let mounted_hosts: Vec<String> = self
+            .tabs
+            .iter()
+            .filter_map(|t| match t {
+                Tab::Browser(app) => app
+                    .network_name
+                    .as_ref()
+                    .and_then(|n| n.strip_prefix("//"))
+                    .and_then(|s| s.split('/').next())
+                    .map(str::to_string),
+                _ => None,
+            })
+            .collect();
+        if let Some(app) = self.active_browser_mut() {
+            if let Some(nv) = app.net.as_mut() {
+                if nv.mounted_hosts != mounted_hosts {
+                    nv.mounted_hosts = mounted_hosts;
+                    changed = true;
+                }
+            }
+            let (c, ms) = app.poll_net();
+            changed |= c;
+            mounts.extend(ms);
+            if let Some(nv) = app.net.as_mut() {
+                if let Some(kind) = nv.take_next_prompt() {
+                    prompts.push(kind);
+                }
+            }
+        }
+        for (host, share, mounted) in mounts {
+            changed = true;
+            self.open_mounted_tab(&host, &share, mounted);
+        }
+        for kind in prompts {
+            if let Some(app) = self.active_browser_mut() {
+                app.start_input(kind);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Unmount every mounted network share (best effort, for shutdown).
+    pub fn unmount_all(&mut self) {
+        for tab in &self.tabs {
+            if let Tab::Browser(app) = tab {
+                if let Some(mp) = &app.mount_point {
+                    let _ = net::unmount_path(mp);
+                }
+            }
+        }
+    }
+
     /// Open a new interactive shell tab in the current directory.
     /// The pty is sized properly on the first render.
     pub fn new_shell_tab(&mut self) {
@@ -1177,6 +2019,12 @@ impl Workspace {
             }
             return;
         }
+        // Unmount network shares owned by the closing tab.
+        if let Some(Tab::Browser(app)) = self.tabs.get(self.active) {
+            if let Some(mp) = app.mount_point.clone() {
+                let _ = net::unmount_path(&mp);
+            }
+        }
         self.tabs.remove(self.active);
         self.active = self.active.min(self.tabs.len() - 1);
     }
@@ -1200,13 +2048,27 @@ impl Workspace {
     }
 
     /// Short label for the tab strip.
+    /// Tab titles are capped so long file names don't crowd the tab strip.
     pub fn tab_title(&self, i: usize) -> String {
-        match self.tabs.get(i) {
-            Some(Tab::Browser(app)) => app
-                .cwd
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| app.cwd.to_string_lossy().into_owned()),
+        let raw = match self.tabs.get(i) {
+            Some(Tab::Browser(app)) => {
+                // While editing, the tab names the open file, not the directory.
+                if matches!(app.mode, Mode::Editor | Mode::ConfirmDiscard) {
+                    app.editor
+                        .as_ref()
+                        .and_then(|ed| ed.path.file_name())
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| String::from("untitled"))
+                } else if let Some(name) = &app.network_name {
+                    // Mounted network shares name the share, not the temp dir.
+                    name.clone()
+                } else {
+                    app.cwd
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| app.cwd.to_string_lossy().into_owned())
+                }
+            }
             Some(Tab::Shell(sh)) => {
                 if sh.state.exited {
                     String::from("shell (exited)")
@@ -1215,7 +2077,8 @@ impl Workspace {
                 }
             }
             None => String::new(),
-        }
+        };
+        short_tab_title(&raw)
     }
 
     /// Tab-management keys, active in every mode — including shell tabs,
@@ -1228,6 +2091,10 @@ impl Workspace {
             match key.code {
                 KeyCode::Char('t') | KeyCode::Char('T') => {
                     self.new_browser_tab();
+                    return true;
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.new_text_tab();
                     return true;
                 }
                 KeyCode::Char('w') | KeyCode::Char('W') => {
@@ -1457,6 +2324,473 @@ mod tests {
             if let Tab::Browser(app) = tab {
                 assert_eq!(app.show_line_numbers, ws.show_line_numbers);
             }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn preview_off_by_default_and_toggleable() {
+        let (mut ws, dir) = test_workspace();
+        assert!(!ws.active_browser().unwrap().show_preview);
+        ws.active_browser_mut().unwrap().toggle_preview();
+        assert!(ws.active_browser().unwrap().show_preview);
+        assert_eq!(ws.active_browser().unwrap().status, "Preview on");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn tab_title_truncates_and_names_edited_file() {
+        assert_eq!(short_tab_title("short.txt"), "short.txt");
+        let t = short_tab_title("a_very_long_file_name_for_tab_title_testing.txt");
+        assert_eq!(t.chars().count(), 24);
+        assert!(t.ends_with('…'));
+
+        let (mut ws, dir) = test_workspace();
+        // Browser tabs name the folder.
+        let folder = dir.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(ws.tab_title(0), folder);
+        // Editing tabs name the open file instead.
+        ws.active_browser_mut().unwrap().open_editor();
+        assert!(matches!(ws.active_browser().unwrap().mode, Mode::Editor));
+        assert_eq!(ws.tab_title(0), "a.txt");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn key_event(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn key_event_ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn new_text_tab_opens_untitled_editor() {
+        let (mut ws, dir) = test_workspace();
+        ws.new_text_tab();
+        assert_eq!(ws.tabs.len(), 2);
+        assert_eq!(ws.active, 1);
+        let app = ws.active_browser().unwrap();
+        assert!(matches!(app.mode, Mode::Editor));
+        let ed = app.editor.as_ref().unwrap();
+        assert!(ed.is_untitled());
+        assert!(!ed.dirty, "a fresh untitled doc has nothing to lose");
+        assert_eq!(ws.tab_title(1), "untitled");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ctrl_s_on_untitled_opens_save_dialog() {
+        let (mut ws, dir) = test_workspace();
+        ws.new_text_tab();
+        crate::input::handle_key(&mut ws, key_event_ctrl(KeyCode::Char('s')));
+        assert!(ws.active_browser().unwrap().save_dialog.is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn type_in_dialog(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.save_dialog_key(key_event(KeyCode::Char(c)));
+        }
+    }
+
+    #[test]
+    fn save_dialog_saves_untitled_into_chosen_dir() {
+        let (mut ws, dir) = test_workspace();
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        ws.new_text_tab();
+        {
+            let ed = ws.active_browser_mut().unwrap().editor.as_mut().unwrap();
+            for c in "hello".chars() {
+                ed.insert_char(c);
+            }
+        }
+        crate::input::handle_key(&mut ws, key_event_ctrl(KeyCode::Char('s')));
+        let app = ws.active_browser_mut().unwrap();
+        // Navigate into "docs".
+        let idx = app
+            .save_dialog
+            .as_ref()
+            .unwrap()
+            .dirs
+            .iter()
+            .position(|d| d.file_name().unwrap() == "docs")
+            .unwrap();
+        app.save_dialog.as_mut().unwrap().selected = idx;
+        app.save_dialog_key(key_event(KeyCode::Right));
+        assert_eq!(app.save_dialog.as_ref().unwrap().cwd, dir.join("docs"));
+        // Type the file name and save.
+        type_in_dialog(app, "notes.txt");
+        app.save_dialog_key(key_event(KeyCode::Enter));
+        assert!(app.save_dialog.is_none(), "dialog closes after saving");
+        let saved = dir.join("docs").join("notes.txt");
+        assert!(saved.exists());
+        assert_eq!(std::fs::read_to_string(&saved).unwrap(), "hello\n");
+        let ed = app.editor.as_ref().unwrap();
+        assert!(!ed.is_untitled());
+        assert_eq!(ed.path, saved);
+        assert!(!ed.dirty);
+        assert_eq!(ws.tab_title(1), "notes.txt");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn save_dialog_overwrite_needs_confirmation() {
+        let (mut ws, dir) = test_workspace();
+        ws.new_text_tab();
+        {
+            let ed = ws.active_browser_mut().unwrap().editor.as_mut().unwrap();
+            for c in "new".chars() {
+                ed.insert_char(c);
+            }
+        }
+        crate::input::handle_key(&mut ws, key_event_ctrl(KeyCode::Char('s')));
+        let app = ws.active_browser_mut().unwrap();
+        type_in_dialog(app, "a.txt"); // already exists in the test dir
+        app.save_dialog_key(key_event(KeyCode::Enter));
+        assert!(
+            app.save_dialog.is_some(),
+            "first Enter only arms the overwrite prompt"
+        );
+        assert!(app
+            .save_dialog
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("overwrite"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "hello\n",
+            "file untouched until confirmed"
+        );
+        app.save_dialog_key(key_event(KeyCode::Enter));
+        assert!(app.save_dialog.is_none());
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "new\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn save_dialog_esc_cancels_without_saving() {
+        let (mut ws, dir) = test_workspace();
+        ws.new_text_tab();
+        crate::input::handle_key(&mut ws, key_event_ctrl(KeyCode::Char('s')));
+        let app = ws.active_browser_mut().unwrap();
+        type_in_dialog(app, "nope.txt");
+        app.save_dialog_key(key_event(KeyCode::Esc));
+        assert!(app.save_dialog.is_none());
+        assert!(!dir.join("nope.txt").exists());
+        assert!(app.editor.as_ref().unwrap().is_untitled());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn save_dialog_navigates_dirs() {
+        let (mut ws, dir) = test_workspace();
+        std::fs::create_dir_all(dir.join("sub").join("deep")).unwrap();
+        ws.new_text_tab();
+        crate::input::handle_key(&mut ws, key_event_ctrl(KeyCode::Char('s')));
+        let app = ws.active_browser_mut().unwrap();
+        let dlg = app.save_dialog.as_ref().unwrap();
+        assert_eq!(dlg.cwd, dir);
+        assert!(dlg.dirs.iter().any(|d| d.file_name().unwrap() == "sub"));
+        // Down/up wrap around the list.
+        let n = app.save_dialog.as_ref().unwrap().dirs.len();
+        app.save_dialog_key(key_event(KeyCode::Up));
+        assert_eq!(app.save_dialog.as_ref().unwrap().selected, n - 1);
+        app.save_dialog_key(key_event(KeyCode::Down));
+        assert_eq!(app.save_dialog.as_ref().unwrap().selected, 0);
+        // Enter the first dir, then go back up.
+        app.save_dialog.as_mut().unwrap().selected = 0;
+        let first = app.save_dialog.as_ref().unwrap().dirs[0].clone();
+        app.save_dialog_key(key_event(KeyCode::Right));
+        assert_eq!(app.save_dialog.as_ref().unwrap().cwd, first);
+        app.save_dialog_key(key_event(KeyCode::Left));
+        assert_eq!(app.save_dialog.as_ref().unwrap().cwd, dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn test_net_view() -> NetView {
+        NetView::new().expect("mDNS discovery should start in tests")
+    }
+
+    #[test]
+    fn net_view_add_manual_host() {
+        let mut nv = test_net_view();
+        nv.add_manual_host("192.168.1.10");
+        assert_eq!(nv.devices.len(), 1);
+        assert_eq!(nv.devices[0].host, "192.168.1.10");
+        assert!(nv.devices[0].manual);
+        // Duplicates are ignored.
+        nv.add_manual_host("192.168.1.10");
+        assert_eq!(nv.devices.len(), 1);
+        // Blank input is ignored.
+        nv.add_manual_host("   ");
+        assert_eq!(nv.devices.len(), 1);
+    }
+
+    #[test]
+    fn net_view_shares_flow() {
+        let mut nv = test_net_view();
+        nv.state = NetState::LoadingShares {
+            host: String::from("nas"),
+        };
+        let out = nv.apply_msg(NetMsg::Shares {
+            host: String::from("nas"),
+            result: Ok(vec![String::from("Media"), String::from("Backups")]),
+        });
+        assert!(out.is_none());
+        assert!(matches!(nv.state, NetState::Shares { .. }));
+        assert_eq!(nv.selected, 0);
+        // A stale reply after backing out is ignored.
+        nv.back();
+        assert!(matches!(nv.state, NetState::Devices));
+        let out = nv.apply_msg(NetMsg::Shares {
+            host: String::from("nas"),
+            result: Ok(vec![String::from("X")]),
+        });
+        assert!(out.is_none());
+        assert!(matches!(nv.state, NetState::Devices));
+    }
+
+    #[test]
+    fn net_view_empty_share_list() {
+        let mut nv = test_net_view();
+        nv.state = NetState::LoadingShares {
+            host: String::from("nas"),
+        };
+        nv.apply_msg(NetMsg::Shares {
+            host: String::from("nas"),
+            result: Ok(Vec::new()),
+        });
+        assert!(matches!(nv.state, NetState::Devices));
+        assert!(!nv.message.is_empty());
+    }
+
+    #[test]
+    fn net_view_mount_success_returns_mount() {
+        let mut nv = test_net_view();
+        nv.state = NetState::Mounting {
+            host: String::from("nas"),
+            share: String::from("Media"),
+        };
+        let out = nv.apply_msg(NetMsg::Mounted {
+            host: String::from("nas"),
+            share: String::from("Media"),
+            result: Ok(net::MountedShare {
+                path: PathBuf::from("/tmp/fex-test-mnt"),
+                needs_unmount: false,
+            }),
+        });
+        let (host, share, mounted) = out.expect("mount should be returned");
+        assert_eq!(host, "nas");
+        assert_eq!(share, "Media");
+        assert_eq!(mounted.path, PathBuf::from("/tmp/fex-test-mnt"));
+        assert!(matches!(nv.state, NetState::Devices));
+    }
+
+    #[test]
+    fn net_view_auth_failure_prompts_for_username() {
+        let mut nv = test_net_view();
+        nv.state = NetState::Mounting {
+            host: String::from("nas"),
+            share: String::from("Media"),
+        };
+        let err = io::Error::new(
+            io::ErrorKind::Other,
+            "mount_smbfs: server rejected the connection: Authentication error",
+        );
+        let out = nv.apply_msg(NetMsg::Mounted {
+            host: String::from("nas"),
+            share: String::from("Media"),
+            result: Err(err),
+        });
+        assert!(out.is_none());
+        assert_eq!(nv.take_next_prompt(), Some(InputKind::SmbUser));
+        // Username in, password prompt chained by submit_input; the view
+        // just records the user.
+        nv.submit_credentials(InputKind::SmbUser, "kurt");
+        // Password in: the mount is retried with both credentials.
+        nv.submit_credentials(InputKind::SmbPass, "secret");
+        assert!(matches!(nv.state, NetState::Mounting { .. }));
+    }
+
+    #[test]
+    fn net_view_non_auth_mount_failure_shows_error() {
+        let mut nv = test_net_view();
+        nv.state = NetState::Mounting {
+            host: String::from("nas"),
+            share: String::from("Media"),
+        };
+        let out = nv.apply_msg(NetMsg::Mounted {
+            host: String::from("nas"),
+            share: String::from("Media"),
+            result: Err(io::Error::new(io::ErrorKind::Other, "No route to host")),
+        });
+        assert!(out.is_none());
+        assert!(nv.take_next_prompt().is_none());
+        assert!(nv.message.contains("No route to host"));
+    }
+
+    #[test]
+    fn net_view_share_list_failure_prompts_for_share_name() {
+        let mut nv = test_net_view();
+        nv.state = NetState::LoadingShares {
+            host: String::from("nas"),
+        };
+        nv.apply_msg(NetMsg::Shares {
+            host: String::from("nas"),
+            result: Err(io::Error::new(io::ErrorKind::Other, "timed out")),
+        });
+        assert_eq!(nv.take_next_prompt(), Some(InputKind::NetShare));
+        // Typing the share name starts the mount.
+        nv.submit_manual_share("Media");
+        assert!(matches!(nv.state, NetState::Mounting { .. }));
+    }
+
+    #[test]
+    fn mounted_tab_names_share_and_unmounts_on_close() {
+        let (mut ws, _dir) = test_workspace();
+        ws.open_mounted_tab(
+            "nas",
+            "Media",
+            net::MountedShare {
+                path: PathBuf::from("/tmp/fex-test-mnt"),
+                needs_unmount: true,
+            },
+        );
+        assert_eq!(ws.tabs.len(), 2);
+        assert_eq!(ws.tab_title(1), "//nas/Media");
+        // Closing the tab unmounts (best effort; a no-op on Linux).
+        ws.close_active_tab();
+        assert_eq!(ws.tabs.len(), 1);
+    }
+
+    fn fake_drive(name: &str) -> Drive {
+        Drive {
+            name: name.to_string(),
+            mount_point: PathBuf::from(format!("/mnt/{name}")),
+            available: 10_000,
+            total: 100_000,
+            removable: false,
+        }
+    }
+
+    #[test]
+    fn net_view_rows_group_drives_then_network() {
+        let mut nv = test_net_view();
+        nv.drives = vec![fake_drive("b"), fake_drive("a")];
+        nv.devices = vec![NetDevice::manual("nas")];
+        let rows = nv.rows();
+        assert_eq!(
+            rows,
+            vec![
+                NetRow::Header(NetSection::Drives),
+                NetRow::Drive(0),
+                NetRow::Drive(1),
+                NetRow::Header(NetSection::Network),
+                NetRow::Device(0),
+            ]
+        );
+    }
+
+    #[test]
+    fn net_view_rows_show_hint_when_no_devices() {
+        let mut nv = test_net_view();
+        nv.drives = vec![fake_drive("d")];
+        nv.devices.clear();
+        let rows = nv.rows();
+        assert_eq!(
+            rows,
+            vec![
+                NetRow::Header(NetSection::Drives),
+                NetRow::Drive(0),
+                NetRow::Header(NetSection::Network),
+                NetRow::Hint,
+            ]
+        );
+        // The hint is not selectable.
+        assert!(!NetRow::Hint.selectable());
+        assert!(!NetRow::Header(NetSection::Drives).selectable());
+    }
+
+    #[test]
+    fn net_view_selection_skips_headers_and_wraps() {
+        let mut nv = test_net_view();
+        nv.drives = vec![fake_drive("d")];
+        nv.devices = vec![NetDevice::manual("nas")];
+        // rows: [Header, Drive(0), Header, Device(0)]
+        nv.selected = nv.first_selectable();
+        assert_eq!(nv.rows()[nv.selected], NetRow::Drive(0));
+        nv.move_selection(1);
+        assert_eq!(nv.rows()[nv.selected], NetRow::Device(0));
+        nv.move_selection(1); // wraps past both headers
+        assert_eq!(nv.rows()[nv.selected], NetRow::Drive(0));
+        nv.move_selection(-1);
+        assert_eq!(nv.rows()[nv.selected], NetRow::Device(0));
+        // Home/End jump to first/last selectable rows.
+        nv.jump_to(0);
+        assert_eq!(nv.rows()[nv.selected], NetRow::Drive(0));
+        nv.jump_to(usize::MAX);
+        assert_eq!(nv.rows()[nv.selected], NetRow::Device(0));
+    }
+
+    #[test]
+    fn net_view_enter_on_drive_row_is_ignored() {
+        let mut nv = test_net_view();
+        nv.drives = vec![fake_drive("d")];
+        nv.selected = nv.first_selectable();
+        assert!(nv.selected_drive().is_some());
+        assert!(nv.selected_device().is_none());
+        nv.enter();
+        // Drives are opened as tabs by the input layer; NetView::enter
+        // ignores them.
+        assert!(matches!(nv.state, NetState::Devices));
+    }
+
+    #[test]
+    fn net_view_enter_on_device_row_starts_share_listing() {
+        let mut nv = test_net_view();
+        nv.drives.clear();
+        nv.devices = vec![NetDevice::manual("nas")];
+        nv.selected = nv.first_selectable();
+        assert_eq!(nv.rows()[nv.selected], NetRow::Device(0));
+        assert!(nv.selected_drive().is_none());
+        nv.enter();
+        assert!(matches!(
+            nv.state,
+            NetState::LoadingShares { ref host } if host == "nas"
+        ));
+    }
+
+    #[test]
+    fn net_view_back_resets_selection_past_headers() {
+        let mut nv = test_net_view();
+        nv.drives = vec![fake_drive("d")];
+        nv.state = NetState::Shares {
+            host: String::from("nas"),
+            shares: vec![String::from("Media")],
+        };
+        nv.selected = 0; // a share-list index, meaningless up top
+        assert!(!nv.back()); // back a level, don't close
+        assert!(matches!(nv.state, NetState::Devices));
+        assert!(nv.rows()[nv.selected].selectable());
+    }
+
+    #[test]
+    fn open_drive_tab_opens_browser_at_mount_point() {
+        let (mut ws, dir) = test_workspace();
+        let target = dir.join("drivevol");
+        std::fs::create_dir(&target).unwrap();
+        ws.open_drive_tab(&target, "TestDrive");
+        assert_eq!(ws.tabs.len(), 2);
+        assert_eq!(ws.active, 1);
+        match &ws.tabs[1] {
+            Tab::Browser(app) => {
+                assert_eq!(app.cwd, target);
+                assert!(app.mount_point.is_none());
+                assert!(app.network_name.is_none());
+            }
+            _ => panic!("expected a browser tab"),
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }

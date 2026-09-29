@@ -1,8 +1,9 @@
 //! Rendering: layout, file list, preview pane, status bar, and popups.
 
-use crate::app::{App, InputKind, Mode, Tab, ViewMode, Workspace};
+use crate::app::{App, InputKind, Mode, NetRow, NetState, Tab, ViewMode, Workspace};
 use crate::editor::Editor;
 use crate::fs::Preview;
+use crate::net;
 use crate::theme::Theme;
 use chrono::{DateTime, Local};
 use pulldown_cmark::{Event, Parser, Tag, TagEnd};
@@ -80,6 +81,22 @@ pub fn render(frame: &mut Frame, ws: &mut Workspace) {
         return;
     }
 
+    // Network device browser. Its input prompts pop over it.
+    if matches!(app.mode, Mode::Network)
+        || matches!(
+            app.mode,
+            Mode::Input(
+                InputKind::NetHost | InputKind::NetShare | InputKind::SmbUser | InputKind::SmbPass
+            )
+        )
+    {
+        render_network(frame, app, content);
+        if let Mode::Input(kind) = app.mode {
+            render_input_popup(frame, app, kind, content);
+        }
+        return;
+    }
+
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -96,12 +113,16 @@ pub fn render(frame: &mut Frame, ws: &mut Workspace) {
         Mode::Search => render_search(frame, app, layout[1]),
         _ if app.view == ViewMode::Columns => render_columns(frame, app, layout[1]),
         _ => {
-            let main = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
-                .split(layout[1]);
-            render_list(frame, app, main[0]);
-            render_preview(frame, app, main[1]);
+            if app.show_preview {
+                let main = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+                    .split(layout[1]);
+                render_list(frame, app, main[0]);
+                render_preview(frame, app, main[1]);
+            } else {
+                render_list(frame, app, layout[1]);
+            }
         }
     }
 
@@ -112,7 +133,12 @@ pub fn render(frame: &mut Frame, ws: &mut Workspace) {
         Mode::Input(kind) => render_input_popup(frame, app, kind, content),
         Mode::ConfirmDelete => render_confirm_popup(frame, app, content),
         Mode::Help => render_help_popup(frame, ws, content),
-        Mode::Normal | Mode::Editor | Mode::ConfirmDiscard | Mode::Search | Mode::Sheet => {}
+        Mode::Normal
+        | Mode::Editor
+        | Mode::ConfirmDiscard
+        | Mode::Search
+        | Mode::Sheet
+        | Mode::Network => {}
     }
 }
 
@@ -142,7 +168,7 @@ fn render_tab_bar(frame: &mut Frame, ws: &mut Workspace, th: &Theme, area: Rect)
         }
     }
     // Right-aligned hint, dimmed.
-    let hint = "Ctrl+T new tab · ` terminal · click a tab to switch";
+    let hint = "Ctrl+T new tab · Ctrl+N new text doc · ` terminal · click a tab to switch";
     let used = x.saturating_sub(area.x) as usize;
     let pad = (area.width as usize).saturating_sub(used + hint.len() + 1);
     if pad > 0 {
@@ -229,10 +255,144 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_stateful_widget(list, area, &mut app.list_state);
 }
 
+/// A full-width separator line with a centered label, e.g.
+/// `────── Drives ──────`. Used to split the Network view into its
+/// Drives and Network sections.
+fn section_separator(label: &str, width: usize) -> String {
+    let label = format!(" {label} ");
+    if width <= label.len() {
+        return label;
+    }
+    let fill = width - label.len();
+    let left = fill / 2;
+    format!("{}{label}{}", "─".repeat(left), "─".repeat(fill - left))
+}
+
+/// Network view: discovered SMB devices, or the shares on one device.
+/// Selecting a share mounts it and opens it as a regular browser tab.
+fn render_network(frame: &mut Frame, app: &mut App, area: Rect) {
+    let th = app.theme();
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(5),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    let (title, rows) = match app.net.as_ref().map(|nv| &nv.state) {
+        Some(NetState::Devices) => {
+            let nv = app.net.as_ref().expect("network view");
+            // Inner width for the full-width section separators.
+            let inner_w = area.width.saturating_sub(2) as usize;
+            let rows: Vec<ListItem> = nv
+                .rows()
+                .iter()
+                .map(|row| match row {
+                    NetRow::Header(section) => ListItem::new(Line::from(Span::styled(
+                        section_separator(section.label(), inner_w),
+                        Style::default().fg(th.dim),
+                    ))),
+                    NetRow::Drive(i) => {
+                        let d = &nv.drives[*i];
+                        let mut spans = vec![Span::styled(
+                            d.name.clone(),
+                            Style::default().fg(th.heading).add_modifier(Modifier::BOLD),
+                        )];
+                        spans.push(Span::styled(
+                            format!("  {}", net::drive_space(d)),
+                            Style::default().fg(th.dim),
+                        ));
+                        if d.removable {
+                            spans.push(Span::styled("  removable", Style::default().fg(th.dim)));
+                        }
+                        ListItem::new(Line::from(spans))
+                    }
+                    NetRow::Device(i) => {
+                        let d = &nv.devices[*i];
+                        let mut spans = vec![Span::styled(
+                            d.name.clone(),
+                            Style::default().fg(th.heading).add_modifier(Modifier::BOLD),
+                        )];
+                        spans.push(Span::styled(
+                            format!("  {}", d.host),
+                            Style::default().fg(th.dim),
+                        ));
+                        if d.manual {
+                            spans.push(Span::styled("  manual", Style::default().fg(th.dim)));
+                        }
+                        if nv.mounted_hosts.iter().any(|h| h == &d.host) {
+                            spans.push(Span::styled("  ● mounted", Style::default().fg(th.accent)));
+                        }
+                        ListItem::new(Line::from(spans))
+                    }
+                    NetRow::Hint => ListItem::new(Line::from(Span::styled(
+                        "No SMB devices found yet — press m to add one by hand",
+                        Style::default().fg(th.dim),
+                    ))),
+                })
+                .collect();
+            (" Drives & network ", rows)
+        }
+        Some(NetState::Shares { host, shares }) => {
+            let rows: Vec<ListItem> = shares
+                .iter()
+                .map(|s| {
+                    ListItem::new(Line::from(vec![
+                        Span::styled(format!("//{host}/"), Style::default().fg(th.dim)),
+                        Span::styled(
+                            s.clone(),
+                            Style::default().fg(th.heading).add_modifier(Modifier::BOLD),
+                        ),
+                    ]))
+                })
+                .collect();
+            (" Network — shares ", rows)
+        }
+        _ => (" Network ", Vec::new()),
+    };
+
+    let selected = app.net.as_ref().map(|nv| nv.selected);
+    let mut state = ListState::default();
+    if !rows.is_empty() {
+        state.select(selected);
+    }
+    let list = List::new(rows)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD))
+        .highlight_symbol("▸ ");
+    frame.render_stateful_widget(list, layout[0], &mut state);
+
+    // Live status line: scanning, loading, mounting, or errors.
+    let message = app
+        .net
+        .as_ref()
+        .map(|nv| nv.message.clone())
+        .unwrap_or_default();
+    let busy = app.net.as_ref().is_some_and(|nv| {
+        matches!(
+            nv.state,
+            NetState::LoadingShares { .. } | NetState::Mounting { .. }
+        )
+    });
+    let status_text = if busy || !message.is_empty() {
+        message
+    } else {
+        String::new()
+    };
+    let status = Paragraph::new(status_text).style(Style::default().fg(th.dim));
+    frame.render_widget(status, layout[1]);
+
+    let hints = "↑↓ move · Enter open/list · ← back · m add host · Esc close";
+    let footer = Paragraph::new(hints).style(Style::default().fg(th.dim));
+    frame.render_widget(footer, layout[2]);
+}
+
 /// Miller-column view: directory columns side by side, with a file
 /// preview panel at the right when the active selection is a file.
 fn render_columns(frame: &mut Frame, app: &mut App, area: Rect) {
-    let show_preview = app.selected_entry().is_some_and(|e| !e.is_dir);
+    let show_preview = app.show_preview && app.selected_entry().is_some_and(|e| !e.is_dir);
     let n_panels = app.columns.len() + usize::from(show_preview);
     if n_panels == 0 {
         return;
@@ -567,6 +727,118 @@ fn render_sheet(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
+/// Save-as dialog: a directory browser plus a file-name field, rendered
+/// over the editor.
+fn render_save_dialog(frame: &mut Frame, app: &App, area: Rect) {
+    let th = app.theme();
+    let Some(dlg) = app.save_dialog.as_ref() else {
+        return;
+    };
+    let popup = centered_rect(62, 70, area);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Save as ")
+        .style(Style::default().fg(th.accent));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    // Current directory, truncated from the left when too long.
+    let cwd_s = dlg.cwd.display().to_string();
+    let w = chunks[0].width as usize;
+    let cwd_show = if cwd_s.len() > w {
+        format!("…{}", &cwd_s[cwd_s.len() - w + 1..])
+    } else {
+        cwd_s
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            cwd_show,
+            Style::default().fg(th.dim),
+        ))),
+        chunks[0],
+    );
+
+    // Directory list, kept scrolled so the selection stays visible.
+    let list_h = chunks[1].height as usize;
+    let start = if dlg.selected + 1 > list_h.max(1) {
+        dlg.selected + 1 - list_h.max(1)
+    } else {
+        0
+    };
+    let rows: Vec<Line> = dlg
+        .dirs
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(list_h)
+        .map(|(i, d)| {
+            let name = d
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| d.display().to_string());
+            let label = format!("{}/", name);
+            if i == dlg.selected {
+                Line::from(vec![
+                    Span::styled(
+                        "▸ ",
+                        Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        label,
+                        Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+                    ),
+                ])
+            } else {
+                Line::from(format!("  {}", label))
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(rows), chunks[1]);
+
+    // File-name field with a block cursor.
+    let fc = dlg.fcursor.min(dlg.filename.chars().count());
+    let left: String = dlg.filename.chars().take(fc).collect();
+    let right: String = dlg.filename.chars().skip(fc).collect();
+    let name_line = Line::from(vec![
+        Span::styled("Name: ", Style::default().fg(th.dim)),
+        Span::raw(left),
+        Span::styled("█", Style::default().fg(th.accent)),
+        Span::styled(right, Style::default().fg(th.dim)),
+    ]);
+    frame.render_widget(Paragraph::new(name_line), chunks[2]);
+
+    // Message line (prompts and errors).
+    let msg_style = if dlg.message.starts_with("Cannot") || dlg.message.starts_with("Save failed") {
+        Style::default().fg(th.danger)
+    } else {
+        Style::default().fg(th.accent)
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(dlg.message.clone(), msg_style))),
+        chunks[3],
+    );
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "↑↓ select · → open dir · ← up · type name · Enter save · Esc cancel",
+            Style::default().fg(th.dim),
+        ))),
+        chunks[4],
+    );
+}
+
 /// Render markdown source into styled lines: headings bold blue, `code` green,
 /// *emphasis* italic, **strong** bold, links underlined with the URL dimmed.
 fn render_markdown(theme: &Theme, src: &str) -> Vec<Line<'static>> {
@@ -718,7 +990,7 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_footer(frame: &mut Frame, theme: &Theme, area: Rect) {
-    let hints = "↑↓ move · →/Enter open · ← back · / filter · f find · 1/2 list/columns · e edit · n new · r rename · d delete · y/x/p copy/cut/paste · Y path · C preview text · s sort · . hidden · ? help · q quit";
+    let hints = "↑↓ move · →/Enter open · ← back · / filter · f find · 1/2 list/columns · P preview · e edit · n new · r rename · d delete · y/x/p copy/cut/paste · Y path · C preview text · s sort · . hidden · G network · ? help · q quit";
     let footer = Paragraph::new(hints).style(Style::default().fg(theme.dim));
     frame.render_widget(footer, area);
 }
@@ -747,8 +1019,14 @@ fn render_input_popup(frame: &mut Frame, app: &App, kind: InputKind, area: Rect)
     let popup = centered_rect(60, 20, area);
     frame.render_widget(Clear, popup);
     let cursor = app.cursor.min(app.input.chars().count());
-    let left: String = app.input.chars().take(cursor).collect();
-    let right: String = app.input.chars().skip(cursor).collect();
+    // Passwords are masked on screen.
+    let shown: String = if kind.is_secret() {
+        "•".repeat(app.input.chars().count())
+    } else {
+        app.input.clone()
+    };
+    let left: String = shown.chars().take(cursor).collect();
+    let right: String = shown.chars().skip(cursor).collect();
     let line = Line::from(vec![
         Span::raw(left),
         Span::styled("█", Style::default().fg(th.accent)),
@@ -838,7 +1116,11 @@ fn render_editor(frame: &mut Frame, app: &mut App, area: Rect) {
 
         let title = format!(
             " {} {} ",
-            ed.path.display(),
+            if ed.path.as_os_str().is_empty() {
+                "untitled".to_string()
+            } else {
+                ed.path.display().to_string()
+            },
             if ed.dirty { "[modified]" } else { "[saved]" }
         );
         let para = Paragraph::new(text).block(Block::default().borders(Borders::ALL).title(title));
@@ -867,6 +1149,9 @@ fn render_editor(frame: &mut Frame, app: &mut App, area: Rect) {
 
     if discard {
         render_discard_popup(frame, &app.theme(), area);
+    }
+    if app.save_dialog.is_some() {
+        render_save_dialog(frame, app, area);
     }
 }
 
@@ -966,6 +1251,7 @@ fn render_help_popup(frame: &mut Frame, ws: &Workspace, area: Rect) {
             "search file names (Tab: deep content search, Enter: jump)",
         ),
         ("1 / 2", "list view / Miller-column view"),
+        ("P", "toggle the preview pane (off by default)"),
         ("s / S", "cycle sort key · toggle direction"),
         (".", "show / hide hidden files"),
         ("n / N", "new file / new directory"),
@@ -975,11 +1261,16 @@ fn render_help_popup(frame: &mut Frame, ws: &Workspace, area: Rect) {
         ("Y", "copy selected path to the system clipboard"),
         ("C", "copy preview pane text to the system clipboard"),
         (
+            "G",
+            "drives & network: open a drive, find SMB devices, mount a share as a new tab",
+        ),
+        (
             "e",
             "edit file (text editor) · CSV files open the table viewer",
         ),
         ("`", "open a terminal tab (a real shell in this folder)"),
         ("Ctrl+T", "new file-browser tab"),
+        ("Ctrl+N", "new blank text document (tab)"),
         ("Ctrl+W", "close current tab"),
         ("Ctrl+PgUp / PgDn", "previous / next tab"),
         ("Alt+1 … Alt+9", "jump to tab"),
@@ -1030,7 +1321,7 @@ fn render_help_popup(frame: &mut Frame, ws: &Workspace, area: Rect) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "Enter on a file opens it with the system default app. Terminal tabs run your $SHELL — almost every key goes straight to it (Ctrl+C is SIGINT there); Ctrl+T / Ctrl+W / Ctrl+PgUp/PgDn / Alt+1-9 still manage tabs. In the editor: arrows/Home/End/PgUp/PgDn move · Ctrl+Left/Right jump by word · type to edit · paste is instant (bracketed paste) · Ctrl+S save · Ctrl+Z/Y undo/redo · Ctrl+A select all · Ctrl+C/X/V copy/cut/paste (selection, never line numbers; copies also land on the system clipboard, so Cmd+V works anywhere — the terminal itself intercepts Cmd+C, it never reaches fex) · Esc clears selection, then closes (asks if unsaved). In the CSV viewer: arrows move · Enter edits a cell · Tab next cell · a adds a row · A adds a column · Ctrl+S saves · Esc closes.",
+        "Enter on a file opens it with the system default app. Terminal tabs run your $SHELL (PowerShell on Windows) — almost every key goes straight to it (Ctrl+C is SIGINT there); Ctrl+T / Ctrl+N / Ctrl+W / Ctrl+PgUp/PgDn / Alt+1-9 still manage tabs. Ctrl+N opens a new blank text document in its own tab; Ctrl+S on it opens a save dialog where you browse to a folder, type a name, and Enter saves (existing files ask to overwrite). In the editor: arrows/Home/End/PgUp/PgDn move · Ctrl+Left/Right jump by word · type to edit · paste is instant (bracketed paste) · Ctrl+S save · Ctrl+Z/Y undo/redo · Ctrl+A select all · Ctrl+C/X/V copy/cut/paste (selection, never line numbers; copies also land on the system clipboard, so Cmd+V works anywhere — the terminal itself intercepts Cmd+C, it never reaches fex) · Esc clears selection, then closes (asks if unsaved). In the CSV viewer: arrows move · Enter edits a cell · Tab next cell · a adds a row · A adds a column · Ctrl+S saves · Esc closes.",
         Style::default().fg(Color::DarkGray),
     )));
     let help = Paragraph::new(lines).block(

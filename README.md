@@ -36,11 +36,11 @@ there first, or pass a path: `./target/release/fex ~/Documents`.
 
 ## Views
 
-- **List view** (`1`) — classic two-pane layout: file list on the left,
-  preview on the right.
+- **List view** (`1`) — file list; press `P` for the preview pane on the
+  right.
 - **Miller columns** (`2`) — macOS Finder-style column browsing. ←/→ move
-  between columns, ↑/↓ move within a column. A preview panel appears on the
-  right when a file is selected.
+  between columns, ↑/↓ move within a column. With `P` on, a preview panel
+  appears on the right when a file is selected.
 
 The listing **auto-refreshes**: if files appear, change, or vanish behind
 fex's back (a download landing, another program writing), the view updates
@@ -48,7 +48,8 @@ on its own within a fraction of a second. Your selection is preserved.
 
 ## Preview pane
 
-The highlighted file is previewed automatically:
+The preview pane is **off by default** — press `P` to toggle it. When on,
+the highlighted file is previewed automatically:
 
 | File type | Preview |
 |---|---|
@@ -88,11 +89,14 @@ own background isn't pure black.
 The top strip shows every open tab — click one to switch, or use the
 keyboard. Each file-browser tab keeps its own directory, selection, filter,
 sort, and editor; the file clipboard (`y` / `x` / `p`) is shared across tabs.
+A tab names its folder, or the open file while you're editing it (a new
+blank document shows "untitled"; long names are truncated to 24 characters).
 
 | Keys | Action |
 |---|---|
-| `` ` `` (backtick) | Open a terminal tab — a real interactive shell (`$SHELL`) in the current folder |
+| `` ` `` (backtick) | Open a terminal tab — a real interactive shell in the current folder (`$SHELL` on macOS/Linux, PowerShell on Windows) |
 | `Ctrl+T` | New file-browser tab |
+| `Ctrl+N` | New blank text document in its own tab |
 | `Ctrl+W` | Close current tab (the last tab can't be closed) |
 | `Ctrl+PgUp` / `Ctrl+PgDn` | Previous / next tab |
 | `Alt+1` … `Alt+9` | Jump to tab |
@@ -102,6 +106,39 @@ Inside a terminal tab almost every key goes straight to the shell, so
 `Ctrl+C` there is SIGINT (interrupt), not copy — the tab-management keys
 above still work. The shell is a full pty: colors, prompts, `vim`, `ssh`,
 and full-screen programs all work.
+
+## Drives & network
+
+`G` opens one combined page: your local **drives** (volumes, USB sticks,
+…) with free space, then the **network** devices — each group under its
+own labeled separator line. `Enter` on a drive opens it as a regular
+browser tab.
+
+Below the drives, fex listens for mDNS/Bonjour announcements (the same
+discovery Finder and Windows Network use) and lists SMB file servers on
+your LAN with their names and addresses — no root, no setup. Devices
+with a share currently mounted are tagged `● mounted`.
+
+- `↑` / `↓` — pick a drive or device; `Enter` opens the drive or lists
+  the device's shares.
+- `Enter` on a share **mounts it and opens it as a regular browser tab**,
+  so preview, editing, search, and copy/paste all work on its files.
+- The tab is named `//host/share`. Closing the tab unmounts the share
+  (macOS); quitting fex unmounts everything.
+- If a share needs a login, fex prompts for username then password
+  (the password is masked; credentials live only in memory for the
+  session). On Windows the OS handles authentication itself.
+- `m` adds a host by hand (IP or hostname) for devices that don't
+  advertise over mDNS. If listing shares fails, fex asks for the share
+  name instead.
+
+How it mounts, per OS:
+
+| | Method |
+|---|---|
+| macOS | `mount_smbfs` into a temp dir (`smbutil view` lists shares) |
+| Windows | none — `\\host\share` UNC paths browse directly (`net view` lists shares) |
+| Linux | not supported: mount the share with your OS and browse it as a folder |
 
 ## Finding things
 
@@ -155,7 +192,10 @@ events to the app and you want the terminal's native text selection.)
   - With no selection: VS Code style — the whole current line is
     copied/cut, and paste inserts below the current line.
 - **Save / close** — `Ctrl+S` saves, `Esc` closes (asks about unsaved
-  changes first).
+  changes first). On a new blank document (`Ctrl+N` tab) `Ctrl+S` opens a
+  save dialog instead: browse folders (`↑↓` select, `→` open, `←` up),
+  type a file name, `Enter` saves (`Enter` again to overwrite an existing
+  file, `Esc` cancels). Syntax highlighting picks up the new extension.
 - **Syntax highlighting** — Rust, Python, JS/TS, Go, C/C++, Java, C#, Ruby,
   HTML, CSS, SQL, YAML, TOML, JSON, Markdown, shell. Colored separately:
   keywords, strings, comments, numbers, types (capitalized names,
@@ -215,6 +255,7 @@ src/
                vt100), key-to-bytes translation, screen rendering
   fs.rs      — filesystem ops (list, preview, search, create/rename/delete/copy/move)
   input.rs   — keyboard / paste / mouse handling per UI mode
+  net.rs     — network: mDNS discovery, SMB share listing, mount/unmount
   ui.rs      — rendering (tab bar, list, columns, preview, editor, sheet, popups)
   theme.rs   — color themes + settings persistence (~/.config/fex/settings)
 ```

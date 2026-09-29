@@ -1,6 +1,7 @@
 //! An interactive shell running in a tab, backed by a pseudo-terminal.
 //!
-//! Each shell tab spawns the user's `$SHELL` under `portable-pty`; a reader
+//! Each shell tab spawns an interactive shell under `portable-pty` — the
+//! user's `$SHELL` on Unix, PowerShell on Windows; a reader thread pumps
 //! thread pumps pty bytes into a `vt100` parser, whose screen is drawn with
 //! ratatui. Keystrokes are translated to the byte sequences a terminal
 //! would send (so Ctrl+C really is SIGINT here).
@@ -112,7 +113,8 @@ pub struct ShellTab {
 }
 
 impl ShellTab {
-    /// Spawn an interactive `$SHELL` (fallback `/bin/sh`) in `cwd`.
+    /// Spawn an interactive shell in `cwd`: the user's `$SHELL` (fallback
+    /// `/bin/sh`) on Unix, PowerShell on Windows.
     pub fn spawn(cols: u16, rows: u16, cwd: &Path) -> std::io::Result<Self> {
         let state = ShellState::new(cols, rows);
         let pty_system = native_pty_system();
@@ -125,10 +127,19 @@ impl ShellTab {
             })
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| String::from("/bin/sh"));
+        // Windows has no $SHELL and no /bin/sh: PowerShell is the default shell there.
+        let shell = if cfg!(windows) {
+            String::from("powershell.exe")
+        } else {
+            std::env::var("SHELL").unwrap_or_else(|_| String::from("/bin/sh"))
+        };
         let mut cmd = CommandBuilder::new(shell);
         cmd.cwd(cwd);
-        cmd.args(["-i"]);
+        if cfg!(windows) {
+            cmd.args(["-NoLogo"]);
+        } else {
+            cmd.args(["-i"]);
+        }
         // The vt100 parser speaks xterm; advertise exactly that.
         cmd.env("TERM", "xterm-256color");
 

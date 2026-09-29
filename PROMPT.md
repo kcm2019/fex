@@ -18,7 +18,7 @@ Additional features:
   `Ctrl+X` / `Ctrl+V` like any OS (`y` / `x` / `p` still work as aliases),
   and `Y` copies the selected entry's absolute path to the system clipboard
   (via `pbcopy`; `Ctrl+Shift+C` also works where the terminal reports it)
-- Preview pane: extracted text for PDFs, rendered markdown, text preview for
+- Preview pane (off by default, `P` toggles): extracted text for PDFs, rendered markdown, text preview for
   other files, item count for directories, "[binary file]" for non-text
   (including images — thumbnails were removed as too laggy for a text
   terminal)
@@ -53,7 +53,7 @@ Deliverable: a working binary I can run with `cargo run`
   Linux (`wl-copy`/`wl-paste`, `xclip`, `xsel`, `xdg-open`). `cargo check
   --target x86_64-pc-windows-gnu` must pass.
 - **Miller-column view** (`2`; `1` returns to list view): Finder-style
-  columns, ←/→ between columns, preview panel for files.
+  columns, ←/→ between columns, preview panel for files when `P` is on.
 - **Recursive search** (`f`): filename substring search; `Tab` toggles deep
   content search (case-insensitive, skips binaries/>2MB); `Enter` jumps to
   the hit, `Esc` exits.
@@ -76,15 +76,34 @@ Deliverable: a working binary I can run with `cargo run`
   CSV text.
 - **No image thumbnails**: removed — too laggy and useless in a plain text
   terminal. Images get the generic binary preview.
-- **Themes**: Dark (orange accent, black selection), Solarized, Dracula, Mono.
+- **Themes**: Dark (purple accent, white text, no solid selection
+  backgrounds), Solarized, Dracula, Mono.
   `?` opens help, where `t` cycles the theme and `l` toggles editor line
   numbers. Both persist in `~/.config/fex/settings`.
 - **Tabs**: a clickable tab strip. `` ` `` opens a terminal tab (a real
-  interactive `$SHELL` in the current folder via a pty), `Ctrl+T` a new
-  file-browser tab, `Ctrl+W` closes, `Ctrl+PgUp/PgDn` switches, `Alt+1-9`
+  interactive shell in the current folder via a pty — `$SHELL` on Unix,
+  PowerShell on Windows), `Ctrl+T` a new
+  file-browser tab, `Ctrl+N` a new blank text document, `Ctrl+W` closes,
+  `Ctrl+PgUp/PgDn` switches, `Alt+1-9`
   jumps. The file clipboard is shared across tabs. In terminal tabs,
   `Ctrl+C` is SIGINT, not copy; editor copies land on the system clipboard
   (so `Cmd+V` works on macOS — the terminal intercepts `Cmd+C` itself).
+  On a blank document, `Ctrl+S` opens a save dialog: browse folders,
+  type a name, `Enter` saves (`Enter` again overwrites, `Esc` cancels).
 - **Sorting works in column view**: `s`/`S` re-sort every Miller column, not
   just the list view.
+- **Drives & network** (`G`): one combined page — local drives/volumes
+  with free space (via `sysinfo`, tagged `removable` for USB sticks;
+  `Enter` opens one as a regular browser tab), then mDNS/Bonjour
+  discovery of SMB servers on the LAN (pure-Rust `mdns-sd`, no system
+  services; devices with a mounted share tagged `● mounted`). `Enter` on
+  a device lists its shares (`smbutil view` on macOS, `net view` on
+  Windows); `Enter` on a share mounts it and opens it as a regular
+  browser tab — preview, edit, search, and copy/paste all work on its
+  files. macOS mounts with `mount_smbfs` into a temp dir and unmounts on
+  tab close (or quit); Windows browses `\\host\share` UNC paths directly;
+  Linux mounting is not supported (browse an OS-mounted share as a folder
+  instead). Auth-requiring shares prompt for username then password
+  (masked, memory-only); `m` adds a host by hand; a failed share listing
+  falls back to typing the share name.
 - **README.md documents every feature** and is updated with each change.

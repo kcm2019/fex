@@ -1,6 +1,6 @@
 //! Keyboard input handling, dispatched by UI mode.
 
-use crate::app::{App, InputKind, Mode, Tab, ViewMode, Workspace};
+use crate::app::{App, InputKind, Mode, NetState, Tab, ViewMode, Workspace};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 
 pub fn handle_key(ws: &mut Workspace, key: KeyEvent) {
@@ -86,6 +86,65 @@ pub fn handle_key(ws: &mut Workspace, key: KeyEvent) {
             KeyCode::Char('l') | KeyCode::Char('L') => ws.toggle_line_numbers(),
             _ => {}
         },
+        Mode::Network => handle_network(ws, key),
+    }
+}
+
+/// Keys for the Network view: browse local drives and discovered
+/// devices, mount a share as a new tab.
+fn handle_network(ws: &mut Workspace, key: KeyEvent) {
+    // Enter on a drive row opens it as a new browser tab; anywhere else
+    // the view handles the key itself.
+    if matches!(key.code, KeyCode::Enter | KeyCode::Right) {
+        let drive = ws.active_browser().and_then(|app| {
+            app.net
+                .as_ref()
+                .and_then(|nv| nv.selected_drive())
+                .map(|d| (d.mount_point.clone(), d.name.clone()))
+        });
+        if let Some((path, name)) = drive {
+            ws.open_drive_tab(&path, &name);
+            return;
+        }
+    }
+    let Some(app) = ws.active_browser_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Up => {
+            if let Some(nv) = app.net.as_mut() {
+                nv.move_selection(-1);
+            }
+        }
+        KeyCode::Down => {
+            if let Some(nv) = app.net.as_mut() {
+                nv.move_selection(1);
+            }
+        }
+        KeyCode::Home => {
+            if let Some(nv) = app.net.as_mut() {
+                nv.jump_to(0);
+            }
+        }
+        KeyCode::End => {
+            if let Some(nv) = app.net.as_mut() {
+                nv.jump_to(usize::MAX);
+            }
+        }
+        KeyCode::Enter | KeyCode::Right => app.net_enter(),
+        KeyCode::Left | KeyCode::Esc => app.net_back(),
+        // Add a host by hand (IP or hostname) for devices that don't
+        // advertise over mDNS.
+        KeyCode::Char('m') => {
+            if app
+                .net
+                .as_ref()
+                .is_some_and(|nv| matches!(nv.state, NetState::Devices))
+            {
+                app.start_input(InputKind::NetHost);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -95,8 +154,17 @@ pub fn handle_key(ws: &mut Workspace, key: KeyEvent) {
 fn handle_editor(app: &mut App, key: KeyEvent) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    // The save-as dialog eats every key while it's open.
+    if app.save_dialog.is_some() {
+        app.save_dialog_key(key);
+        return;
+    }
     if ctrl && !shift && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S')) {
-        if let Some(ed) = app.editor.as_mut() {
+        let untitled = app.editor.as_ref().is_some_and(|ed| ed.is_untitled());
+        if untitled {
+            // No path yet: browse for a location and file name.
+            app.open_save_dialog();
+        } else if let Some(ed) = app.editor.as_mut() {
             if let Err(e) = ed.save() {
                 ed.message = format!("Save failed: {e}");
             }
@@ -431,6 +499,9 @@ fn handle_normal(ws: &mut Workspace, key: KeyEvent) {
         KeyCode::Char('1') => app.exit_column_mode(),
         KeyCode::Char('2') => app.enter_column_mode(),
 
+        // Preview pane (off by default)
+        KeyCode::Char('P') => app.toggle_preview(),
+
         // Filter / sort / hidden / search
         KeyCode::Char('/') => {
             if app.view == ViewMode::Columns {
@@ -451,6 +522,9 @@ fn handle_normal(ws: &mut Workspace, key: KeyEvent) {
         KeyCode::Char('Y') => app.copy_path(),
         KeyCode::Char('C') if !ctrl => app.copy_preview_text(),
         KeyCode::Char('e') => app.open_editor(),
+
+        // Network: discover SMB devices on the LAN and mount their shares.
+        KeyCode::Char('G') => app.open_network(),
 
         // Help
         KeyCode::Char('?') => app.mode = Mode::Help,
@@ -672,6 +746,35 @@ mod tests {
         assert_eq!(ws.tabs.len(), 1);
         assert!(!ws.is_shell_active());
         assert!(matches!(browser(&ws).mode, Mode::Normal));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn g_opens_network_view_and_esc_closes_it() {
+        let (mut ws, dir) = test_app();
+        handle_key(&mut ws, key(KeyCode::Char('G'), KeyModifiers::SHIFT));
+        {
+            let app = browser(&ws);
+            assert!(matches!(app.mode, Mode::Network));
+            assert!(app.net.is_some());
+        }
+        // Esc at the top level closes the view.
+        handle_key(&mut ws, key(KeyCode::Esc, KeyModifiers::NONE));
+        {
+            let app = browser(&ws);
+            assert!(matches!(app.mode, Mode::Normal));
+            assert!(app.net.is_none());
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn m_in_network_view_prompts_for_host() {
+        let (mut ws, dir) = test_app();
+        handle_key(&mut ws, key(KeyCode::Char('G'), KeyModifiers::SHIFT));
+        handle_key(&mut ws, key(KeyCode::Char('m'), KeyModifiers::NONE));
+        let app = browser(&ws);
+        assert!(matches!(app.mode, Mode::Input(InputKind::NetHost)));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

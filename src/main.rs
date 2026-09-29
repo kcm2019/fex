@@ -4,6 +4,7 @@ mod app;
 mod editor;
 mod fs;
 mod input;
+mod net;
 mod sheet;
 mod shell;
 mod theme;
@@ -40,6 +41,8 @@ fn main() -> io::Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let mut ws = Workspace::new(cwd);
     let result = run(&mut terminal, &mut ws);
+    // Best effort: unmount network shares before the terminal is restored.
+    ws.unmount_all();
 
     disable_raw_mode()?;
     execute!(
@@ -63,6 +66,8 @@ fn run(
     loop {
         // Drain any shell output; redraw if it produced new screen content.
         let mut dirty = ws.poll_shell();
+        // Drain network discovery and worker messages too.
+        dirty |= ws.poll_network();
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => input::handle_key(ws, key),

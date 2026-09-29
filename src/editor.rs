@@ -999,6 +999,48 @@ impl Editor {
         Ok(())
     }
 
+    /// A blank, unsaved document (empty path). Used for "new text" tabs;
+    /// the save dialog assigns a real path on first save.
+    pub fn untitled() -> Editor {
+        Editor {
+            path: PathBuf::new(),
+            lines: vec![String::new()],
+            row: 0,
+            col: 0,
+            offset: 0,
+            view_h: 24,
+            dirty: false,
+            message: String::new(),
+            clipboard: Vec::new(),
+            clipboard_inline: None,
+            sel_anchor: None,
+            view_x: 0,
+            view_y: 0,
+            lang: Lang::Plain,
+            trailing_newline: true,
+            show_line_numbers: true,
+            block_end: Vec::new(),
+            hl_valid: 0,
+            undo: Vec::new(),
+            redo: Vec::new(),
+        }
+    }
+
+    /// Save to a new path (the save-as flow): adopts the path, picks up
+    /// syntax highlighting from its extension, then saves normally.
+    pub fn save_to(&mut self, path: &Path) -> io::Result<()> {
+        self.path = path.to_path_buf();
+        self.lang = Lang::from_path(path);
+        self.hl_valid = 0;
+        self.block_end.clear();
+        self.save()
+    }
+
+    /// True for a never-saved document (no path yet).
+    pub fn is_untitled(&self) -> bool {
+        self.path.as_os_str().is_empty()
+    }
+
     // -- undo / redo ------------------------------------------------------
     // Snapshot-based: every mutating operation pushes the pre-edit state.
 
