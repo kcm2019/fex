@@ -14,9 +14,14 @@ Core requirements:
 
 Additional features:
 - File operations: new file, new directory, rename, delete (with
-  confirmation), copy/cut/paste (with name-collision handling)
-- Preview pane: text preview of the highlighted file, item count for
-  directories, "[binary file]" for non-text
+  confirmation), copy/cut/paste (with name-collision handling) on `Ctrl+C` /
+  `Ctrl+X` / `Ctrl+V` like any OS (`y` / `x` / `p` still work as aliases),
+  and `Y` copies the selected entry's absolute path to the system clipboard
+  (via `pbcopy`; `Ctrl+Shift+C` also works where the terminal reports it)
+- Preview pane: extracted text for PDFs, rendered markdown, text preview for
+  other files, item count for directories, "[binary file]" for non-text
+  (including images — thumbnails were removed as too laggy for a text
+  terminal)
 - Search/filter: `/` filters the list live as you type, Esc clears
 - Sorting: cycle Name → Size → Modified, toggle ascending/descending
 - Open files: Enter on a file opens it with the macOS default app
@@ -24,8 +29,11 @@ Additional features:
 - Built-in text editor: `e` opens the selected text file; arrow keys, Home/End,
   PgUp/PgDn navigate; type to insert, Enter splits lines, Backspace/Delete edit;
   `Ctrl+S` saves (terminals can't see the Cmd key, so no Cmd+S), `Esc` closes and
-  asks about unsaved changes; syntax highlighting for Rust, Python, JS/TS, TOML,
-  JSON, Markdown, shell (keywords, strings, comments, numbers); refuses binary
+  asks about unsaved changes; `Ctrl+C` / `Ctrl+X` / `Ctrl+V` copy, cut, and paste
+  the current line (also synced with the system clipboard via pbcopy/pbpaste);
+  syntax highlighting for Rust, Python, JS/TS, Go, C/C++, Java, C#, Ruby,
+  HTML, CSS, SQL, YAML, TOML, JSON, Markdown, shell (keywords, strings,
+  comments, numbers, types, function calls); refuses binary
   files and files over 512 KB
 
 Code quality:
@@ -35,3 +43,48 @@ Code quality:
 - Unit tests for the filesystem operations
 
 Deliverable: a working binary I can run with `cargo run`
+
+---
+
+## Later additions (kept current with the build)
+
+- **Cross-platform**: macOS (`pbcopy`/`pbpaste`, `open`), Windows (`clip` /
+  PowerShell `Get-Clipboard`, `cmd /C start`, hidden-attribute detection),
+  Linux (`wl-copy`/`wl-paste`, `xclip`, `xsel`, `xdg-open`). `cargo check
+  --target x86_64-pc-windows-gnu` must pass.
+- **Miller-column view** (`2`; `1` returns to list view): Finder-style
+  columns, ←/→ between columns, preview panel for files.
+- **Recursive search** (`f`): filename substring search; `Tab` toggles deep
+  content search (case-insensitive, skips binaries/>2MB); `Enter` jumps to
+  the hit, `Esc` exits.
+- **Preview text copy** (`C`): copies text/Markdown/PDF/CSV preview text to
+  the system clipboard.
+- **Auto-refresh**: the listing re-reads the directory when its mtime
+  changes behind the app (downloads etc.), preserving selection.
+- **Instant paste**: bracketed paste inserts the whole block at once in the
+  editor and in every input field.
+- **Editor upgrades**: `Ctrl+Z` / `Ctrl+Y` (or `Ctrl+Shift+Z`) undo/redo;
+  mouse click moves the cursor, click-drag selects text, wheel scrolls;
+  `Ctrl+C`/`Ctrl+X` copy/cut the exact selection (never the line-number
+  gutter), typing replaces the selection; `Esc` clears the selection first;
+  `Ctrl+A` selects the whole file; `Ctrl+Left`/`Ctrl+Right` jump by word.
+- **CSV viewer** (`e` on a `.csv`): table view with header row and visible
+  grid lines; arrows move, `Enter` edits a cell, `Tab` next cell, `a` adds a
+  row, `A` adds a column after the current one (popup asks for the name),
+  `Ctrl+S` saves, `Esc` closes (asks if unsaved); mouse click selects cells,
+  wheel scrolls. CSVs also preview as an aligned table; `C` copies preview
+  CSV text.
+- **No image thumbnails**: removed — too laggy and useless in a plain text
+  terminal. Images get the generic binary preview.
+- **Themes**: Dark (orange accent, black selection), Solarized, Dracula, Mono.
+  `?` opens help, where `t` cycles the theme and `l` toggles editor line
+  numbers. Both persist in `~/.config/fex/settings`.
+- **Tabs**: a clickable tab strip. `` ` `` opens a terminal tab (a real
+  interactive `$SHELL` in the current folder via a pty), `Ctrl+T` a new
+  file-browser tab, `Ctrl+W` closes, `Ctrl+PgUp/PgDn` switches, `Alt+1-9`
+  jumps. The file clipboard is shared across tabs. In terminal tabs,
+  `Ctrl+C` is SIGINT, not copy; editor copies land on the system clipboard
+  (so `Cmd+V` works on macOS — the terminal intercepts `Cmd+C` itself).
+- **Sorting works in column view**: `s`/`S` re-sort every Miller column, not
+  just the list view.
+- **README.md documents every feature** and is updated with each change.

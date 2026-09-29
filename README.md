@@ -1,45 +1,223 @@
 # fex — a terminal file explorer in Rust
 
-A keyboard-driven file explorer for the macOS terminal, built with
-[ratatui](https://ratatui.rs).
+A keyboard-driven file explorer that runs on macOS, Linux, and Windows,
+built with [ratatui](https://ratatui.rs).
+
+## Install (first time)
+
+1. Install Rust. On macOS the easiest way is Homebrew:
+   ```sh
+   brew install rust
+   ```
+   (Any platform: [rustup.rs](https://rustup.rs) works too.)
+2. Get the source and build it:
+   ```sh
+   cd "/Users/km/Documents/Scripts/fex 2"
+   cargo build --release
+   ```
+   This takes a couple of minutes the first time while dependencies compile.
 
 ## Run it
 
+From the project folder:
+
 ```sh
-cargo run
+cd "/Users/km/Documents/Scripts/fex 2"
+./target/release/fex
 ```
 
-It opens in the directory you run it from. Requires Rust 1.70+.
+It opens in the directory you run it from. To browse somewhere else, `cd`
+there first, or pass a path: `./target/release/fex ~/Documents`.
 
-## Features
+> Coming back later? Just `cd` into the folder and run
+> `./target/release/fex` again — no rebuild needed unless the source
+> changed. (While developing, `cargo run` builds and runs in one step, and
+> `cargo test` runs the unit tests.)
 
-- **Arrow-key navigation** — ↑/↓ move, →/Enter enters a directory, ← goes back
-- **Preview pane** — text preview of the highlighted file, item count for directories
-- **Search/filter** — `/` filters the list live as you type
-- **Sorting** — `s` cycles Name → Size → Modified, `S` toggles direction
-- **Open files** — Enter on a file opens it in the macOS default app
-- **File operations** — new file (`n`), new directory (`N`), rename (`r`),
-  delete with confirmation (`d`), copy (`y`) / cut (`x`) / paste (`p`)
-- **Built-in text editor** — `e` opens the selected file; arrow keys/Home/End/PgUp/PgDn
-  navigate, type to edit, `Ctrl+S` saves, `Esc` closes (asks about unsaved changes).
-  Syntax highlighting for Rust, Python, JS/TS, TOML, JSON, Markdown, and shell
-  (keywords, strings, comments, numbers). Refuses binary files and files over 512 KB.
-- **Hidden files** — `.` toggles dotfiles
-- **Help overlay** — `?`
+## Views
 
-> Note: terminal emulators don't pass the Cmd key through to terminal apps,
-> so save is `Ctrl+S`, not `Cmd+S`.
+- **List view** (`1`) — classic two-pane layout: file list on the left,
+  preview on the right.
+- **Miller columns** (`2`) — macOS Finder-style column browsing. ←/→ move
+  between columns, ↑/↓ move within a column. A preview panel appears on the
+  right when a file is selected.
+
+The listing **auto-refreshes**: if files appear, change, or vanish behind
+fex's back (a download landing, another program writing), the view updates
+on its own within a fraction of a second. Your selection is preserved.
+
+## Preview pane
+
+The highlighted file is previewed automatically:
+
+| File type | Preview |
+|---|---|
+| Text / code | First lines, as-is |
+| PDF | Extracted text |
+| Markdown | Styled (headings, emphasis, code, lists, quotes, links) |
+| CSV | Aligned column table (first rows) |
+| Directories | Item count |
+| Anything binary (incl. images) | `[binary file]` placeholder |
+
+Image thumbnails were removed — they were too laggy and don't work in a
+plain text terminal.
+
+`C` copies the preview's text (text, Markdown, PDF text, CSV) to the system
+clipboard. Placeholders report "Nothing to copy."
+
+## Themes & settings
+
+Press `?` for help, then:
+
+| Keys | Action |
+|---|---|
+| `t` | Cycle color theme: Dark → Solarized → Dracula → Mono |
+| `l` | Toggle editor line numbers |
+
+The theme and the line-number setting are saved to
+`~/.config/fex/settings` and restored on the next launch.
+
+The default Dark theme is deliberately plain: white text, purple
+directories and highlights. Selections (the active tab, the highlighted
+file, the `▸` marker) are shown with bold accent-colored text and never a
+solid background, so nothing renders as a black box on terminals whose
+own background isn't pure black.
+
+## Tabs
+
+The top strip shows every open tab — click one to switch, or use the
+keyboard. Each file-browser tab keeps its own directory, selection, filter,
+sort, and editor; the file clipboard (`y` / `x` / `p`) is shared across tabs.
+
+| Keys | Action |
+|---|---|
+| `` ` `` (backtick) | Open a terminal tab — a real interactive shell (`$SHELL`) in the current folder |
+| `Ctrl+T` | New file-browser tab |
+| `Ctrl+W` | Close current tab (the last tab can't be closed) |
+| `Ctrl+PgUp` / `Ctrl+PgDn` | Previous / next tab |
+| `Alt+1` … `Alt+9` | Jump to tab |
+| Click a tab | Switch to it |
+
+Inside a terminal tab almost every key goes straight to the shell, so
+`Ctrl+C` there is SIGINT (interrupt), not copy — the tab-management keys
+above still work. The shell is a full pty: colors, prompts, `vim`, `ssh`,
+and full-screen programs all work.
+
+## Finding things
+
+- `/` — live filter: narrows the list as you type (Esc clears).
+- `f` — recursive search from the current directory:
+  - **filename mode** (default): substring match on names.
+  - **Tab**: toggles **deep mode**, which searches file *contents*
+    (case-insensitive, skips binary files and files over 2 MB).
+  - Results show the path (and line number + snippet for content hits).
+    `Enter` jumps to the selected result, `Esc` leaves search.
+
+## File operations
+
+| Keys | Action |
+|---|---|
+| ↑ / ↓, PgUp / PgDn, Home / End | Move selection |
+| → / Enter | Enter directory · open file in the default app |
+| ← / Backspace | Parent directory |
+| `n` / `N` | New file / new directory |
+| `r` | Rename |
+| `d` | Delete (asks first) |
+| `y` / `x` / `p` or `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / cut / paste files |
+| `Y` | Copy the selected file's full path to the system clipboard |
+| `s` / `S` | Cycle sort key (Name → Size → Modified) / toggle direction (works in column view too) |
+| `.` | Show / hide hidden files |
+| `?` | Help overlay |
+| `q` / `Esc` | Quit |
+
+Mouse: click a file to select it, scroll wheel moves the selection.
+(Hold `Alt`/`Option` while dragging if your terminal is set to pass mouse
+events to the app and you want the terminal's native text selection.)
+
+## Built-in text editor
+
+`e` opens the selected text file (refuses binary files and files over 512 KB).
+
+- **Navigation** — arrows, Home/End, PgUp/PgDn, `Ctrl+Left`/`Ctrl+Right`
+  jump by word. Click anywhere to move the cursor; the scroll wheel scrolls.
+- **Editing** — just type. **Pasting is instant**: the terminal's bracketed
+  paste delivers the whole block as one event, so a 10,000-line paste lands
+  at once (and undoes as one step). You can also paste into the rename /
+  new-file / filter / search fields the same way.
+- **Undo / redo** — `Ctrl+Z` undoes, `Ctrl+Y` (or `Ctrl+Shift+Z`) redoes.
+- **Select all** — `Ctrl+A` selects the whole file.
+- **Copy / cut / paste** — `Ctrl+C` / `Ctrl+X` / `Ctrl+V`, synced with the
+  system clipboard:
+  - With a mouse selection (click + drag): copies the **exact selected
+    text** — the line-number gutter is display-only and never copied.
+    Typing or pasting with a selection replaces it. `Esc` clears the
+    selection.
+  - With no selection: VS Code style — the whole current line is
+    copied/cut, and paste inserts below the current line.
+- **Save / close** — `Ctrl+S` saves, `Esc` closes (asks about unsaved
+  changes first).
+- **Syntax highlighting** — Rust, Python, JS/TS, Go, C/C++, Java, C#, Ruby,
+  HTML, CSS, SQL, YAML, TOML, JSON, Markdown, shell. Colored separately:
+  keywords, strings, comments, numbers, types (capitalized names,
+  decorators, annotations, `#[attributes]`, lifetimes), function calls,
+  C-style `#include` directives, CSS `@`-rules, and HTML tags (tag names,
+  attribute strings, comments). Block comments carry across lines.
+
+> Terminal emulators don't pass the Cmd key to terminal apps, so save is
+> `Ctrl+S`, not `Cmd+S`, and copy/cut/paste use `Ctrl`, not `Cmd`. Editor
+> copies are also written to the system clipboard, so `Cmd+V` pastes them
+> anywhere on macOS.
+
+## CSV viewer
+
+`e` on a `.csv` file opens a table viewer (the preview pane also shows CSVs
+as an aligned table). The first row is treated as the header; quoted fields
+with commas and escaped quotes parse correctly. Cells are drawn with visible
+grid lines.
+
+| Keys | Action |
+|---|---|
+| Arrows | Move between cells |
+| `Enter` | Edit the current cell (a popup; `Enter` commits, `Esc` cancels) |
+| `Tab` / `Shift+Tab` | Next / previous cell |
+| `a` | Add an empty row below the current one |
+| `A` (`Shift+A`) | Add a column after the current one (a popup asks for the column name; blank becomes `colN`) |
+| `Ctrl+S` | Save back to the CSV file |
+| `Esc` | Close (asks about unsaved changes first) |
+| Mouse | Click a cell to select it; wheel scrolls |
+
+## Clipboard & opening files, per OS
+
+fex shells out to the platform's native tools — no extra setup on macOS or
+Windows:
+
+| | Copy/paste | Open with default app |
+|---|---|---|
+| macOS | `pbcopy` / `pbpaste` | `open` |
+| Windows | `clip` / PowerShell `Get-Clipboard` | `cmd /C start` |
+| Linux | `wl-copy`/`wl-paste`, then `xclip`, then `xsel` | `xdg-open` |
+
+On Linux, install one of `wl-clipboard`, `xclip`, or `xsel` for clipboard
+support (Wayland: `wl-clipboard`; X11: `xclip` or `xsel`). Hidden files on
+Windows are detected via the file attribute, not just the dot prefix.
 
 ## Layout
 
 ```
 src/
-  main.rs   — terminal setup and event loop
-  app.rs    — application state (listing, selection, filter, sort, modes)
-  editor.rs — built-in text editor (buffer, cursor, syntax highlighting)
-  fs.rs     — filesystem operations (list, preview, create/rename/delete/copy/move)
-  input.rs  — keyboard handling per UI mode
-  ui.rs     — rendering (header, list, preview, popups)
+  main.rs    — terminal setup, event loop, auto-refresh tick, pty polling
+  app.rs     — application state (listing, selection, filter, sort, modes)
+               + Workspace: the multi-tab strip (browser tabs, terminal tabs,
+               shared theme/clipboard/quit)
+  editor.rs  — text editor (buffer, undo/redo, selection, highlighting)
+  sheet.rs   — CSV table viewer (parse, navigate, edit, save)
+  shell.rs   — terminal tab: pty-backed interactive shell (portable-pty +
+               vt100), key-to-bytes translation, screen rendering
+  fs.rs      — filesystem ops (list, preview, search, create/rename/delete/copy/move)
+  input.rs   — keyboard / paste / mouse handling per UI mode
+  ui.rs      — rendering (tab bar, list, columns, preview, editor, sheet, popups)
+  theme.rs   — color themes + settings persistence (~/.config/fex/settings)
 ```
 
-Run `cargo test` for the filesystem unit tests.
+> This README documents every feature. It is updated whenever a feature is
+> added or changed.

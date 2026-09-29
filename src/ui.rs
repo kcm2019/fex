@@ -1,12 +1,16 @@
 //! Rendering: layout, file list, preview pane, status bar, and popups.
 
-use crate::app::{App, InputKind, Mode};
+use crate::app::{App, InputKind, Mode, Tab, ViewMode, Workspace};
+use crate::editor::Editor;
+use crate::fs::Preview;
+use crate::theme::Theme;
 use chrono::{DateTime, Local};
+use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
 use std::time::SystemTime;
@@ -36,11 +40,43 @@ fn human_time(modified: Option<SystemTime>) -> String {
     }
 }
 
-pub fn render(frame: &mut Frame, app: &mut App) {
+pub fn render(frame: &mut Frame, ws: &mut Workspace) {
     let area = frame.area();
+    if area.height == 0 {
+        return;
+    }
+    let th = ws.theme();
+
+    // Tab strip across the top; everything else renders below it.
+    let bar = Rect::new(area.x, area.y, area.width, 1);
+    render_tab_bar(frame, ws, &th, bar);
+    let content = Rect::new(
+        area.x,
+        area.y + 1,
+        area.width,
+        area.height.saturating_sub(1),
+    );
+
+    // Terminal tabs render the pty screen; nothing else applies there.
+    if ws.is_shell_active() {
+        render_shell(frame, ws, content);
+        return;
+    }
+    let Some(app) = ws.active_browser_mut() else {
+        return;
+    };
 
     if matches!(app.mode, Mode::Editor | Mode::ConfirmDiscard) {
-        render_editor(frame, app);
+        render_editor(frame, app, content);
+        return;
+    }
+
+    // CSV table viewer. Cell editing pops an input dialog over it.
+    if matches!(app.mode, Mode::Sheet | Mode::Input(InputKind::CsvCell)) {
+        render_sheet(frame, app, content);
+        if let Mode::Input(kind) = app.mode {
+            render_input_popup(frame, app, kind, content);
+        }
         return;
     }
 
@@ -52,29 +88,91 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             Constraint::Length(1),
             Constraint::Length(1),
         ])
-        .split(area);
+        .split(content);
 
     render_header(frame, app, layout[0]);
 
-    let main = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
-        .split(layout[1]);
-    render_list(frame, app, main[0]);
-    render_preview(frame, app, main[1]);
+    match app.mode {
+        Mode::Search => render_search(frame, app, layout[1]),
+        _ if app.view == ViewMode::Columns => render_columns(frame, app, layout[1]),
+        _ => {
+            let main = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+                .split(layout[1]);
+            render_list(frame, app, main[0]);
+            render_preview(frame, app, main[1]);
+        }
+    }
 
     render_status(frame, app, layout[2]);
-    render_footer(frame, layout[3]);
+    render_footer(frame, &app.theme(), layout[3]);
 
     match app.mode {
-        Mode::Input(kind) => render_input_popup(frame, app, kind, area),
-        Mode::ConfirmDelete => render_confirm_popup(frame, app, area),
-        Mode::Help => render_help_popup(frame, area),
-        Mode::Normal | Mode::Editor | Mode::ConfirmDiscard => {}
+        Mode::Input(kind) => render_input_popup(frame, app, kind, content),
+        Mode::ConfirmDelete => render_confirm_popup(frame, app, content),
+        Mode::Help => render_help_popup(frame, ws, content),
+        Mode::Normal | Mode::Editor | Mode::ConfirmDiscard | Mode::Search | Mode::Sheet => {}
     }
 }
 
+/// The tab strip: one clickable label per tab, the active one highlighted.
+fn render_tab_bar(frame: &mut Frame, ws: &mut Workspace, th: &Theme, area: Rect) {
+    ws.tab_hits.clear();
+    let mut spans: Vec<Span> = Vec::new();
+    let mut x = area.x;
+    for i in 0..ws.tabs.len() {
+        let title = ws.tab_title(i);
+        let label = format!(" {} {} ", i + 1, title);
+        let w = label.chars().count() as u16;
+        ws.tab_hits.push((x, x + w, i));
+        let style = if i == ws.active {
+            // No background on the active tab: a solid select background
+            // renders as ugly boxes on terminals whose own background
+            // isn't the same color. Bold accent text marks it instead.
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(th.dim)
+        };
+        spans.push(Span::styled(label, style));
+        x += w;
+        if i + 1 < ws.tabs.len() {
+            spans.push(Span::styled("│", Style::default().fg(th.dim)));
+            x += 1;
+        }
+    }
+    // Right-aligned hint, dimmed.
+    let hint = "Ctrl+T new tab · ` terminal · click a tab to switch";
+    let used = x.saturating_sub(area.x) as usize;
+    let pad = (area.width as usize).saturating_sub(used + hint.len() + 1);
+    if pad > 0 {
+        spans.push(Span::raw(" ".repeat(pad)));
+        spans.push(Span::styled(hint, Style::default().fg(th.dim)));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Draw the active shell tab's pty screen.
+fn render_shell(frame: &mut Frame, ws: &mut Workspace, area: Rect) {
+    let (exited, lines) = match ws.tabs.get_mut(ws.active) {
+        Some(Tab::Shell(sh)) => {
+            sh.resize(area.width, area.height);
+            (sh.state.exited, sh.state.render_lines())
+        }
+        _ => return,
+    };
+    let mut lines: Vec<Line> = lines.into_iter().take(area.height as usize).collect();
+    if exited {
+        lines.push(Line::from(Span::styled(
+            " [process exited — Ctrl+W closes this tab]",
+            Style::default().fg(ws.theme().dim),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
 fn render_header(frame: &mut Frame, app: &App, area: Rect) {
+    let th = app.theme();
     let mut meta = format!("  {} items", app.visible_count());
     meta.push_str(&format!("  ·  sort: {}", app.sort.label()));
     if !app.filter.is_empty() {
@@ -88,19 +186,21 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
             app.cwd.to_string_lossy().into_owned(),
             Style::default().add_modifier(Modifier::BOLD),
         ),
-        Span::styled(meta, Style::default().fg(Color::DarkGray)),
+        Span::styled(meta, Style::default().fg(th.dim)),
     ]);
     let header = Paragraph::new(line).block(Block::default().borders(Borders::ALL).title(" fex "));
     frame.render_widget(header, area);
 }
 
 fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
+    let th = app.theme();
+    app.list_origin = (area.x, area.y);
     let items: Vec<ListItem> = app
         .visible_entries()
         .map(|e| {
             let (style, name) = if e.is_dir {
                 (
-                    Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+                    Style::default().fg(th.heading).add_modifier(Modifier::BOLD),
                     format!("{}/", e.name),
                 )
             } else {
@@ -115,7 +215,7 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 Span::styled(name, style),
                 Span::styled(
                     format!("  {size:>8}  {}", human_time(e.modified)),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(th.dim),
                 ),
             ]);
             ListItem::new(line)
@@ -124,35 +224,502 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(" Files "))
-        .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+        .highlight_style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD))
         .highlight_symbol("▸ ");
     frame.render_stateful_widget(list, area, &mut app.list_state);
 }
 
-fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
-    let text = app.preview_text().to_string();
-    let title = match app.selected_entry() {
-        Some(e) => format!(" Preview: {} ", e.name),
-        None => String::from(" Preview "),
+/// Miller-column view: directory columns side by side, with a file
+/// preview panel at the right when the active selection is a file.
+fn render_columns(frame: &mut Frame, app: &mut App, area: Rect) {
+    let show_preview = app.selected_entry().is_some_and(|e| !e.is_dir);
+    let n_panels = app.columns.len() + usize::from(show_preview);
+    if n_panels == 0 {
+        return;
+    }
+    let col_w: u16 = 28;
+    // Show the last `fit` panels so the active column stays on screen.
+    let fit = ((area.width / col_w).max(1) as usize).min(n_panels);
+    let start = n_panels - fit;
+    let mut x = area.x;
+    for (pi, i) in (start..n_panels).enumerate() {
+        let last = pi == fit - 1;
+        let w = if last {
+            area.x + area.width - x
+        } else {
+            col_w.min(area.x + area.width - x)
+        };
+        if w < 8 {
+            break;
+        }
+        let rect = Rect {
+            x,
+            y: area.y,
+            width: w,
+            height: area.height,
+        };
+        if i < app.columns.len() {
+            render_column(frame, app, i, i == app.col_active, rect);
+        } else {
+            render_preview(frame, app, rect);
+        }
+        x += w;
+    }
+}
+
+fn render_column(frame: &mut Frame, app: &App, idx: usize, active: bool, area: Rect) {
+    let th = app.theme();
+    let Some(col) = app.columns.get(idx) else {
+        return;
     };
-    let preview = Paragraph::new(text)
+    let name = col
+        .path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| col.path.to_string_lossy().into_owned());
+    let items: Vec<ListItem> = col
+        .entries
+        .iter()
+        .map(|e| {
+            let (style, label) = if e.is_dir {
+                (
+                    Style::default().fg(th.heading).add_modifier(Modifier::BOLD),
+                    format!("{}/", e.name),
+                )
+            } else {
+                (Style::default(), e.name.clone())
+            };
+            ListItem::new(Line::from(Span::styled(label, style)))
+        })
+        .collect();
+    let mut state = ListState::default();
+    state.select(Some(col.selected));
+    let title = if active {
+        format!(" {name} ● ")
+    } else {
+        format!(" {name} ")
+    };
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD))
+        .highlight_symbol("▸ ");
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// Search mode: query bar on top, live results below.
+fn render_search(frame: &mut Frame, app: &mut App, area: Rect) {
+    let th = app.theme();
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .split(area);
+
+    let cursor = app.cursor.min(app.input.chars().count());
+    let left: String = app.input.chars().take(cursor).collect();
+    let right: String = app.input.chars().skip(cursor).collect();
+    let mode_label = if app.search_deep {
+        "deep (contents)"
+    } else {
+        "names"
+    };
+    let bar = Line::from(vec![
+        Span::styled(
+            format!(" Search [{mode_label}]: "),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(left),
+        Span::styled("█", Style::default().fg(th.accent)),
+        Span::styled(right, Style::default().fg(th.dim)),
+        Span::styled(
+            "   (Tab: toggle deep · Enter: jump · Esc: exit)",
+            Style::default().fg(th.dim),
+        ),
+    ]);
+    frame.render_widget(
+        Paragraph::new(bar).block(Block::default().borders(Borders::ALL).title(" Find ")),
+        layout[0],
+    );
+
+    let items: Vec<ListItem> = app
+        .search_results
+        .iter()
+        .map(|r| {
+            let rel = r.path.strip_prefix(&app.cwd).unwrap_or(&r.path);
+            let label = match (r.line_no, &r.snippet) {
+                (Some(n), Some(s)) => format!("{}:{}  {s}", rel.display(), n),
+                _ => format!("{}{}", rel.display(), if r.is_dir { "/" } else { "" }),
+            };
+            let style = if r.is_dir {
+                Style::default().fg(th.heading).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::from(Span::styled(label, style)))
+        })
+        .collect();
+    let mut state = ListState::default();
+    if !app.search_results.is_empty() {
+        state.select(Some(app.search_selected));
+    }
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" Results ({}) ", app.search_results.len())),
+        )
+        .highlight_style(Style::default().fg(th.accent).add_modifier(Modifier::BOLD))
+        .highlight_symbol("▸ ");
+    frame.render_stateful_widget(list, layout[1], &mut state);
+}
+
+fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
+    let th = app.theme();
+    let name = app
+        .selected_entry()
+        .map(|e| e.name.clone())
+        .unwrap_or_default();
+    let preview = app.preview().clone();
+    let title = if name.is_empty() {
+        String::from(" Preview ")
+    } else {
+        format!(" Preview: {name} ")
+    };
+    let body: Vec<Line> = match &preview {
+        Preview::Text(s) | Preview::Dir(s) => vec![Line::from(s.as_str())],
+        Preview::Markdown(src) => render_markdown(&th, src),
+        Preview::Csv(rows) => csv_preview_lines(&th, rows),
+    };
+    let preview = Paragraph::new(body)
         .block(Block::default().borders(Borders::ALL).title(title))
         .wrap(Wrap { trim: false });
     frame.render_widget(preview, area);
 }
 
+/// Aligned-column mini table for the CSV preview pane (header in bold).
+fn csv_preview_lines(theme: &Theme, rows: &[Vec<String>]) -> Vec<Line<'static>> {
+    if rows.is_empty() {
+        return vec![Line::from("[empty csv]")];
+    }
+    let ncols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    let mut widths = vec![0usize; ncols];
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(cell.chars().count().min(20));
+        }
+    }
+    rows.iter()
+        .enumerate()
+        .map(|(ri, row)| {
+            let mut spans = Vec::new();
+            for (i, w) in widths.iter().enumerate() {
+                let cell = row.get(i).map(|s| s.as_str()).unwrap_or("");
+                let shown: String = cell.chars().take(*w).collect();
+                let style = if ri == 0 {
+                    Style::default()
+                        .add_modifier(Modifier::BOLD)
+                        .fg(theme.header)
+                } else {
+                    Style::default()
+                };
+                spans.push(Span::styled(format!("{shown:<width$}  ", width = w), style));
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// One table row for the CSV viewer: padded cells, the selected cell
+/// reversed, the header row bold.
+/// Dim style for the table grid lines.
+fn grid_style(theme: &Theme) -> Style {
+    Style::default().fg(theme.dim)
+}
+
+fn csv_row_line(
+    theme: &Theme,
+    cells: &[String],
+    widths: &[usize],
+    off_col: usize,
+    selected_col: Option<usize>,
+    is_header: bool,
+) -> Line<'static> {
+    let grid = grid_style(theme);
+    let mut spans = vec![Span::styled("│", grid)];
+    for (i, w) in widths.iter().enumerate().skip(off_col) {
+        let cell = cells.get(i).map(|s| s.as_str()).unwrap_or("");
+        let shown: String = cell.chars().take(*w).collect();
+        let mut style = if is_header {
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(theme.header)
+        } else {
+            Style::default()
+        };
+        if selected_col == Some(i) {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        spans.push(Span::styled(format!(" {shown:<width$} ", width = w), style));
+        spans.push(Span::styled("│", grid));
+    }
+    Line::from(spans)
+}
+
+/// Horizontal grid separator between the header and the body (`├─┼─┤`).
+fn csv_sep_line(theme: &Theme, widths: &[usize], off_col: usize) -> Line<'static> {
+    let mut text = String::from("├");
+    for (k, w) in widths.iter().enumerate().skip(off_col) {
+        if k > off_col {
+            text.push('┼');
+        }
+        text.push_str(&"─".repeat(w + 2));
+    }
+    text.push('┤');
+    Line::from(Span::styled(text, grid_style(theme)))
+}
+
+fn render_sheet(frame: &mut Frame, app: &mut App, area: Rect) {
+    let discard = app.sheet.as_ref().is_some_and(|s| s.confirm_discard);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    let th = app.theme();
+    {
+        let Some(sh) = app.sheet.as_mut() else {
+            return;
+        };
+        sh.view_h = layout[0].height.saturating_sub(4).max(1) as usize; // border + header + separator
+        sh.view_w = layout[0].width.saturating_sub(2) as usize;
+        sh.view_x = layout[0].x;
+        sh.view_y = layout[0].y;
+        sh.ensure_visible();
+
+        let widths = sh.col_widths();
+        let mut lines: Vec<Line> = Vec::with_capacity(sh.view_h + 1);
+        lines.push(csv_row_line(
+            &th,
+            &sh.headers,
+            &widths,
+            sh.off_col,
+            None,
+            true,
+        ));
+        lines.push(csv_sep_line(&th, &widths, sh.off_col));
+        for j in sh.off_row..(sh.off_row + sh.view_h).min(sh.rows.len()) {
+            let sel = if j == sh.row { Some(sh.col) } else { None };
+            lines.push(csv_row_line(
+                &th,
+                &sh.rows[j],
+                &widths,
+                sh.off_col,
+                sel,
+                false,
+            ));
+        }
+
+        let title = format!(
+            " {} {} ",
+            sh.path.display(),
+            if sh.dirty { "[modified]" } else { "[saved]" }
+        );
+        let para = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
+        frame.render_widget(para, layout[0]);
+
+        let status = format!(
+            "Row {}/{} · Col {}/{} · Enter edit · Tab next · a row · A column · Ctrl+S save · Esc close",
+            sh.row + 1,
+            sh.rows.len(),
+            sh.col + 1,
+            sh.ncols(),
+        );
+        frame.render_widget(
+            Paragraph::new(status).style(Style::default().fg(th.dim)),
+            layout[1],
+        );
+        frame.render_widget(
+            Paragraph::new(sh.message.clone()).style(Style::default().fg(th.accent)),
+            layout[2],
+        );
+
+        // Put the real terminal cursor on the selected cell.
+        let mut cx = layout[0].x + 3; // border + │ + space
+        for (i, w) in widths.iter().enumerate() {
+            if i < sh.off_col {
+                continue;
+            }
+            if i >= sh.col {
+                break;
+            }
+            cx += *w as u16 + 3; // │ + space + content + space
+        }
+        let cy = layout[0].y + 3 + sh.row.saturating_sub(sh.off_row) as u16; // header + separator
+        frame.set_cursor_position(Position::new(cx, cy));
+    }
+
+    if discard {
+        render_discard_popup(frame, &app.theme(), area);
+    }
+}
+
+/// Render markdown source into styled lines: headings bold blue, `code` green,
+/// *emphasis* italic, **strong** bold, links underlined with the URL dimmed.
+fn render_markdown(theme: &Theme, src: &str) -> Vec<Line<'static>> {
+    struct State {
+        lines: Vec<Line<'static>>,
+        cur: Vec<Span<'static>>,
+        styles: Vec<Style>,
+        link_url: Option<String>,
+        item_prefix: Option<&'static str>,
+        quote: usize,
+        quote_style: Style,
+        accent_style: Style,
+    }
+    impl State {
+        fn style(&self) -> Style {
+            *self.styles.last().unwrap()
+        }
+        fn newline(&mut self) {
+            let mut spans = Vec::new();
+            for _ in 0..self.quote {
+                spans.push(Span::styled("│ ", self.quote_style));
+            }
+            if let Some(p) = self.item_prefix.take() {
+                spans.push(Span::styled(p, self.accent_style));
+            }
+            spans.extend(self.cur.drain(..));
+            self.lines.push(Line::from(spans));
+        }
+        fn blank(&mut self) {
+            self.newline();
+            self.lines.push(Line::from(""));
+        }
+    }
+
+    let mut st = State {
+        lines: Vec::new(),
+        cur: Vec::new(),
+        styles: vec![Style::default()],
+        link_url: None,
+        item_prefix: None,
+        quote: 0,
+        quote_style: Style::default().fg(theme.dim),
+        accent_style: Style::default().fg(theme.accent),
+    };
+    let heading = Style::default()
+        .fg(theme.heading)
+        .add_modifier(Modifier::BOLD);
+    let code = Style::default().fg(theme.code);
+    let dim = Style::default().fg(theme.dim);
+
+    for ev in Parser::new(src) {
+        match ev {
+            Event::Start(Tag::Heading { .. }) => {
+                st.newline();
+                st.styles.push(heading);
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                st.styles.pop();
+                st.blank();
+            }
+            Event::Start(Tag::Paragraph) => {}
+            Event::End(TagEnd::Paragraph) => st.blank(),
+            Event::Start(Tag::BlockQuote(_)) => {
+                st.newline();
+                st.quote += 1;
+            }
+            Event::End(TagEnd::BlockQuote(_)) => {
+                st.quote = st.quote.saturating_sub(1);
+                st.newline();
+            }
+            Event::Start(Tag::CodeBlock(_)) => {
+                st.newline();
+                st.styles.push(code);
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                st.styles.pop();
+                st.blank();
+            }
+            Event::Start(Tag::List(_)) => st.newline(),
+            Event::End(TagEnd::List(_)) => st.newline(),
+            Event::Start(Tag::Item) => {
+                st.newline();
+                st.item_prefix = Some("• ");
+            }
+            Event::End(TagEnd::Item) => {}
+            Event::Start(Tag::Emphasis) => {
+                st.styles.push(st.style().add_modifier(Modifier::ITALIC));
+            }
+            Event::Start(Tag::Strong) => {
+                st.styles.push(st.style().add_modifier(Modifier::BOLD));
+            }
+            Event::End(TagEnd::Emphasis) | Event::End(TagEnd::Strong) => {
+                st.styles.pop();
+            }
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                st.link_url = Some(dest_url.to_string());
+                st.styles.push(
+                    st.style()
+                        .fg(theme.header)
+                        .add_modifier(Modifier::UNDERLINED),
+                );
+            }
+            Event::End(TagEnd::Link) => {
+                st.styles.pop();
+                if let Some(u) = st.link_url.take() {
+                    st.cur.push(Span::styled(format!(" <{u}>"), dim));
+                }
+            }
+            Event::Start(Tag::Image { dest_url, .. }) => {
+                st.cur
+                    .push(Span::styled(format!("[image: {dest_url}]"), dim));
+            }
+            Event::End(TagEnd::Image) => {}
+            Event::Text(t) => st.cur.push(Span::styled(t.to_string(), st.style())),
+            Event::Code(c) => st.cur.push(Span::styled(c.to_string(), code)),
+            Event::Html(h) | Event::InlineHtml(h) => {
+                st.cur.push(Span::styled(h.to_string(), dim));
+            }
+            Event::FootnoteReference(n) => {
+                st.cur.push(Span::styled(format!("[^{n}]"), dim));
+            }
+            Event::SoftBreak | Event::HardBreak => st.newline(),
+            Event::Rule => {
+                st.newline();
+                st.cur.push(Span::styled("─".repeat(24), dim));
+                st.newline();
+            }
+            Event::TaskListMarker(done) => {
+                st.cur.push(Span::raw(if done { "[x] " } else { "[ ] " }));
+            }
+            _ => {}
+        }
+    }
+    st.newline();
+    while st.lines.last().is_some_and(|l| l.width() == 0) {
+        st.lines.pop();
+    }
+    st.lines
+}
+
 fn render_status(frame: &mut Frame, app: &App, area: Rect) {
+    let th = app.theme();
     let style = if app.status.is_empty() {
         Style::default()
     } else {
-        Style::default().fg(Color::Yellow)
+        Style::default().fg(th.accent)
     };
     frame.render_widget(Paragraph::new(app.status.as_str()).style(style), area);
 }
 
-fn render_footer(frame: &mut Frame, area: Rect) {
-    let hints = "↑↓ move · →/Enter open · ← back · / filter · e edit · n new · r rename · d delete · y/x/p copy/cut/paste · s sort · . hidden · ? help · q quit";
-    let footer = Paragraph::new(hints).style(Style::default().fg(Color::DarkGray));
+fn render_footer(frame: &mut Frame, theme: &Theme, area: Rect) {
+    let hints = "↑↓ move · →/Enter open · ← back · / filter · f find · 1/2 list/columns · e edit · n new · r rename · d delete · y/x/p copy/cut/paste · Y path · C preview text · s sort · . hidden · ? help · q quit";
+    let footer = Paragraph::new(hints).style(Style::default().fg(theme.dim));
     frame.render_widget(footer, area);
 }
 
@@ -176,6 +743,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 }
 
 fn render_input_popup(frame: &mut Frame, app: &App, kind: InputKind, area: Rect) {
+    let th = app.theme();
     let popup = centered_rect(60, 20, area);
     frame.render_widget(Clear, popup);
     let cursor = app.cursor.min(app.input.chars().count());
@@ -183,8 +751,8 @@ fn render_input_popup(frame: &mut Frame, app: &App, kind: InputKind, area: Rect)
     let right: String = app.input.chars().skip(cursor).collect();
     let line = Line::from(vec![
         Span::raw(left),
-        Span::styled("█", Style::default().fg(Color::Yellow)),
-        Span::styled(right, Style::default().fg(Color::DarkGray)),
+        Span::styled("█", Style::default().fg(th.accent)),
+        Span::styled(right, Style::default().fg(th.dim)),
     ]);
     let input = Paragraph::new(line).block(
         Block::default()
@@ -195,33 +763,38 @@ fn render_input_popup(frame: &mut Frame, app: &App, kind: InputKind, area: Rect)
 }
 
 fn render_confirm_popup(frame: &mut Frame, app: &App, area: Rect) {
+    let th = app.theme();
     let popup = centered_rect(50, 22, area);
     frame.render_widget(Clear, popup);
-    let name = app.selected_entry().map(|e| e.name.clone()).unwrap_or_default();
+    let name = app
+        .selected_entry()
+        .map(|e| e.name.clone())
+        .unwrap_or_default();
     let text = vec![
         Line::from(format!("Delete \"{name}\"?")),
         Line::from(""),
-        Line::from(Span::styled(
-            "y: yes    n: no",
-            Style::default().fg(Color::DarkGray),
-        )),
+        Line::from(Span::styled("y: yes    n: no", Style::default().fg(th.dim))),
     ];
     let confirm = Paragraph::new(text).block(
         Block::default()
             .borders(Borders::ALL)
             .title(" Confirm delete ")
-            .style(Style::default().fg(Color::Red)),
+            .style(Style::default().fg(th.danger)),
     );
     frame.render_widget(confirm, popup);
 }
 
-fn render_editor(frame: &mut Frame, app: &mut App) {
-    let area = frame.area();
+fn render_editor(frame: &mut Frame, app: &mut App, area: Rect) {
     let discard = app.mode == Mode::ConfirmDiscard;
+    let th = app.theme();
 
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
         .split(area);
 
     {
@@ -229,19 +802,35 @@ fn render_editor(frame: &mut Frame, app: &mut App) {
             return;
         };
         ed.view_h = layout[0].height.saturating_sub(2) as usize; // inside the border
+        ed.view_x = layout[0].x;
+        ed.view_y = layout[0].y;
         let num_w = ed.lines.len().to_string().len().max(2);
-        let gutter_w = (num_w + 1) as u16; // digits + one trailing space
+        let gutter_w = if ed.show_line_numbers {
+            (num_w + 1) as u16 // digits + one trailing space
+        } else {
+            0
+        };
 
-        let visible = ed.highlight_visible(ed.offset, ed.view_h);
+        let visible = ed.highlight_visible(&th, ed.offset, ed.view_h);
         let text: Vec<Line> = visible
             .into_iter()
             .enumerate()
             .map(|(j, spans)| {
                 let lineno = ed.offset + j + 1;
-                let mut v = vec![Span::styled(
-                    format!("{lineno:>num_w$} "),
-                    Style::default().fg(Color::DarkGray),
-                )];
+                let mut v = if ed.show_line_numbers {
+                    vec![Span::styled(
+                        format!("{lineno:>num_w$} "),
+                        Style::default().fg(th.dim),
+                    )]
+                } else {
+                    Vec::new()
+                };
+                // Mouse selections render reversed; the gutter is never part
+                // of the selection, so it can't be copied by accident.
+                let spans = match sel_range_for_row(ed, ed.offset + j) {
+                    Some((s, e)) => apply_selection(spans, s, e),
+                    None => spans,
+                };
                 v.extend(spans);
                 Line::from(v)
             })
@@ -252,22 +841,21 @@ fn render_editor(frame: &mut Frame, app: &mut App) {
             ed.path.display(),
             if ed.dirty { "[modified]" } else { "[saved]" }
         );
-        let para =
-            Paragraph::new(text).block(Block::default().borders(Borders::ALL).title(title));
+        let para = Paragraph::new(text).block(Block::default().borders(Borders::ALL).title(title));
         frame.render_widget(para, layout[0]);
 
         let status = format!(
-            "Ln {}, Col {} · {} lines · Ctrl+S save · Esc close",
+            "Ln {}, Col {} · {} lines · Ctrl+S save · Ctrl+Z/Y undo/redo · click+drag selects · Esc close",
             ed.row + 1,
             ed.col + 1,
             ed.lines.len()
         );
         frame.render_widget(
-            Paragraph::new(status).style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new(status).style(Style::default().fg(th.dim)),
             layout[1],
         );
         frame.render_widget(
-            Paragraph::new(ed.message.clone()).style(Style::default().fg(Color::Yellow)),
+            Paragraph::new(ed.message.clone()).style(Style::default().fg(th.accent)),
             layout[2],
         );
 
@@ -278,11 +866,59 @@ fn render_editor(frame: &mut Frame, app: &mut App) {
     }
 
     if discard {
-        render_discard_popup(frame, area);
+        render_discard_popup(frame, &app.theme(), area);
     }
 }
 
-fn render_discard_popup(frame: &mut Frame, area: Rect) {
+/// Selected char range (start, end) on one buffer row, if the row is
+/// touched by the mouse selection.
+fn sel_range_for_row(ed: &Editor, row: usize) -> Option<(usize, usize)> {
+    let ((sr, sc), (er, ec)) = ed.selection()?;
+    if row < sr || row > er {
+        return None;
+    }
+    let len = ed.lines[row].chars().count();
+    let start = if row == sr { sc.min(len) } else { 0 };
+    let end = if row == er { ec.min(len) } else { len };
+    if start >= end {
+        None
+    } else {
+        Some((start, end))
+    }
+}
+
+/// Paint the REVERSED modifier over the spans overlapping [start, end).
+fn apply_selection(spans: Vec<Span<'static>>, start: usize, end: usize) -> Vec<Span<'static>> {
+    let mut out = Vec::with_capacity(spans.len());
+    let mut pos = 0usize;
+    for span in spans {
+        let text = span.content.clone().into_owned();
+        let slen = text.chars().count();
+        let (s0, s1) = (pos, pos + slen);
+        pos = s1;
+        if s1 <= start || s0 >= end {
+            out.push(span);
+            continue;
+        }
+        let chars: Vec<char> = text.chars().collect();
+        let a = start.max(s0) - s0;
+        let b = end.min(s1) - s0;
+        let style = span.style;
+        if a > 0 {
+            out.push(Span::styled(chars[..a].iter().collect::<String>(), style));
+        }
+        out.push(Span::styled(
+            chars[a..b].iter().collect::<String>(),
+            style.add_modifier(Modifier::REVERSED),
+        ));
+        if b < slen {
+            out.push(Span::styled(chars[b..].iter().collect::<String>(), style));
+        }
+    }
+    out
+}
+
+fn render_discard_popup(frame: &mut Frame, theme: &Theme, area: Rect) {
     let popup = centered_rect(46, 24, area);
     frame.render_widget(Clear, popup);
     let text = vec![
@@ -290,23 +926,33 @@ fn render_discard_popup(frame: &mut Frame, area: Rect) {
         Line::from("Discard unsaved changes?"),
         Line::from(""),
         Line::from(vec![
-            Span::styled(" y ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " y ",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" discard    "),
             Span::styled(
                 " n / Esc ",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default().fg(theme.dim).add_modifier(Modifier::BOLD),
             ),
             Span::raw(" keep editing"),
         ]),
     ];
     let p = Paragraph::new(text)
         .alignment(ratatui::layout::Alignment::Center)
-        .block(Block::default().borders(Borders::ALL).title(" Unsaved changes "));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Unsaved changes "),
+        );
     frame.render_widget(p, popup);
 }
 
-fn render_help_popup(frame: &mut Frame, area: Rect) {
-    let popup = centered_rect(62, 72, area);
+fn render_help_popup(frame: &mut Frame, ws: &Workspace, area: Rect) {
+    let th = ws.theme();
+    let popup = centered_rect(62, 80, area);
     frame.render_widget(Clear, popup);
     let rows = [
         ("↑ / ↓", "move selection"),
@@ -315,16 +961,37 @@ fn render_help_popup(frame: &mut Frame, area: Rect) {
         ("PgUp / PgDn", "jump 10 entries"),
         ("Home / End", "first / last entry"),
         ("/", "filter list (live, Esc clears)"),
+        (
+            "f",
+            "search file names (Tab: deep content search, Enter: jump)",
+        ),
+        ("1 / 2", "list view / Miller-column view"),
         ("s / S", "cycle sort key · toggle direction"),
         (".", "show / hide hidden files"),
         ("n / N", "new file / new directory"),
         ("r", "rename"),
         ("d", "delete (asks first)"),
-        ("y / x / p", "copy / cut / paste"),
-        ("e", "edit file in the built-in editor"),
+        ("Ctrl+C / X / V", "copy / cut / paste (y / x / p work too)"),
+        ("Y", "copy selected path to the system clipboard"),
+        ("C", "copy preview pane text to the system clipboard"),
+        (
+            "e",
+            "edit file (text editor) · CSV files open the table viewer",
+        ),
+        ("`", "open a terminal tab (a real shell in this folder)"),
+        ("Ctrl+T", "new file-browser tab"),
+        ("Ctrl+W", "close current tab"),
+        ("Ctrl+PgUp / PgDn", "previous / next tab"),
+        ("Alt+1 … Alt+9", "jump to tab"),
+        ("click tab", "switch tabs with the mouse"),
         ("?", "this help"),
         ("q / Esc", "quit"),
-        ("Ctrl+C", "quit"),
+        ("Ctrl+C", "quit (from dialogs)"),
+        (
+            "mouse",
+            "click selects · click+drag selects text in the editor",
+        ),
+        ("wheel", "scroll list / editor / table"),
     ];
     let mut lines: Vec<Line> = rows
         .iter()
@@ -332,9 +999,7 @@ fn render_help_popup(frame: &mut Frame, area: Rect) {
             Line::from(vec![
                 Span::styled(
                     format!("{keys:<16}"),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(*desc),
             ])
@@ -342,10 +1007,89 @@ fn render_help_popup(frame: &mut Frame, area: Rect) {
         .collect();
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "Enter on a file opens it with the macOS default app. In the editor: arrows/Home/End/PgUp/PgDn move · type to edit · Ctrl+S save · Esc close (asks if unsaved).",
+        "Settings (press t / l while help is open)",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    for (keys, desc) in [
+        ("t", format!("cycle color theme (now: {})", th.name)),
+        (
+            "l",
+            format!(
+                "editor line numbers: {}",
+                if ws.show_line_numbers { "on" } else { "off" }
+            ),
+        ),
+    ] {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{keys:<16}"),
+                Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(desc),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Enter on a file opens it with the system default app. Terminal tabs run your $SHELL — almost every key goes straight to it (Ctrl+C is SIGINT there); Ctrl+T / Ctrl+W / Ctrl+PgUp/PgDn / Alt+1-9 still manage tabs. In the editor: arrows/Home/End/PgUp/PgDn move · Ctrl+Left/Right jump by word · type to edit · paste is instant (bracketed paste) · Ctrl+S save · Ctrl+Z/Y undo/redo · Ctrl+A select all · Ctrl+C/X/V copy/cut/paste (selection, never line numbers; copies also land on the system clipboard, so Cmd+V works anywhere — the terminal itself intercepts Cmd+C, it never reaches fex) · Esc clears selection, then closes (asks if unsaved). In the CSV viewer: arrows move · Enter edits a cell · Tab next cell · a adds a row · A adds a column · Ctrl+S saves · Esc closes.",
         Style::default().fg(Color::DarkGray),
     )));
-    let help = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(" Help (?/Esc to close) "));
+    let help = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Help (?/Esc to close) "),
+    );
     frame.render_widget(help, popup);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme::THEMES;
+
+    fn line_text(line: &Line) -> String {
+        line.spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    #[test]
+    fn markdown_renders_structure() {
+        let lines = render_markdown(
+            &THEMES[0],
+            "# Title\n\nHello *world* and `code`.\n\n- a\n- b\n",
+        );
+        let text: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("Title"), "got:\n{text}");
+        assert!(text.contains("code"), "got:\n{text}");
+        assert!(text.contains("• a"), "got:\n{text}");
+        // The heading text got the bold-blue heading style.
+        let span = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content == "Title")
+            .unwrap();
+        assert_eq!(span.style.fg, Some(THEMES[0].heading));
+        assert!(span.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn csv_grid_lines_render() {
+        let cells = vec![String::from("a"), String::from("bb")];
+        let line = csv_row_line(&THEMES[0], &cells, &[3, 3], 0, Some(1), false);
+        let text: String = line.spans.iter().map(|sp| sp.content.as_ref()).collect();
+        assert_eq!(text, "│ a   │ bb  │");
+        // selected cell is reversed
+        assert!(line.spans[3]
+            .style
+            .add_modifier
+            .contains(Modifier::REVERSED));
+        let sep = csv_sep_line(&THEMES[0], &[3, 3], 0);
+        let sep_text: String = sep.spans.iter().map(|sp| sp.content.as_ref()).collect();
+        assert_eq!(sep_text, "├─────┼─────┤");
+        // header row is bold
+        let head = csv_row_line(&THEMES[0], &cells, &[3, 3], 0, None, true);
+        assert!(head.spans[1].style.add_modifier.contains(Modifier::BOLD));
+    }
 }
