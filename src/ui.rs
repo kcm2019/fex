@@ -327,6 +327,19 @@ fn render_network(frame: &mut Frame, app: &mut App, area: Rect) {
                         }
                         ListItem::new(Line::from(spans))
                     }
+                    NetRow::Mapped(i) => {
+                        let m = &nv.mapped[*i];
+                        let mut spans = vec![Span::styled(
+                            m.local.clone(),
+                            Style::default().fg(th.heading).add_modifier(Modifier::BOLD),
+                        )];
+                        spans.push(Span::styled(
+                            format!("  {}", m.remote),
+                            Style::default().fg(th.dim),
+                        ));
+                        spans.push(Span::styled("  mapped", Style::default().fg(th.dim)));
+                        ListItem::new(Line::from(spans))
+                    }
                     NetRow::Device(i) => {
                         let d = &nv.devices[*i];
                         let mut spans = vec![Span::styled(
@@ -1162,7 +1175,7 @@ fn render_editor(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_widget(para, layout[0]);
 
         let status = format!(
-            "Ln {}, Col {} · {} lines · Ctrl+S save · Ctrl+Z/Y undo/redo · click+drag selects · Esc close",
+            "Ln {}, Col {} · {} lines · Ctrl+S save · Ctrl+Z/Y undo/redo · Shift+arrows select · Esc close",
             ed.row + 1,
             ed.col + 1,
             ed.lines.len()
@@ -1345,7 +1358,7 @@ fn render_help_popup(frame: &mut Frame, ws: &Workspace, area: Rect) {
         ("C", "copy preview pane text to the system clipboard"),
         (
             "G",
-            "drives & network: open a drive, find SMB devices, mount a share as a new tab",
+            "drives & network: open a drive, mapped network drives (Windows), find SMB devices, mount a share as a new tab",
         ),
         ("*", "favorite / unfavorite the selected file or folder"),
         (
@@ -1374,7 +1387,7 @@ fn render_help_popup(frame: &mut Frame, ws: &Workspace, area: Rect) {
         ("Ctrl+C", "quit (from dialogs)"),
         (
             "mouse",
-            "click selects a file/folder · double-click opens it · click+drag selects text in the editor",
+            "click selects a file/folder · double-click opens it · click+drag or Shift+arrows selects text in the editor",
         ),
         ("wheel", "scroll list / editor / table"),
     ];
@@ -1415,7 +1428,7 @@ fn render_help_popup(frame: &mut Frame, ws: &Workspace, area: Rect) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "Enter on a file opens it with the system default app. Terminal tabs run your $SHELL (PowerShell on Windows) — almost every key goes straight to it (Ctrl+C is SIGINT there); Ctrl+T / Ctrl+N / Ctrl+W / Ctrl+PgUp/PgDn / Alt+1-9 / Ctrl+G still manage tabs. Ctrl+N opens a new blank text document in its own tab; Ctrl+S on it opens a save dialog where you browse to a folder, type a name, and Enter saves (existing files ask to overwrite). In the editor: arrows/Home/End/PgUp/PgDn move · Ctrl+Left/Right jump by word · type to edit · paste is instant (bracketed paste) · Ctrl+S save · Ctrl+Z/Y undo/redo · Ctrl+A select all (Ctrl+E works too, for terminals that grab Ctrl+A) · Ctrl+C/X/V copy/cut/paste (selection, never line numbers; copies also land on the system clipboard, so Cmd+V works anywhere — the terminal itself intercepts Cmd+C, it never reaches fex) · Esc clears selection, then closes (asks if unsaved). In the CSV viewer: arrows move · Enter edits a cell · Tab next cell · a adds a row · A adds a column · Ctrl+S saves ·  Tabs are saved between launches: quitting brings back your browser tabs, editors (including unsaved changes), and terminal tabs (a fresh shell in the same folder). Closing a tab with Ctrl+W discards its saved state for good.Esc closes.",
+        "Enter on a file opens it with the system default app. Terminal tabs run your $SHELL (PowerShell on Windows) — almost every key goes straight to it (Ctrl+C is SIGINT there); Ctrl+T / Ctrl+N / Ctrl+W / Ctrl+PgUp/PgDn / Alt+1-9 / Ctrl+G still manage tabs. Ctrl+N opens a new blank text document in its own tab; Ctrl+S on it opens a save dialog where you browse to a folder, type a name, and Enter saves (existing files ask to overwrite). In the editor: arrows/Home/End/PgUp/PgDn move · Shift+arrows (or Shift+Home/End) selects text, plain arrows collapse the selection · Ctrl+Left/Right jump by word (Ctrl+Shift+Left/Right selects by word) · type to edit · paste is instant and undoes as one step (Ctrl+Z removes the whole paste, even when the terminal delivers it character by character) · Ctrl+S save · Ctrl+Z/Y undo/redo (fast typing undoes as one burst) · Ctrl+A select all (Ctrl+E works too, for terminals that grab Ctrl+A) · Ctrl+C/X/V copy/cut/paste (selection, never line numbers; copies also land on the system clipboard, so Cmd+V works anywhere — the terminal itself intercepts Cmd+C, it never reaches fex) · Esc clears selection, then closes (asks if unsaved). In the CSV viewer: arrows move · Enter edits a cell · Tab next cell · a adds a row · A adds a column · Ctrl+S saves ·  Tabs are saved between launches: quitting brings back your browser tabs, editors (including unsaved changes), and terminal tabs (a fresh shell in the same folder). Closing a tab with Ctrl+W discards its saved state for good.Esc closes.",
         Style::default().fg(Color::DarkGray),
     )));
     let help = Paragraph::new(lines).block(

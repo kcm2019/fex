@@ -11,6 +11,7 @@ use ratatui::{
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// Refuse to open files bigger than this in the editor.
 const MAX_EDIT_BYTES: u64 = 512 * 1024;
@@ -917,6 +918,11 @@ struct UndoSnap {
 /// Cap on the undo history (each entry clones the buffer).
 const MAX_UNDO: usize = 200;
 
+/// Window in which consecutive character inserts share one undo entry: a
+/// paste arriving as individual key events (no bracketed paste, e.g. under
+/// tmux) and fast typing undo as a unit instead of character by character.
+const INSERT_GROUP: Duration = Duration::from_secs(1);
+
 pub struct Editor {
     pub path: PathBuf,
     pub lines: Vec<String>,
@@ -947,6 +953,9 @@ pub struct Editor {
     hl_valid: usize,      // rows [0, hl_valid) have valid block_end entries
     undo: Vec<UndoSnap>,
     redo: Vec<UndoSnap>,
+    /// When the last character was inserted; rapid consecutive inserts
+    /// share one undo entry (see INSERT_GROUP).
+    last_insert: Option<Instant>,
 }
 
 impl Editor {
@@ -990,6 +999,7 @@ impl Editor {
             hl_valid: 0,
             undo: Vec::new(),
             redo: Vec::new(),
+            last_insert: None,
         })
     }
 
@@ -1030,6 +1040,7 @@ impl Editor {
             hl_valid: 0,
             undo: Vec::new(),
             redo: Vec::new(),
+            last_insert: None,
         }
     }
 
@@ -1090,6 +1101,9 @@ impl Editor {
     // Snapshot-based: every mutating operation pushes the pre-edit state.
 
     fn push_undo(&mut self) {
+        // A new mutation breaks any insert burst: the next character starts
+        // a fresh undo group.
+        self.last_insert = None;
         let snap = UndoSnap {
             lines: self.lines.clone(),
             row: self.row,
@@ -1112,6 +1126,7 @@ impl Editor {
         self.row = snap.row;
         self.col = snap.col;
         self.sel_anchor = None;
+        self.last_insert = None;
         self.dirty = true;
         self.invalidate_hl(0);
         self.ensure_visible();
@@ -1153,13 +1168,20 @@ impl Editor {
     }
 
     pub fn insert_char(&mut self, ch: char) {
-        self.push_undo();
+        // Characters arriving in quick succession (a paste delivered as
+        // individual key events, or fast typing) share one undo entry, so
+        // one Ctrl+Z removes the whole burst instead of one character.
+        let grouped = matches!(self.last_insert, Some(t) if t.elapsed() < INSERT_GROUP);
+        if !grouped {
+            self.push_undo();
+        }
         self.remove_selection();
         let b = char_idx_to_byte(&self.lines[self.row], self.col);
         self.lines[self.row].insert(b, ch);
         self.col += 1;
         self.dirty = true;
         self.invalidate_hl(self.row);
+        self.last_insert = Some(Instant::now());
     }
 
     /// Insert a whole string at the cursor at once (used for pasting:
@@ -1268,6 +1290,19 @@ impl Editor {
 
     pub fn clear_selection(&mut self) {
         self.sel_anchor = None;
+    }
+
+    /// Prepare for a cursor move with or without Shift held: with Shift,
+    /// anchor the selection at the current cursor the first time (so the
+    /// move extends it); without Shift, collapse any selection.
+    pub fn shift_select(&mut self, shift: bool) {
+        if shift {
+            if self.sel_anchor.is_none() {
+                self.sel_anchor = Some((self.row, self.col));
+            }
+        } else {
+            self.sel_anchor = None;
+        }
     }
 
     /// Select the whole buffer: anchor at the start, cursor at the end.
@@ -2061,6 +2096,80 @@ mod tests {
         assert_eq!((ed.row, ed.col), (0, 0)); // start of "hello"
         ed.word_start();
         assert_eq!((ed.row, ed.col), (0, 0)); // already at buffer start
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn shift_select_anchors_extends_and_collapses() {
+        let p = tmpfile("shift.txt", b"hello world\n");
+        let mut ed = Editor::open(&p).unwrap();
+        // Shift+Right anchors at (0,0) and extends.
+        ed.shift_select(true);
+        ed.move_right();
+        ed.move_right();
+        ed.move_right();
+        assert_eq!(ed.selection(), Some(((0, 0), (0, 3))));
+        // Releasing Shift and moving collapses the selection.
+        ed.shift_select(false);
+        ed.move_right();
+        assert_eq!(ed.sel_anchor, None);
+        assert_eq!((ed.row, ed.col), (0, 4));
+        // Shift+Left from the middle anchors there and extends left.
+        ed.shift_select(true);
+        ed.move_left();
+        assert_eq!(ed.selection(), Some(((0, 3), (0, 4))));
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn burst_inserts_share_one_undo_step() {
+        let p = tmpfile("burst.txt", b"\n");
+        let mut ed = Editor::open(&p).unwrap();
+        // Characters arriving in quick succession (a paste without
+        // bracketed-paste support) undo as one unit.
+        for ch in "pasted".chars() {
+            ed.insert_char(ch);
+        }
+        assert_eq!(ed.lines[0], "pasted");
+        ed.undo();
+        assert_eq!(ed.lines[0], "");
+        assert_eq!(ed.message, "Undone");
+        // Redo restores the whole burst too.
+        ed.redo();
+        assert_eq!(ed.lines[0], "pasted");
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn slow_inserts_are_separate_undo_steps() {
+        let p = tmpfile("slow.txt", b"\n");
+        let mut ed = Editor::open(&p).unwrap();
+        ed.insert_char('a');
+        // Simulate a pause longer than INSERT_GROUP between keystrokes.
+        ed.last_insert = Some(Instant::now() - INSERT_GROUP - Duration::from_secs(1));
+        ed.insert_char('b');
+        assert_eq!(ed.lines[0], "ab");
+        ed.undo();
+        assert_eq!(ed.lines[0], "a");
+        ed.undo();
+        assert_eq!(ed.lines[0], "");
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn other_edits_break_the_insert_burst() {
+        let p = tmpfile("brk.txt", b"\n");
+        let mut ed = Editor::open(&p).unwrap();
+        ed.insert_char('a');
+        ed.insert_char('b');
+        ed.newline(); // a different edit starts a new undo group
+        ed.insert_char('c');
+        ed.undo();
+        assert_eq!(ed.lines, vec!["ab", ""]);
+        ed.undo();
+        assert_eq!(ed.lines, vec!["ab"]);
+        ed.undo();
+        assert_eq!(ed.lines, vec![""]);
         std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
     }
 }

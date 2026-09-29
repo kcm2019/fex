@@ -73,19 +73,33 @@ fn run(
         // Drain network discovery and worker messages too.
         dirty |= ws.poll_network();
         if event::poll(Duration::from_millis(100))? {
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => input::handle_key(ws, key),
-                // Bracketed paste: the terminal delivers a whole paste as one
-                // event, so pasting is instant (no char-by-char replay).
-                Event::Paste(text) => input::handle_paste(ws, text),
-                Event::Mouse(m) => input::handle_mouse(ws, m),
-                // Keep shell tabs sized to their content area (below the tab bar).
-                Event::Resize(cols, rows) => ws.resize_shell_tabs(cols, rows.saturating_sub(1)),
-                _ => {}
+            // Drain the whole pending burst before redrawing: a paste that
+            // arrives as individual key events (no bracketed paste, e.g.
+            // under tmux) or fast typing is applied as one update instead
+            // of flickering through one redraw per event.
+            loop {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        input::handle_key(ws, key)
+                    }
+                    // Bracketed paste: the terminal delivers a whole paste as one
+                    // event, so pasting is instant (no char-by-char replay).
+                    Event::Paste(text) => input::handle_paste(ws, text),
+                    Event::Mouse(m) => input::handle_mouse(ws, m),
+                    // Keep shell tabs sized to their content area (below the tab bar).
+                    Event::Resize(cols, rows) => ws.resize_shell_tabs(cols, rows.saturating_sub(1)),
+                    _ => {}
+                }
+                // Handled input may have changed the UI; a terminal resize is
+                // picked up by the next draw's autoresize.
+                dirty = true;
+                if ws.should_quit {
+                    break;
+                }
+                if !event::poll(Duration::ZERO)? {
+                    break;
+                }
             }
-            // Handled input may have changed the UI; a terminal resize is
-            // picked up by the next draw's autoresize.
-            dirty = true;
         } else {
             // No input this tick: pick up files that appeared or vanished
             // behind our back (downloads, other programs).

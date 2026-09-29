@@ -2,6 +2,7 @@
 
 use crate::app::{App, InputKind, Mode, NetState, Tab, ViewMode, Workspace};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 /// Two left-clicks this close together (same cell) count as a double-click.
@@ -102,9 +103,26 @@ pub fn handle_key(ws: &mut Workspace, key: KeyEvent) {
 /// Keys for the Network view: browse local drives and discovered
 /// devices, mount a share as a new tab.
 fn handle_network(ws: &mut Workspace, key: KeyEvent) {
+    // Enter on a mapped network drive (Windows) opens it as a new browser
+    // tab — it's already connected, so no mounting is needed.
     // Enter on a drive row opens it as a new browser tab; anywhere else
     // the view handles the key itself.
     if matches!(key.code, KeyCode::Enter | KeyCode::Right) {
+        let mapped = ws.active_browser().and_then(|app| {
+            app.net
+                .as_ref()
+                .and_then(|nv| nv.selected_mapped())
+                .map(|m| {
+                    (
+                        PathBuf::from(format!("{}{}", m.local, std::path::MAIN_SEPARATOR)),
+                        format!("{} ({})", m.local, m.remote),
+                    )
+                })
+        });
+        if let Some((path, name)) = mapped {
+            ws.open_drive_tab(&path, &name);
+            return;
+        }
         let drive = ws.active_browser().and_then(|app| {
             app.net
                 .as_ref()
@@ -197,6 +215,31 @@ fn handle_editor(app: &mut App, key: KeyEvent) {
         }
         return;
     }
+    // Ctrl+Left/Right: word jumps; with Shift held, extend the selection.
+    if ctrl && matches!(key.code, KeyCode::Left | KeyCode::Right) {
+        let shifted = shift;
+        let moved = match key.code {
+            KeyCode::Left => app
+                .editor
+                .as_mut()
+                .map(|ed| {
+                    ed.shift_select(shifted);
+                    ed.word_start();
+                })
+                .is_some(),
+            _ => app
+                .editor
+                .as_mut()
+                .map(|ed| {
+                    ed.shift_select(shifted);
+                    ed.word_end();
+                })
+                .is_some(),
+        };
+        if moved {
+            return;
+        }
+    }
     // OS-style clipboard: Ctrl+C copies the selection (or current line),
     // Ctrl+X cuts it, Ctrl+V pastes. Copied text never includes the
     // line-number gutter.
@@ -220,8 +263,6 @@ fn handle_editor(app: &mut App, key: KeyEvent) {
             KeyCode::Char('e') | KeyCode::Char('E') => {
                 app.editor.as_mut().map(|ed| ed.select_all()).is_some()
             }
-            KeyCode::Left => app.editor.as_mut().map(|ed| ed.word_start()).is_some(),
-            KeyCode::Right => app.editor.as_mut().map(|ed| ed.word_end()).is_some(),
             _ => false,
         };
         if acted {
@@ -253,14 +294,38 @@ fn handle_editor(app: &mut App, key: KeyEvent) {
         KeyCode::Enter => ed.newline(),
         KeyCode::Backspace => ed.backspace(),
         KeyCode::Delete => ed.delete(),
-        KeyCode::Left => ed.move_left(),
-        KeyCode::Right => ed.move_right(),
-        KeyCode::Up => ed.move_up(),
-        KeyCode::Down => ed.move_down(),
-        KeyCode::Home => ed.home(),
-        KeyCode::End => ed.end(),
-        KeyCode::PageUp => ed.page_up(),
-        KeyCode::PageDown => ed.page_down(),
+        KeyCode::Left => {
+            ed.shift_select(shift);
+            ed.move_left();
+        }
+        KeyCode::Right => {
+            ed.shift_select(shift);
+            ed.move_right();
+        }
+        KeyCode::Up => {
+            ed.shift_select(shift);
+            ed.move_up();
+        }
+        KeyCode::Down => {
+            ed.shift_select(shift);
+            ed.move_down();
+        }
+        KeyCode::Home => {
+            ed.shift_select(shift);
+            ed.home();
+        }
+        KeyCode::End => {
+            ed.shift_select(shift);
+            ed.end();
+        }
+        KeyCode::PageUp => {
+            ed.shift_select(shift);
+            ed.page_up();
+        }
+        KeyCode::PageDown => {
+            ed.shift_select(shift);
+            ed.page_down();
+        }
         KeyCode::Tab => {
             for _ in 0..4 {
                 ed.insert_char(' ');
@@ -972,5 +1037,74 @@ mod tests {
             "unexpected status: {status}"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn shift_arrows_select_in_editor() {
+        let (mut ws, dir) = test_app();
+        browser_mut(&mut ws).open_editor(); // a.txt: "hello\nworld\n"
+                                            // Shift+Right x5 selects "hello".
+        for _ in 0..5 {
+            handle_key(&mut ws, key(KeyCode::Right, KeyModifiers::SHIFT));
+        }
+        let sel = browser(&ws).editor.as_ref().unwrap().selection();
+        assert_eq!(sel, Some(((0, 0), (0, 5))));
+        // Typing replaces the selection in one undo step.
+        handle_key(&mut ws, key(KeyCode::Char('X'), KeyModifiers::empty()));
+        {
+            let ed = browser(&ws).editor.as_ref().unwrap();
+            assert_eq!(ed.lines[0], "X");
+            assert_eq!(ed.sel_anchor, None);
+        }
+        handle_key(&mut ws, key(KeyCode::Char('z'), KeyModifiers::CONTROL));
+        {
+            let ed = browser(&ws).editor.as_ref().unwrap();
+            assert_eq!(ed.lines[0], "hello");
+        }
+        // Plain arrows collapse the selection and just move.
+        for _ in 0..5 {
+            handle_key(&mut ws, key(KeyCode::Left, KeyModifiers::SHIFT));
+        }
+        {
+            let ed = browser(&ws).editor.as_ref().unwrap();
+            assert_eq!(ed.selection(), Some(((0, 0), (0, 5))));
+        }
+        handle_key(&mut ws, key(KeyCode::Left, KeyModifiers::empty()));
+        {
+            let ed = browser(&ws).editor.as_ref().unwrap();
+            assert_eq!(ed.sel_anchor, None);
+            assert_eq!((ed.row, ed.col), (0, 0));
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn network_enter_on_mapped_drive_opens_tab() {
+        let (mut ws, dir) = test_app();
+        browser_mut(&mut ws).open_network();
+        assert!(matches!(browser(&ws).mode, Mode::Network));
+        // Stand-in for a Windows mapped drive: point it at the temp dir.
+        let local = dir.to_string_lossy().into_owned();
+        if let Some(nv) = browser_mut(&mut ws).net.as_mut() {
+            nv.drives.clear();
+            nv.devices.clear();
+            nv.mapped = vec![crate::net::MappedDrive {
+                local: local.clone(),
+                remote: r"\\nas\media".to_string(),
+            }];
+            // Select the Mapped(0) row directly.
+            nv.selected = nv
+                .rows()
+                .iter()
+                .position(|r| matches!(r, crate::app::NetRow::Mapped(0)))
+                .unwrap();
+        }
+        handle_key(&mut ws, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(ws.tabs.len(), 2);
+        assert_eq!(ws.active, 1);
+        match &ws.tabs[1] {
+            Tab::Browser(app) => assert_eq!(app.cwd, dir),
+            _ => panic!("expected a browser tab"),
+        }
     }
 }

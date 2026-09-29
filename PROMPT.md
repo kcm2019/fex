@@ -65,11 +65,16 @@ Deliverable: a working binary I can run with `cargo run`
 - **Auto-refresh**: the listing re-reads the directory when its mtime
   changes behind the app (downloads etc.), preserving selection.
 - **Instant paste**: bracketed paste inserts the whole block at once in the
-  editor and in every input field.
-- **Editor upgrades**: `Ctrl+Z` / `Ctrl+Y` (or `Ctrl+Shift+Z`) undo/redo;
-  mouse click moves the cursor, click-drag selects text, wheel scrolls;
-  `Ctrl+C`/`Ctrl+X` copy/cut the exact selection (never the line-number
-  gutter), typing replaces the selection; `Esc` clears the selection first;
+  editor and in every input field; pastes arriving character by character
+  (no bracketed paste, e.g. tmux) are drained as one update and undo as
+  one step.
+- **Editor upgrades**: `Ctrl+Z` / `Ctrl+Y` (or `Ctrl+Shift+Z`) undo/redo
+  (fast typing undoes as one burst); mouse click moves the cursor,
+  click-drag selects text, wheel scrolls; `Shift`+arrows/Home/End
+  (or `Ctrl+Shift+Left/Right` by word) selects text from the keyboard,
+  plain arrows collapse the selection; `Ctrl+C`/`Ctrl+X` copy/cut the exact
+  selection (never the line-number gutter), typing replaces the selection;
+  `Esc` clears the selection first;
   `Ctrl+A` (or `Ctrl+E`, for terminals that grab `Ctrl+A`) selects the whole file; `Ctrl+Left`/`Ctrl+Right` jump by word.
 - **CSV viewer** (`e` on a `.csv`): table view with header row and visible
   grid lines; arrows move, `Enter` edits a cell, `Tab` next cell, `a` adds a
@@ -125,9 +130,11 @@ Deliverable: a working binary I can run with `cargo run`
   Windows); `Enter` on a share mounts it and opens it as a regular
   browser tab — preview, edit, search, and copy/paste all work on its
   files. macOS mounts with `mount_smbfs` into a temp dir and unmounts on
-  tab close (or quit); Windows browses `\\host\share` UNC paths directly;
-  Linux mounting is not supported (browse an OS-mounted share as a folder
-  instead). Auth-requiring shares prompt for username then password
+  tab close (or quit); Windows browses `\\host\share` UNC paths directly
+  and additionally lists File Explorer's already-connected mapped network
+  drives (`WNetEnumResourceW`, no manual host entry — `Enter` opens one
+  directly); Linux mounting is not supported (browse an OS-mounted share
+  as a folder instead). Auth-requiring shares prompt for username then password
   (masked, memory-only); `m` adds a host by hand; a failed share listing
   falls back to typing the share name.
 - **README.md documents every feature** and is updated with each change.

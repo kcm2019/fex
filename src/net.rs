@@ -113,6 +113,142 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
+/// A network drive Windows already has connected (what File Explorer shows
+/// under This PC), e.g. `Z:` → `\\nas\media`. Needs no mounting: fex just
+/// opens the local path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MappedDrive {
+    /// Drive letter with colon, e.g. `Z:`.
+    pub local: String,
+    /// UNC path of the share, e.g. `\\nas\media`.
+    pub remote: String,
+}
+
+/// List the mapped network drives Windows already has connected, via the
+/// `WNetEnumResourceW` API (mpr.dll) — the same source File Explorer uses.
+/// Non-Windows: always empty.
+pub fn list_mapped_drives() -> Vec<MappedDrive> {
+    #[cfg(windows)]
+    {
+        list_mapped_drives_win()
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
+/// Windows-only: enumerate connected `RESOURCETYPE_DISK` resources with
+/// hand-written FFI so no extra crate is needed.
+#[cfg(windows)]
+fn list_mapped_drives_win() -> Vec<MappedDrive> {
+    use std::ffi::OsString;
+    use std::os::raw::c_void;
+    use std::os::windows::ffi::OsStringExt;
+
+    const RESOURCE_CONNECTED: u32 = 1;
+    const RESOURCETYPE_DISK: u32 = 1;
+    const NO_ERROR: u32 = 0;
+    const ERROR_MORE_DATA: u32 = 234;
+    const ERROR_NO_MORE_ITEMS: u32 = 259;
+
+    #[repr(C)]
+    struct NetResourceW {
+        _dw_scope: u32,
+        _dw_type: u32,
+        _dw_display_type: u32,
+        _dw_usage: u32,
+        lp_local_name: *mut u16,
+        lp_remote_name: *mut u16,
+        _lp_comment: *mut u16,
+        _lp_provider: *mut u16,
+    }
+
+    #[link(name = "mpr")]
+    extern "system" {
+        fn WNetOpenEnumW(
+            dw_scope: u32,
+            dw_type: u32,
+            dw_usage: u32,
+            lp_net_resource: *const NetResourceW,
+            lph_enum: *mut *mut c_void,
+        ) -> u32;
+        fn WNetEnumResourceW(
+            h_enum: *mut c_void,
+            lpc_count: *mut u32,
+            lp_buffer: *mut c_void,
+            lp_buffer_size: *mut u32,
+        ) -> u32;
+        fn WNetCloseEnum(h_enum: *mut c_void) -> u32;
+    }
+
+    /// Read a NUL-terminated UTF-16 Windows string.
+    unsafe fn wide_to_string(mut p: *const u16) -> String {
+        let mut v = Vec::new();
+        while !p.is_null() && *p != 0 {
+            v.push(*p);
+            p = p.add(1);
+        }
+        OsString::from_wide(&v).to_string_lossy().into_owned()
+    }
+
+    let mut out = Vec::new();
+    // SAFETY: all calls follow the WNet contract — a valid enum handle,
+    // a caller-owned buffer, and NUL-terminated strings inside it.
+    unsafe {
+        let mut h_enum: *mut c_void = std::ptr::null_mut();
+        if WNetOpenEnumW(
+            RESOURCE_CONNECTED,
+            RESOURCETYPE_DISK,
+            0,
+            std::ptr::null(),
+            &mut h_enum,
+        ) != NO_ERROR
+        {
+            return out;
+        }
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            // Ask for as many entries as fit; the API caps it itself.
+            let mut count: u32 = u32::MAX;
+            let mut size = buf.len() as u32;
+            let rc = WNetEnumResourceW(
+                h_enum,
+                &mut count,
+                buf.as_mut_ptr() as *mut c_void,
+                &mut size,
+            );
+            if rc == ERROR_NO_MORE_ITEMS || (rc == NO_ERROR && count == 0) {
+                break;
+            }
+            if rc == ERROR_MORE_DATA {
+                buf.resize(size.max(1024) as usize, 0);
+                continue;
+            }
+            if rc != NO_ERROR {
+                break;
+            }
+            // Entries are packed back-to-back at the start of the buffer.
+            let mut p = buf.as_ptr() as *const NetResourceW;
+            for _ in 0..count {
+                let nr = &*p;
+                if !nr.lp_local_name.is_null() && !nr.lp_remote_name.is_null() {
+                    let local = wide_to_string(nr.lp_local_name);
+                    let remote = wide_to_string(nr.lp_remote_name);
+                    if !local.is_empty() && !remote.is_empty() {
+                        out.push(MappedDrive { local, remote });
+                    }
+                }
+                p = p.add(1);
+            }
+        }
+        WNetCloseEnum(h_enum);
+    }
+    out.sort_by(|a, b| a.local.cmp(&b.local));
+    out.dedup_by(|a, b| a.local == b.local);
+    out
+}
+
 /// A mounted share ready to browse: the local path plus whether fex owns
 /// the mount (and must unmount it later). Windows UNC paths need no
 /// unmounting.
@@ -546,5 +682,14 @@ SMB1 disabled -- no workgroup available
             removable: false,
         };
         assert_eq!(drive_space(&d), "120 GB free of 500 GB");
+    }
+
+    #[test]
+    fn mapped_drives_empty_off_windows() {
+        // The real enumeration only exists on Windows (WNet API); on other
+        // platforms the contract is "no mapped drives".
+        if cfg!(not(windows)) {
+            assert!(list_mapped_drives().is_empty());
+        }
     }
 }

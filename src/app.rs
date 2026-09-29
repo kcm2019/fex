@@ -1515,6 +1515,8 @@ pub enum NetState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetSection {
     Drives,
+    /// Windows mapped network drives (File Explorer's connected locations).
+    Mapped,
     Network,
 }
 
@@ -1522,6 +1524,7 @@ impl NetSection {
     pub fn label(self) -> &'static str {
         match self {
             NetSection::Drives => "Drives",
+            NetSection::Mapped => "Mapped network drives",
             NetSection::Network => "Network",
         }
     }
@@ -1533,14 +1536,23 @@ impl NetSection {
 pub enum NetRow {
     Header(NetSection),
     Drive(usize),
+    Mapped(usize),
     Device(usize),
     Hint,
 }
 
 impl NetRow {
     fn selectable(self) -> bool {
-        matches!(self, NetRow::Drive(_) | NetRow::Device(_))
+        matches!(
+            self,
+            NetRow::Drive(_) | NetRow::Mapped(_) | NetRow::Device(_)
+        )
     }
+}
+
+/// Normalize a drive root for comparison: `Z:\` and `z:` are the same.
+fn norm_drive(s: &str) -> String {
+    s.trim_end_matches(['\\', '/']).to_lowercase()
 }
 
 /// The Network view (`G`): local drives plus live mDNS device list and
@@ -1548,6 +1560,9 @@ impl NetRow {
 pub struct NetView {
     /// Local drives/volumes, loaded once when the view opens.
     pub drives: Vec<Drive>,
+    /// Windows mapped network drives (already connected; no mounting
+    /// needed). Empty on other platforms.
+    pub mapped: Vec<net::MappedDrive>,
     /// Discovered + hand-added devices, merged and sorted.
     pub devices: Vec<NetDevice>,
     manual: Vec<NetDevice>,
@@ -1572,8 +1587,18 @@ pub struct NetView {
 impl NetView {
     pub fn new() -> io::Result<Self> {
         let (tx, rx) = mpsc::channel();
+        let mapped = net::list_mapped_drives();
+        // On Windows the disk list also reports mapped network drives;
+        // drop those from Drives so each appears once (with its UNC path,
+        // under "Mapped network drives").
+        let mut drives = net::list_drives();
+        if !mapped.is_empty() {
+            let letters: Vec<String> = mapped.iter().map(|m| norm_drive(&m.local)).collect();
+            drives.retain(|d| !letters.contains(&norm_drive(&d.mount_point.to_string_lossy())));
+        }
         let mut nv = Self {
-            drives: net::list_drives(),
+            drives,
+            mapped,
             devices: Vec::new(),
             manual: Vec::new(),
             selected: 0,
@@ -1592,10 +1617,16 @@ impl NetView {
     }
 
     /// Flat rows of the combined list: a "Drives" separator, the drives,
-    /// a "Network" separator, then the devices (or a hint when empty).
+    /// a "Mapped network drives" separator (Windows only, when any are
+    /// mapped), a "Network" separator, then the devices (or a hint when
+    /// empty).
     pub fn rows(&self) -> Vec<NetRow> {
         let mut rows = vec![NetRow::Header(NetSection::Drives)];
         rows.extend((0..self.drives.len()).map(NetRow::Drive));
+        if !self.mapped.is_empty() {
+            rows.push(NetRow::Header(NetSection::Mapped));
+            rows.extend((0..self.mapped.len()).map(NetRow::Mapped));
+        }
         rows.push(NetRow::Header(NetSection::Network));
         if self.devices.is_empty() {
             rows.push(NetRow::Hint);
@@ -1724,6 +1755,18 @@ impl NetView {
         }
     }
 
+    /// The mapped network drive under the cursor, if the list is on one of
+    /// those rows. Already connected, so the input layer opens it directly.
+    pub fn selected_mapped(&self) -> Option<&net::MappedDrive> {
+        if !matches!(self.state, NetState::Devices) {
+            return None;
+        }
+        match self.rows().get(self.selected) {
+            Some(NetRow::Mapped(i)) => self.mapped.get(*i),
+            _ => None,
+        }
+    }
+
     fn selected_share(&self) -> Option<(String, String)> {
         match &self.state {
             NetState::Shares { host, shares } => {
@@ -1734,8 +1777,8 @@ impl NetView {
     }
 
     /// Enter on the selection: list a device's shares, or mount a share.
-    /// Drives are opened by the input layer (see `selected_drive`); Enter
-    /// here ignores them.
+    /// Drives and mapped network drives are opened by the input layer (see
+    /// `selected_drive` / `selected_mapped`); Enter here ignores them.
     pub fn enter(&mut self) {
         match self.state {
             NetState::Devices => {
@@ -3230,6 +3273,81 @@ mod tests {
         // The hint is not selectable.
         assert!(!NetRow::Hint.selectable());
         assert!(!NetRow::Header(NetSection::Drives).selectable());
+    }
+
+    #[test]
+    fn net_view_rows_include_mapped_section() {
+        let mut nv = test_net_view();
+        nv.drives = vec![fake_drive("d")];
+        nv.mapped = vec![
+            net::MappedDrive {
+                local: "Z:".to_string(),
+                remote: r"\\nas\media".to_string(),
+            },
+            net::MappedDrive {
+                local: "Y:".to_string(),
+                remote: r"\\nas\backup".to_string(),
+            },
+        ];
+        nv.devices.clear();
+        let rows = nv.rows();
+        assert_eq!(
+            rows,
+            vec![
+                NetRow::Header(NetSection::Drives),
+                NetRow::Drive(0),
+                NetRow::Header(NetSection::Mapped),
+                NetRow::Mapped(0),
+                NetRow::Mapped(1),
+                NetRow::Header(NetSection::Network),
+                NetRow::Hint,
+            ]
+        );
+        assert!(NetRow::Mapped(0).selectable());
+        // The selection walks through the mapped rows.
+        nv.selected = nv.first_selectable();
+        assert_eq!(nv.rows()[nv.selected], NetRow::Drive(0));
+        assert!(nv.selected_mapped().is_none());
+        nv.move_selection(1);
+        assert_eq!(nv.rows()[nv.selected], NetRow::Mapped(0));
+        assert_eq!(nv.selected_mapped().unwrap().remote, r"\\nas\media");
+        nv.move_selection(1);
+        assert_eq!(nv.rows()[nv.selected], NetRow::Mapped(1));
+    }
+
+    #[test]
+    fn net_view_no_mapped_section_when_empty() {
+        let mut nv = test_net_view();
+        nv.drives = vec![fake_drive("d")];
+        nv.mapped.clear();
+        nv.devices.clear();
+        let rows = nv.rows();
+        assert!(!rows.contains(&NetRow::Header(NetSection::Mapped)));
+        assert!(nv.selected_mapped().is_none());
+    }
+
+    #[test]
+    fn net_view_enter_on_mapped_row_is_ignored_by_view() {
+        // The input layer opens mapped drives as tabs; NetView::enter
+        // ignores them, like plain drives.
+        let mut nv = test_net_view();
+        nv.drives.clear();
+        nv.mapped = vec![net::MappedDrive {
+            local: "Z:".to_string(),
+            remote: r"\\nas\media".to_string(),
+        }];
+        nv.devices.clear();
+        nv.selected = nv.first_selectable();
+        assert_eq!(nv.rows()[nv.selected], NetRow::Mapped(0));
+        nv.enter();
+        assert!(matches!(nv.state, NetState::Devices));
+    }
+
+    #[test]
+    fn norm_drive_ignores_case_and_separators() {
+        assert_eq!(norm_drive("Z:\\"), "z:");
+        assert_eq!(norm_drive("z:"), "z:");
+        assert_eq!(norm_drive("/mnt/x/"), "/mnt/x");
     }
 
     #[test]

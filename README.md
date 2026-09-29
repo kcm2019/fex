@@ -137,13 +137,19 @@ a favorite, `Esc` closes. Missing favorites are shown dimmed with a
 own labeled separator line. `Enter` on a drive opens it as a regular
 browser tab.
 
+**On Windows**, fex also lists your already-connected **mapped network
+drives** (the same `Z:` → `\\server\share` entries File Explorer shows
+under This PC) in their own section — no manual host entry needed.
+`Enter` opens one directly as a browser tab, since Windows already has
+it connected.
+
 Below the drives, fex listens for mDNS/Bonjour announcements (the same
 discovery Finder and Windows Network use) and lists SMB file servers on
 your LAN with their names and addresses — no root, no setup. Devices
 with a share currently mounted are tagged `● mounted`.
 
-- `↑` / `↓` — pick a drive or device; `Enter` opens the drive or lists
-  the device's shares.
+- `↑` / `↓` — pick a drive, mapped network drive, or device; `Enter`
+  opens the drive or lists the device's shares.
 - `Enter` on a share **mounts it and opens it as a regular browser tab**,
   so preview, editing, search, and copy/paste all work on its files.
 - The tab is named `//host/share`. Closing the tab unmounts the share
@@ -203,11 +209,18 @@ events to the app and you want the terminal's native text selection.)
 
 - **Navigation** — arrows, Home/End, PgUp/PgDn, `Ctrl+Left`/`Ctrl+Right`
   jump by word. Click anywhere to move the cursor; the scroll wheel scrolls.
+- **Selection** — hold `Shift` with the arrows (or `Shift+Home`/`Shift+End`,
+  `Ctrl+Shift+Left/Right` by word) to select text; releasing `Shift` and
+  moving collapses the selection. Click + drag selects with the mouse.
 - **Editing** — just type. **Pasting is instant**: the terminal's bracketed
   paste delivers the whole block as one event, so a 10,000-line paste lands
-  at once (and undoes as one step). You can also paste into the rename /
+  at once. Even when the terminal delivers a paste character by character
+  (e.g. under tmux), pending input is drained before each redraw, so it
+  still lands as one update. You can also paste into the rename /
   new-file / filter / search fields the same way.
 - **Undo / redo** — `Ctrl+Z` undoes, `Ctrl+Y` (or `Ctrl+Shift+Z`) redoes.
+  A paste undoes as **one step** (the whole pasted block, not one
+  character); characters typed in quick succession also undo together.
 - **Select all** — `Ctrl+A` selects the whole file (`Ctrl+E` does the same,
   for terminals that grab `Ctrl+A` for their own "select all").
 - **Copy / cut / paste** — `Ctrl+C` / `Ctrl+X` / `Ctrl+V`, synced with the
