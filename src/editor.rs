@@ -937,6 +937,10 @@ pub struct Editor {
     pub view_y: u16,
     /// Line-number gutter toggle (synced from App on open).
     pub show_line_numbers: bool,
+    /// Session-restore backup holding unsaved buffer content
+    /// (`~/.config/fex/session/backup-N.txt`). `None` when the on-disk file
+    /// is the source of truth. Deleted on save and when the tab closes.
+    pub backup: Option<PathBuf>,
     lang: Lang,
     trailing_newline: bool,
     block_end: Vec<bool>, // in-block-comment at end of line i
@@ -981,6 +985,7 @@ impl Editor {
             lang: Lang::from_path(path),
             trailing_newline,
             show_line_numbers: true,
+            backup: None,
             block_end: Vec::new(),
             hl_valid: 0,
             undo: Vec::new(),
@@ -995,6 +1000,7 @@ impl Editor {
         }
         fs::write(&self.path, content)?;
         self.dirty = false;
+        self.clear_backup();
         self.message = format!("Saved {}", self.path.display());
         Ok(())
     }
@@ -1019,11 +1025,50 @@ impl Editor {
             lang: Lang::Plain,
             trailing_newline: true,
             show_line_numbers: true,
+            backup: None,
             block_end: Vec::new(),
             hl_valid: 0,
             undo: Vec::new(),
             redo: Vec::new(),
         }
+    }
+
+    /// Delete the session backup file (if any) and forget it. The buffer is
+    /// safe on disk now, so the backup must not resurrect stale content.
+    pub fn clear_backup(&mut self) {
+        if let Some(path) = self.backup.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// The exact file content this buffer would save, for session backups.
+    pub fn backup_text(&self) -> String {
+        let mut content = self.lines.join("\n");
+        if self.trailing_newline {
+            content.push('\n');
+        }
+        content
+    }
+
+    /// Rebuild an editor from session-backup text (unsaved work from a
+    /// previous run). The buffer comes back dirty, backed by `backup`.
+    pub fn from_backup(path: PathBuf, text: &str, backup: PathBuf) -> Editor {
+        let mut ed = Editor::untitled();
+        ed.path = path;
+        let mut text = text.to_string();
+        let mut trailing = false;
+        if text.ends_with('\n') {
+            trailing = true;
+            text.pop();
+        }
+        ed.lines = text.split('\n').map(|s| s.to_string()).collect();
+        if ed.lines.is_empty() {
+            ed.lines.push(String::new());
+        }
+        ed.trailing_newline = trailing;
+        ed.dirty = true;
+        ed.backup = Some(backup);
+        ed
     }
 
     /// Save to a new path (the save-as flow): adopts the path, picks up

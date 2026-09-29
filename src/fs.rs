@@ -521,6 +521,50 @@ pub fn open_with_default(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Show a file or folder in the OS file explorer: Finder on macOS (`open -R`
+/// reveals a file and selects it; `open` opens a folder), Explorer on
+/// Windows (`/select,` highlights a file), the default file manager on Linux
+/// (`xdg-open` opens the folder itself — or the parent folder for a file,
+/// since `xdg-open` on a file would launch its default app instead).
+pub fn reveal_in_explorer(path: &Path) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        if path.is_dir() {
+            Command::new("open").arg(path).spawn().map(|_| ())
+        } else {
+            Command::new("open").arg("-R").arg(path).spawn().map(|_| ())
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if path.is_dir() {
+            Command::new("explorer").arg(path).spawn().map(|_| ())
+        } else {
+            Command::new("explorer")
+                .arg(format!("/select,{}", path.to_string_lossy()))
+                .spawn()
+                .map(|_| ())
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let dir = if path.is_dir() {
+            path
+        } else {
+            path.parent().unwrap_or(path)
+        };
+        Command::new("xdg-open").arg(dir).spawn().map(|_| ())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "unsupported platform",
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

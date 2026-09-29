@@ -100,12 +100,35 @@ blank document shows "untitled"; long names are truncated to 24 characters).
 | `Ctrl+W` | Close current tab (the last tab can't be closed) |
 | `Ctrl+PgUp` / `Ctrl+PgDn` | Previous / next tab |
 | `Alt+1` … `Alt+9` | Jump to tab |
+| `Ctrl+G` then `1` … `9` | Jump to tab (macOS-friendly: Mac keyboards have no Alt key, and terminals turn Option+digit into special characters — `Ctrl+G` then `n` / `p` steps to the next / previous tab, `Esc` cancels) |
 | Click a tab | Switch to it |
 
 Inside a terminal tab almost every key goes straight to the shell, so
 `Ctrl+C` there is SIGINT (interrupt), not copy — the tab-management keys
 above still work. The shell is a full pty: colors, prompts, `vim`, `ssh`,
 and full-screen programs all work.
+
+### Session restore
+
+Quitting (`q`) saves your tabs, and the next launch brings them back:
+file-browser tabs (directory, selection, view mode, sort, hidden-files
+setting), editor tabs (file, cursor, and even unsaved changes), and
+terminal tabs (a fresh shell in the same folder — the dead process itself
+can't be resurrected). Unsaved editor buffers are backed up on quit and
+restored as dirty editors, so you pick up exactly where you left off.
+Closing a tab with `Ctrl+W` destroys its saved state for good — including
+any unsaved changes — and stale backups are cleaned up on every quit.
+Session data lives under `~/.config/fex/session/`.
+
+### Favorites
+
+Press `*` to favorite (or unfavorite) the selected file or folder —
+favorites get a `★` marker in the file list and Miller columns, and the
+list is saved to `~/.config/fex/favorites` immediately. Press `F` to open
+the favorites popup: `↑↓` move, `Enter` jumps the current tab there
+(directories open; files are revealed in their parent folder), `*` removes
+a favorite, `Esc` closes. Missing favorites are shown dimmed with a
+`(missing)` tag instead of breaking the list.
 
 ## Drives & network
 
@@ -162,12 +185,15 @@ How it mounts, per OS:
 | `d` | Delete (asks first) |
 | `y` / `x` / `p` or `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / cut / paste files |
 | `Y` | Copy the selected file's full path to the system clipboard |
-| `s` / `S` | Cycle sort key (Name → Size → Modified) / toggle direction (works in column view too) |
+| `o` | Reveal the selected file/folder in the OS file explorer (Finder on macOS, Explorer on Windows, the default file manager on Linux) |
+| `s` / `S` | Cycle sort key (Name → Size → Modified → Type) / toggle direction (works in column view too) |
 | `.` | Show / hide hidden files |
 | `?` | Help overlay |
 | `q` / `Esc` | Quit |
 
-Mouse: click a file to select it, scroll wheel moves the selection.
+Mouse: click a file or folder to select it, double-click to open it (works
+in both list and column views — clicking a row in an earlier column jumps
+there). Scroll wheel moves the selection.
 (Hold `Alt`/`Option` while dragging if your terminal is set to pass mouse
 events to the app and you want the terminal's native text selection.)
 
@@ -182,7 +208,8 @@ events to the app and you want the terminal's native text selection.)
   at once (and undoes as one step). You can also paste into the rename /
   new-file / filter / search fields the same way.
 - **Undo / redo** — `Ctrl+Z` undoes, `Ctrl+Y` (or `Ctrl+Shift+Z`) redoes.
-- **Select all** — `Ctrl+A` selects the whole file.
+- **Select all** — `Ctrl+A` selects the whole file (`Ctrl+E` does the same,
+  for terminals that grab `Ctrl+A` for their own "select all").
 - **Copy / cut / paste** — `Ctrl+C` / `Ctrl+X` / `Ctrl+V`, synced with the
   system clipboard:
   - With a mouse selection (click + drag): copies the **exact selected

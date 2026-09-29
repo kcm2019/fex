@@ -14,6 +14,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
+use std::path::PathBuf;
 use std::time::SystemTime;
 
 fn human_size(bytes: u64) -> String {
@@ -58,11 +59,18 @@ pub fn render(frame: &mut Frame, ws: &mut Workspace) {
         area.height.saturating_sub(1),
     );
 
+    // The favorites popup is modal: it floats above everything else.
+    if ws.show_favorites {
+        render_favorites_popup(frame, ws, content);
+        return;
+    }
+
     // Terminal tabs render the pty screen; nothing else applies there.
     if ws.is_shell_active() {
         render_shell(frame, ws, content);
         return;
     }
+    let favs = ws.favorites.clone();
     let Some(app) = ws.active_browser_mut() else {
         return;
     };
@@ -111,17 +119,17 @@ pub fn render(frame: &mut Frame, ws: &mut Workspace) {
 
     match app.mode {
         Mode::Search => render_search(frame, app, layout[1]),
-        _ if app.view == ViewMode::Columns => render_columns(frame, app, layout[1]),
+        _ if app.view == ViewMode::Columns => render_columns(frame, app, &favs, layout[1]),
         _ => {
             if app.show_preview {
                 let main = Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
                     .split(layout[1]);
-                render_list(frame, app, main[0]);
+                render_list(frame, app, &favs, main[0]);
                 render_preview(frame, app, main[1]);
             } else {
-                render_list(frame, app, layout[1]);
+                render_list(frame, app, &favs, layout[1]);
             }
         }
     }
@@ -167,8 +175,13 @@ fn render_tab_bar(frame: &mut Frame, ws: &mut Workspace, th: &Theme, area: Rect)
             x += 1;
         }
     }
-    // Right-aligned hint, dimmed.
-    let hint = "Ctrl+T new tab · Ctrl+N new text doc · ` terminal · click a tab to switch";
+    // Right-aligned hint, dimmed. While the Ctrl+G leader is armed it shows
+    // what the next key does instead.
+    let hint = if ws.goto_pending {
+        "Go to tab: 1-9 · n next · p prev · Esc cancel"
+    } else {
+        "Ctrl+T new tab · Ctrl+N new text doc · ` terminal · click a tab to switch"
+    };
     let used = x.saturating_sub(area.x) as usize;
     let pad = (area.width as usize).saturating_sub(used + hint.len() + 1);
     if pad > 0 {
@@ -218,7 +231,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(header, area);
 }
 
-fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
+fn render_list(frame: &mut Frame, app: &mut App, favs: &[PathBuf], area: Rect) {
     let th = app.theme();
     app.list_origin = (area.x, area.y);
     let items: Vec<ListItem> = app
@@ -237,14 +250,19 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 human_size(e.size)
             };
-            let line = Line::from(vec![
-                Span::styled(name, style),
-                Span::styled(
-                    format!("  {size:>8}  {}", human_time(e.modified)),
-                    Style::default().fg(th.dim),
-                ),
-            ]);
-            ListItem::new(line)
+            let mut spans = Vec::new();
+            if favs.contains(&e.path) {
+                spans.push(Span::styled(
+                    "★ ",
+                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+                ));
+            }
+            spans.push(Span::styled(name, style));
+            spans.push(Span::styled(
+                format!("  {size:>8}  {}", human_time(e.modified)),
+                Style::default().fg(th.dim),
+            ));
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
@@ -391,7 +409,7 @@ fn render_network(frame: &mut Frame, app: &mut App, area: Rect) {
 
 /// Miller-column view: directory columns side by side, with a file
 /// preview panel at the right when the active selection is a file.
-fn render_columns(frame: &mut Frame, app: &mut App, area: Rect) {
+fn render_columns(frame: &mut Frame, app: &mut App, favs: &[PathBuf], area: Rect) {
     let show_preview = app.show_preview && app.selected_entry().is_some_and(|e| !e.is_dir);
     let n_panels = app.columns.len() + usize::from(show_preview);
     if n_panels == 0 {
@@ -402,6 +420,7 @@ fn render_columns(frame: &mut Frame, app: &mut App, area: Rect) {
     let fit = ((area.width / col_w).max(1) as usize).min(n_panels);
     let start = n_panels - fit;
     let mut x = area.x;
+    app.col_hits.clear();
     for (pi, i) in (start..n_panels).enumerate() {
         let last = pi == fit - 1;
         let w = if last {
@@ -419,7 +438,8 @@ fn render_columns(frame: &mut Frame, app: &mut App, area: Rect) {
             height: area.height,
         };
         if i < app.columns.len() {
-            render_column(frame, app, i, i == app.col_active, rect);
+            app.col_hits.push((i, rect));
+            render_column(frame, app, favs, i, i == app.col_active, rect);
         } else {
             render_preview(frame, app, rect);
         }
@@ -427,7 +447,14 @@ fn render_columns(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-fn render_column(frame: &mut Frame, app: &App, idx: usize, active: bool, area: Rect) {
+fn render_column(
+    frame: &mut Frame,
+    app: &App,
+    favs: &[PathBuf],
+    idx: usize,
+    active: bool,
+    area: Rect,
+) {
     let th = app.theme();
     let Some(col) = app.columns.get(idx) else {
         return;
@@ -449,7 +476,15 @@ fn render_column(frame: &mut Frame, app: &App, idx: usize, active: bool, area: R
             } else {
                 (Style::default(), e.name.clone())
             };
-            ListItem::new(Line::from(Span::styled(label, style)))
+            let mut spans = Vec::new();
+            if favs.contains(&e.path) {
+                spans.push(Span::styled(
+                    "★ ",
+                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+                ));
+            }
+            spans.push(Span::styled(label, style));
+            ListItem::new(Line::from(spans))
         })
         .collect();
     let mut state = ListState::default();
@@ -990,7 +1025,7 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_footer(frame: &mut Frame, theme: &Theme, area: Rect) {
-    let hints = "↑↓ move · →/Enter open · ← back · / filter · f find · 1/2 list/columns · P preview · e edit · n new · r rename · d delete · y/x/p copy/cut/paste · Y path · C preview text · s sort · . hidden · G network · ? help · q quit";
+    let hints = "↑↓ move · →/Enter open · ← back · / filter · f find · 1/2 list/columns · P preview · e edit · o explorer · n new · r rename · d delete · y/x/p copy/cut/paste · Y path · C preview text · s sort · . hidden · * fav · F favorites · G network · ? help · q quit";
     let footer = Paragraph::new(hints).style(Style::default().fg(theme.dim));
     frame.render_widget(footer, area);
 }
@@ -1235,6 +1270,54 @@ fn render_discard_popup(frame: &mut Frame, theme: &Theme, area: Rect) {
     frame.render_widget(p, popup);
 }
 
+/// Modal favorites list: Enter jumps the current tab there, * removes.
+fn render_favorites_popup(frame: &mut Frame, ws: &Workspace, area: Rect) {
+    let th = ws.theme();
+    let popup = centered_rect(70, 60, area);
+    frame.render_widget(Clear, popup);
+    let items: Vec<ListItem> = if ws.favorites.is_empty() {
+        vec![ListItem::new(Line::from(vec![
+            Span::styled(
+                "★ ",
+                Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "No favorites yet — press * on a file or folder to add one.",
+                Style::default().fg(th.dim),
+            ),
+        ]))]
+    } else {
+        ws.favorites
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let style = if i == ws.fav_sel {
+                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+                } else if p.exists() {
+                    Style::default()
+                } else {
+                    Style::default().fg(th.dim)
+                };
+                let mut label = format!("★ {}", p.to_string_lossy());
+                if p.is_dir() {
+                    label.push('/');
+                }
+                if !p.exists() {
+                    label.push_str("  (missing)");
+                }
+                ListItem::new(Line::from(Span::styled(label, style)))
+            })
+            .collect()
+    };
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Favorites ")
+            .title_bottom(" Enter jump · * remove · Esc close "),
+    );
+    frame.render_widget(list, popup);
+}
+
 fn render_help_popup(frame: &mut Frame, ws: &Workspace, area: Rect) {
     let th = ws.theme();
     let popup = centered_rect(62, 80, area);
@@ -1264,6 +1347,11 @@ fn render_help_popup(frame: &mut Frame, ws: &Workspace, area: Rect) {
             "G",
             "drives & network: open a drive, find SMB devices, mount a share as a new tab",
         ),
+        ("*", "favorite / unfavorite the selected file or folder"),
+        (
+            "F",
+            "favorites popup (Enter: jump there, *: remove, Esc: close)",
+        ),
         (
             "e",
             "edit file (text editor) · CSV files open the table viewer",
@@ -1274,13 +1362,19 @@ fn render_help_popup(frame: &mut Frame, ws: &Workspace, area: Rect) {
         ("Ctrl+W", "close current tab"),
         ("Ctrl+PgUp / PgDn", "previous / next tab"),
         ("Alt+1 … Alt+9", "jump to tab"),
+        (
+            "Ctrl+G then 1-9",
+            "jump to tab (macOS-friendly: no Alt key needed)",
+        ),
+        ("Ctrl+G then n / p", "next / previous tab"),
         ("click tab", "switch tabs with the mouse"),
+        ("o", "reveal the selected file/folder in the OS file explorer"),
         ("?", "this help"),
         ("q / Esc", "quit"),
         ("Ctrl+C", "quit (from dialogs)"),
         (
             "mouse",
-            "click selects · click+drag selects text in the editor",
+            "click selects a file/folder · double-click opens it · click+drag selects text in the editor",
         ),
         ("wheel", "scroll list / editor / table"),
     ];
@@ -1321,7 +1415,7 @@ fn render_help_popup(frame: &mut Frame, ws: &Workspace, area: Rect) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "Enter on a file opens it with the system default app. Terminal tabs run your $SHELL (PowerShell on Windows) — almost every key goes straight to it (Ctrl+C is SIGINT there); Ctrl+T / Ctrl+N / Ctrl+W / Ctrl+PgUp/PgDn / Alt+1-9 still manage tabs. Ctrl+N opens a new blank text document in its own tab; Ctrl+S on it opens a save dialog where you browse to a folder, type a name, and Enter saves (existing files ask to overwrite). In the editor: arrows/Home/End/PgUp/PgDn move · Ctrl+Left/Right jump by word · type to edit · paste is instant (bracketed paste) · Ctrl+S save · Ctrl+Z/Y undo/redo · Ctrl+A select all · Ctrl+C/X/V copy/cut/paste (selection, never line numbers; copies also land on the system clipboard, so Cmd+V works anywhere — the terminal itself intercepts Cmd+C, it never reaches fex) · Esc clears selection, then closes (asks if unsaved). In the CSV viewer: arrows move · Enter edits a cell · Tab next cell · a adds a row · A adds a column · Ctrl+S saves · Esc closes.",
+        "Enter on a file opens it with the system default app. Terminal tabs run your $SHELL (PowerShell on Windows) — almost every key goes straight to it (Ctrl+C is SIGINT there); Ctrl+T / Ctrl+N / Ctrl+W / Ctrl+PgUp/PgDn / Alt+1-9 / Ctrl+G still manage tabs. Ctrl+N opens a new blank text document in its own tab; Ctrl+S on it opens a save dialog where you browse to a folder, type a name, and Enter saves (existing files ask to overwrite). In the editor: arrows/Home/End/PgUp/PgDn move · Ctrl+Left/Right jump by word · type to edit · paste is instant (bracketed paste) · Ctrl+S save · Ctrl+Z/Y undo/redo · Ctrl+A select all (Ctrl+E works too, for terminals that grab Ctrl+A) · Ctrl+C/X/V copy/cut/paste (selection, never line numbers; copies also land on the system clipboard, so Cmd+V works anywhere — the terminal itself intercepts Cmd+C, it never reaches fex) · Esc clears selection, then closes (asks if unsaved). In the CSV viewer: arrows move · Enter edits a cell · Tab next cell · a adds a row · A adds a column · Ctrl+S saves ·  Tabs are saved between launches: quitting brings back your browser tabs, editors (including unsaved changes), and terminal tabs (a fresh shell in the same folder). Closing a tab with Ctrl+W discards its saved state for good.Esc closes.",
         Style::default().fg(Color::DarkGray),
     )));
     let help = Paragraph::new(lines).block(

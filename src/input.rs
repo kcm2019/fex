@@ -2,8 +2,17 @@
 
 use crate::app::{App, InputKind, Mode, NetState, Tab, ViewMode, Workspace};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
+use std::time::{Duration, Instant};
+
+/// Two left-clicks this close together (same cell) count as a double-click.
+const DOUBLE_CLICK: Duration = Duration::from_millis(500);
 
 pub fn handle_key(ws: &mut Workspace, key: KeyEvent) {
+    // The favorites popup is modal: it eats every key while open.
+    if ws.show_favorites {
+        handle_favorites(ws, key);
+        return;
+    }
     // Tab-management keys work everywhere: file list, editor, prompts,
     // even shell tabs (where every other key goes to the shell).
     if ws.handle_tab_key(key) {
@@ -203,6 +212,12 @@ fn handle_editor(app: &mut App, key: KeyEvent) {
                 app.editor.as_mut().map(|ed| ed.paste()).is_some()
             }
             KeyCode::Char('a') | KeyCode::Char('A') => {
+                app.editor.as_mut().map(|ed| ed.select_all()).is_some()
+            }
+            // Ctrl+E is a second select-all: some terminals grab Ctrl+A for
+            // their own "select all" so it never reaches fex; Ctrl+E
+            // always gets through.
+            KeyCode::Char('e') | KeyCode::Char('E') => {
                 app.editor.as_mut().map(|ed| ed.select_all()).is_some()
             }
             KeyCode::Left => app.editor.as_mut().map(|ed| ed.word_start()).is_some(),
@@ -422,7 +437,17 @@ pub fn handle_mouse(ws: &mut Workspace, m: MouseEvent) {
             }
         }
         Mode::Normal => match m.kind {
-            Kind::Down(MouseButton::Left) => app.click_select(m.column, m.row),
+            Kind::Down(MouseButton::Left) => {
+                let now = Instant::now();
+                let double = matches!(app.last_click,
+                    Some((px, py, t)) if px == m.column && py == m.row && now.duration_since(t) <= DOUBLE_CLICK);
+                app.last_click = Some((m.column, m.row, now));
+                if double {
+                    app.dblclick_open(m.column, m.row);
+                } else {
+                    app.click_select(m.column, m.row);
+                }
+            }
             Kind::ScrollUp => app.move_selection(-3),
             Kind::ScrollDown => app.move_selection(3),
             _ => {}
@@ -523,11 +548,72 @@ fn handle_normal(ws: &mut Workspace, key: KeyEvent) {
         KeyCode::Char('C') if !ctrl => app.copy_preview_text(),
         KeyCode::Char('e') => app.open_editor(),
 
+        // Reveal the selected file/folder in the OS file explorer.
+        KeyCode::Char('o') => app.reveal_in_explorer(),
+
         // Network: discover SMB devices on the LAN and mount their shares.
         KeyCode::Char('G') => app.open_network(),
 
         // Help
         KeyCode::Char('?') => app.mode = Mode::Help,
+
+        // Favorites: star the selected file/folder, F opens the list.
+        KeyCode::Char('*') => {
+            let path = ws
+                .active_browser()
+                .and_then(|a| a.selected_entry())
+                .map(|e| e.path.clone());
+            match path {
+                Some(path) => {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let added = ws.toggle_favorite(path);
+                    if let Some(app) = ws.active_browser_mut() {
+                        app.status = if added {
+                            format!("★ {name} added to favorites (F to view)")
+                        } else {
+                            format!("{name} removed from favorites")
+                        };
+                    }
+                }
+                None => {
+                    if let Some(app) = ws.active_browser_mut() {
+                        app.status = String::from("Nothing to favorite");
+                    }
+                }
+            }
+        }
+        KeyCode::Char('F') => {
+            ws.show_favorites = true;
+            ws.fav_sel = 0;
+        }
+        _ => {}
+    }
+}
+
+/// Key handling for the modal favorites popup: move, jump, remove, close.
+fn handle_favorites(ws: &mut Workspace, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('F') => {
+            ws.show_favorites = false;
+        }
+        KeyCode::Up => {
+            ws.fav_sel = ws.fav_sel.saturating_sub(1);
+        }
+        KeyCode::Down => {
+            ws.fav_sel = ws
+                .fav_sel
+                .saturating_add(1)
+                .min(ws.favorites.len().saturating_sub(1));
+        }
+        KeyCode::Home => ws.fav_sel = 0,
+        KeyCode::End => ws.fav_sel = ws.favorites.len().saturating_sub(1),
+        KeyCode::Enter => ws.jump_to_favorite(),
+        KeyCode::Char('*') | KeyCode::Char('x') | KeyCode::Char('X') => {
+            ws.remove_favorite_sel();
+        }
         _ => {}
     }
 }
@@ -605,7 +691,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("a.txt");
         std::fs::write(&p, "hello\nworld\n").unwrap();
-        (Workspace::new(dir.clone()), dir)
+        let mut ws = Workspace::new(dir.clone());
+        // Never touch the real ~/.config from these tests.
+        ws.set_config_dir(None);
+        (ws, dir)
     }
 
     fn browser(ws: &Workspace) -> &App {
@@ -706,6 +795,32 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_a_and_ctrl_e_select_all_in_editor() {
+        let (mut ws, dir) = test_app();
+        browser_mut(&mut ws).open_editor();
+        assert!(matches!(browser(&ws).mode, Mode::Editor));
+        // Ctrl+A selects the whole buffer; Backspace deletes it.
+        handle_key(&mut ws, ctrl('a'));
+        let ed = browser(&ws).editor.as_ref().unwrap();
+        assert!(ed.sel_anchor.is_some(), "Ctrl+A selects all");
+        handle_key(&mut ws, key(KeyCode::Backspace, KeyModifiers::NONE));
+        let ed = browser(&ws).editor.as_ref().unwrap();
+        assert_eq!(ed.lines, vec!["".to_string()]);
+        // Ctrl+E is the fallback select-all for terminals that grab
+        // Ctrl+A for their own "select all".
+        handle_key(&mut ws, ctrl('z')); // undo the delete
+        handle_key(&mut ws, ctrl('e'));
+        let ed = browser(&ws).editor.as_ref().unwrap();
+        assert!(ed.sel_anchor.is_some(), "Ctrl+E selects all");
+        assert_eq!(
+            ed.selection(),
+            Some(((0, 0), (1, 5))),
+            "Ctrl+E selects the whole buffer"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn sort_key_applies_in_column_mode() {
         let (mut ws, dir) = test_app();
         std::fs::write(dir.join("b.txt"), "x".repeat(100)).unwrap();
@@ -720,14 +835,18 @@ mod tests {
                 .map(|e| e.name.clone())
                 .collect::<Vec<_>>()
         };
-        // Default sort is by name.
-        assert_eq!(col_names(browser(&ws)), vec!["a.txt", "b.txt", "c.txt"]);
-        // `s` cycles to size sort; the column must re-sort too.
+        // Default sort is by modified date, newest first. `s` cycles
+        // Modified -> Type -> Name -> Size, keeping the direction;
+        // the column must re-sort too.
+        handle_key(&mut ws, key(KeyCode::Char('s'), KeyModifiers::NONE)); // Type ↓
+        handle_key(&mut ws, key(KeyCode::Char('s'), KeyModifiers::NONE)); // Name ↓
+        assert_eq!(col_names(browser(&ws)), vec!["c.txt", "b.txt", "a.txt"]);
+        // `s` again reaches size sort, still descending.
         handle_key(&mut ws, key(KeyCode::Char('s'), KeyModifiers::NONE));
-        assert_eq!(col_names(browser(&ws)), vec!["c.txt", "a.txt", "b.txt"]);
+        assert_eq!(col_names(browser(&ws)), vec!["b.txt", "a.txt", "c.txt"]);
         // `S` toggles direction.
         handle_key(&mut ws, key(KeyCode::Char('S'), KeyModifiers::SHIFT));
-        assert_eq!(col_names(browser(&ws)), vec!["b.txt", "a.txt", "c.txt"]);
+        assert_eq!(col_names(browser(&ws)), vec!["c.txt", "a.txt", "b.txt"]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -775,6 +894,83 @@ mod tests {
         handle_key(&mut ws, key(KeyCode::Char('m'), KeyModifiers::NONE));
         let app = browser(&ws);
         assert!(matches!(app.mode, Mode::Input(InputKind::NetHost)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // -- mouse: click to select, double-click to open -------------------------
+
+    use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+
+    fn click(x: u16, y: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::empty(),
+        }
+    }
+
+    /// Pretend the file list renders at terminal row 4 and return the y
+    /// coordinate of the row showing `name`.
+    fn row_y_of(ws: &mut Workspace, name: &str) -> u16 {
+        let app = browser_mut(ws);
+        app.refresh();
+        app.list_origin = (0, 4);
+        let row = app.visible_row(name).unwrap();
+        4 + 1 + row as u16
+    }
+
+    #[test]
+    fn single_click_selects_without_opening() {
+        let (mut ws, dir) = test_app();
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        let cwd = dir.clone();
+        let y = row_y_of(&mut ws, "sub");
+        handle_mouse(&mut ws, click(2, y));
+        let app = browser(&ws);
+        assert_eq!(app.cwd, cwd, "single click must not open the directory");
+        assert_eq!(app.selected_entry().unwrap().name, "sub");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn double_click_opens_directory() {
+        let (mut ws, dir) = test_app();
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        let y = row_y_of(&mut ws, "sub");
+        // Two clicks in immediate succession count as a double-click.
+        handle_mouse(&mut ws, click(2, y));
+        handle_mouse(&mut ws, click(2, y));
+        let app = browser(&ws);
+        assert_eq!(app.cwd, dir.join("sub"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn click_outside_list_is_ignored() {
+        let (mut ws, dir) = test_app();
+        let before = {
+            let app = browser_mut(&mut ws);
+            app.refresh();
+            app.list_origin = (0, 4);
+            app.selected_entry().unwrap().name.clone()
+        };
+        handle_mouse(&mut ws, click(70, 20)); // far right of the list
+        handle_mouse(&mut ws, click(2, 100)); // below the list
+        let app = browser(&ws);
+        assert_eq!(app.selected_entry().unwrap().name, before);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn o_key_reveals_in_explorer() {
+        let (mut ws, dir) = test_app();
+        handle_key(&mut ws, key(KeyCode::Char('o'), KeyModifiers::empty()));
+        let status = browser(&ws).status.clone();
+        assert!(
+            status.starts_with("Revealed ") || status.starts_with("Could not open"),
+            "unexpected status: {status}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

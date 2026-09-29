@@ -5,6 +5,7 @@ mod editor;
 mod fs;
 mod input;
 mod net;
+mod session;
 mod sheet;
 mod shell;
 mod theme;
@@ -40,6 +41,9 @@ fn main() -> io::Result<()> {
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let mut ws = Workspace::new(cwd);
+    // Bring back last session's tabs (browser, editor, terminal) when there
+    // is a saved session; otherwise the fresh single tab above stands.
+    ws.restore_session();
     let result = run(&mut terminal, &mut ws);
     // Best effort: unmount network shares before the terminal is restored.
     ws.unmount_all();
@@ -91,6 +95,9 @@ fn run(
             terminal.draw(|f| ui::render(f, ws))?;
         }
         if ws.should_quit {
+            // Save the session (tabs + backups for unsaved editors) before
+            // the terminal is restored, so a relaunch brings it all back.
+            ws.save_session();
             return Ok(());
         }
     }

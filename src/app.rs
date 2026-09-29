@@ -4,22 +4,25 @@
 use crate::editor::Editor;
 use crate::fs::{self, Entry, Preview, SearchResult};
 use crate::net::{self, Drive, NetDevice};
+use crate::session;
 use crate::sheet::{self, Sheet};
 use crate::shell::ShellTab;
 use crate::theme;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
 use std::cmp::Ordering;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortKey {
     Name,
     Size,
     Modified,
+    Type,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -37,6 +40,8 @@ impl SortOrder {
             (SortKey::Size, false) => "Size ↓",
             (SortKey::Modified, true) => "Modified ↑",
             (SortKey::Modified, false) => "Modified ↓",
+            (SortKey::Type, true) => "Type ↑",
+            (SortKey::Type, false) => "Type ↓",
         }
     }
 
@@ -44,7 +49,8 @@ impl SortOrder {
         self.key = match self.key {
             SortKey::Name => SortKey::Size,
             SortKey::Size => SortKey::Modified,
-            SortKey::Modified => SortKey::Name,
+            SortKey::Modified => SortKey::Type,
+            SortKey::Type => SortKey::Name,
         };
     }
 }
@@ -140,6 +146,15 @@ impl Column {
     }
 }
 
+/// Lowercase file extension used by the Type sort, e.g. "rs".
+/// Files without an extension (and dotfiles like `.gitignore`) sort as "".
+fn file_ext(name: &str) -> String {
+    Path::new(name)
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default()
+}
+
 /// Indices into `entries` after hidden-filtering, name filtering, and sorting.
 fn view_indices(entries: &[Entry], filter: &str, sort: SortOrder, show_hidden: bool) -> Vec<usize> {
     let needle = filter.to_lowercase();
@@ -155,22 +170,28 @@ fn view_indices(entries: &[Entry], filter: &str, sort: SortOrder, show_hidden: b
     idx.sort_by(|&a, &b| {
         let ea = &entries[a];
         let eb = &entries[b];
-        // Directories always come first.
-        match (ea.is_dir, eb.is_dir) {
-            (true, false) => Ordering::Less,
-            (false, true) => Ordering::Greater,
-            _ => {
-                let ord = match sort.key {
-                    SortKey::Name => ea.name.to_lowercase().cmp(&eb.name.to_lowercase()),
-                    SortKey::Size => ea.size.cmp(&eb.size),
-                    SortKey::Modified => ea.modified.cmp(&eb.modified),
-                };
-                if sort.ascending {
-                    ord
-                } else {
-                    ord.reverse()
+        // Folders are NOT forced to the top: only the Type key groups.
+        let ord = match sort.key {
+            SortKey::Name => ea.name.to_lowercase().cmp(&eb.name.to_lowercase()),
+            SortKey::Size => ea.size.cmp(&eb.size),
+            SortKey::Modified => ea.modified.cmp(&eb.modified),
+            SortKey::Type => {
+                // Group: directories first, then files grouped by extension;
+                // alphabetical by name inside each group.
+                match (ea.is_dir, eb.is_dir) {
+                    (true, false) => Ordering::Less,
+                    (false, true) => Ordering::Greater,
+                    (true, true) => ea.name.to_lowercase().cmp(&eb.name.to_lowercase()),
+                    (false, false) => file_ext(&ea.name)
+                        .cmp(&file_ext(&eb.name))
+                        .then_with(|| ea.name.to_lowercase().cmp(&eb.name.to_lowercase())),
                 }
             }
+        };
+        if sort.ascending {
+            ord
+        } else {
+            ord.reverse()
         }
     });
     idx
@@ -204,6 +225,10 @@ pub struct App {
     dir_mtime: Option<SystemTime>,
     /// Top-left of the rendered file list, for mapping mouse clicks.
     pub list_origin: (u16, u16),
+    /// Rendered Miller columns as (column index, rect), for mouse clicks.
+    pub col_hits: Vec<(usize, Rect)>,
+    /// Last mouse click (x, y, time), for double-click detection.
+    pub last_click: Option<(u16, u16, Instant)>,
     /// Index into `theme::THEMES`.
     pub theme_idx: usize,
     /// Editor line-number gutter toggle (persisted).
@@ -238,8 +263,8 @@ impl App {
             show_hidden: false,
             filter: String::new(),
             sort: SortOrder {
-                key: SortKey::Name,
-                ascending: true,
+                key: SortKey::Modified,
+                ascending: false,
             },
             mode: Mode::Normal,
             input: String::new(),
@@ -257,6 +282,8 @@ impl App {
             sheet: None,
             dir_mtime: None,
             list_origin: (0, 0),
+            col_hits: Vec::new(),
+            last_click: None,
             theme_idx: 0,
             show_line_numbers: true,
             show_preview: false,
@@ -389,6 +416,19 @@ impl App {
         self.list_state.select(Some(self.selected));
     }
 
+    /// Select the visible entry named `name`, if it's there. Used by
+    /// session restore and favorites jumps.
+    pub fn select_by_name(&mut self, name: &str) {
+        if let Some(pos) = self
+            .visible
+            .iter()
+            .position(|&i| self.entries[i].name == name)
+        {
+            self.selected = pos;
+            self.list_state.select(Some(pos));
+        }
+    }
+
     pub fn jump_to(&mut self, index: usize) {
         if self.view == ViewMode::Columns {
             let Some(col) = self.columns.get_mut(self.col_active) else {
@@ -408,10 +448,20 @@ impl App {
         self.list_state.select(Some(self.selected));
     }
 
+    /// Row (visible index) of the shown entry named `name`, if present.
+    /// Test helper (also handy for future mouse/click logic).
+    #[cfg(test)]
+    pub fn visible_row(&self, name: &str) -> Option<usize> {
+        self.visible
+            .iter()
+            .position(|&i| self.entries[i].name == name)
+    }
+
     /// Select the file-list row under a mouse click at terminal (x, y).
     /// Clicks outside the list are ignored.
     pub fn click_select(&mut self, x: u16, y: u16) {
-        if self.view != ViewMode::List {
+        if self.view == ViewMode::Columns {
+            self.click_select_column(x, y);
             return;
         }
         let (ox, oy) = self.list_origin;
@@ -423,6 +473,56 @@ impl App {
         if idx < self.visible.len() {
             self.selected = idx;
             self.list_state.select(Some(idx));
+        }
+    }
+
+    /// Select the Miller-column row under a mouse click. Clicking a row in
+    /// an earlier column activates that column (like keyboard-left), then
+    /// selects the row and rebuilds the trailing columns.
+    fn click_select_column(&mut self, x: u16, y: u16) {
+        let hits = self.col_hits.clone();
+        for (idx, rect) in hits {
+            if x < rect.x || x >= rect.x + rect.width || y <= rect.y || y >= rect.y + rect.height {
+                continue;
+            }
+            if idx > self.col_active {
+                return; // preview panel, not a real column
+            }
+            let j = (y - rect.y - 1) as usize;
+            let len = self.columns.get(idx).map(|c| c.entries.len()).unwrap_or(0);
+            if j >= len {
+                return;
+            }
+            self.col_active = idx;
+            if let Some(col) = self.columns.get_mut(idx) {
+                col.selected = j;
+            }
+            self.cwd = self.columns[idx].path.clone();
+            self.sync_columns();
+            return;
+        }
+    }
+
+    /// Double-click a file-list row: select it, then open it like Enter.
+    pub fn dblclick_open(&mut self, x: u16, y: u16) {
+        self.click_select(x, y);
+        self.enter_selected();
+    }
+
+    /// Show the selected file/folder in the OS file explorer (Finder on
+    /// macOS, Explorer on Windows, the default file manager on Linux).
+    pub fn reveal_in_explorer(&mut self) {
+        let Some(entry) = self.selected_entry().cloned() else {
+            self.status = String::from("Nothing to reveal");
+            return;
+        };
+        match fs::reveal_in_explorer(&entry.path) {
+            Ok(()) => {
+                self.status = format!("Revealed {} in the file explorer", entry.name);
+            }
+            Err(e) => {
+                self.status = format!("Could not open the file explorer: {e}");
+            }
         }
     }
 
@@ -1231,6 +1331,18 @@ pub struct Workspace {
     pub should_quit: bool,
     /// Tab-bar hit ranges recorded during render: (x_start, x_end, tab).
     pub tab_hits: Vec<(u16, u16, usize)>,
+    /// Ctrl+G was just pressed: the next key jumps tabs (macOS-friendly
+    /// alternative to Alt+1-9, since macOS keyboards have no Alt key).
+    pub goto_pending: bool,
+    /// Favorite files/folders (global, persisted to `~/.config/fex/favorites`).
+    pub favorites: Vec<PathBuf>,
+    /// The favorites popup is open. Modal: it eats every key until closed.
+    pub show_favorites: bool,
+    /// Selected row in the favorites popup.
+    pub fav_sel: usize,
+    /// Base dir for session/favorites persistence. `None` skips all disk I/O
+    /// (tests pass a temp dir so they never touch the real `~/.config`).
+    pub config_dir: Option<PathBuf>,
 }
 
 /// Max characters shown in a tab title; longer names get an ellipsis so
@@ -1799,7 +1911,7 @@ impl Workspace {
         let mut app = App::new(cwd);
         app.theme_idx = theme_idx;
         app.show_line_numbers = show_line_numbers;
-        Self {
+        let mut ws = Self {
             tabs: vec![Tab::Browser(app)],
             active: 0,
             clipboard: None,
@@ -1807,6 +1919,31 @@ impl Workspace {
             show_line_numbers,
             should_quit: false,
             tab_hits: Vec::new(),
+            goto_pending: false,
+            favorites: Vec::new(),
+            show_favorites: false,
+            fav_sel: 0,
+            config_dir: None,
+        };
+        ws.set_config_dir(session::config_dir());
+        ws
+    }
+
+    /// Point persistence at `dir` (or disable it with `None`) and reload
+    /// favorites from there. Tests pass a temp dir.
+    pub fn set_config_dir(&mut self, dir: Option<PathBuf>) {
+        self.config_dir = dir;
+        self.favorites = self
+            .config_dir
+            .as_deref()
+            .map(session::load_favorites_in)
+            .unwrap_or_default();
+    }
+
+    /// Write the favorites file, when persistence is enabled.
+    fn write_favorites(&self) {
+        if let Some(dir) = self.config_dir.as_deref() {
+            let _ = session::save_favorites_in(dir, &self.favorites);
         }
     }
 
@@ -1887,6 +2024,7 @@ impl Workspace {
     pub fn new_browser_tab(&mut self) {
         let cwd = self.new_tab_cwd();
         self.push_browser_tab(cwd);
+        self.save_tabs_only();
     }
 
     /// Open a new tab with a blank, unsaved text document. Ctrl+S on it
@@ -1902,6 +2040,7 @@ impl Workspace {
         app.mode = Mode::Editor;
         self.tabs.push(Tab::Browser(app));
         self.active = self.tabs.len() - 1;
+        self.save_tabs_only();
     }
 
     /// Open a browser tab on a freshly mounted network share.
@@ -1918,6 +2057,7 @@ impl Workspace {
         app.status = format!("Mounted //{host}/{share}");
         self.tabs.push(Tab::Browser(app));
         self.active = self.tabs.len() - 1;
+        self.save_tabs_only();
     }
 
     /// Open a browser tab on a local drive picked in the Network view.
@@ -1929,6 +2069,7 @@ impl Workspace {
         app.status = format!("Opened {name}");
         self.tabs.push(Tab::Browser(app));
         self.active = self.tabs.len() - 1;
+        self.save_tabs_only();
     }
 
     /// Drain network worker messages for the active tab's Network view.
@@ -2002,6 +2143,7 @@ impl Workspace {
             Ok(tab) => {
                 self.tabs.push(Tab::Shell(tab));
                 self.active = self.tabs.len() - 1;
+                self.save_tabs_only();
             }
             Err(e) => {
                 if let Some(app) = self.active_browser_mut() {
@@ -2025,25 +2167,301 @@ impl Workspace {
                 let _ = net::unmount_path(&mp);
             }
         }
+        // Destroy the tab's session backup: a closed tab is gone for good and
+        // must not be resurrected by session restore on the next launch.
+        if let Some(Tab::Browser(app)) = self.tabs.get_mut(self.active) {
+            if let Some(ed) = app.editor.as_mut() {
+                ed.clear_backup();
+            }
+        }
         self.tabs.remove(self.active);
         self.active = self.active.min(self.tabs.len() - 1);
+        self.show_favorites = false;
+        self.save_tabs_only();
+    }
+
+    // ------------------------------------------------------------ favorites
+
+    /// Toggle `path` in the favorites list. Returns true when it was added.
+    /// The list is persisted immediately.
+    pub fn toggle_favorite(&mut self, path: PathBuf) -> bool {
+        let added = if let Some(i) = self.favorites.iter().position(|f| f == &path) {
+            self.favorites.remove(i);
+            false
+        } else {
+            self.favorites.push(path);
+            true
+        };
+        self.write_favorites();
+        added
+    }
+
+    /// Remove the favorite currently selected in the popup.
+    pub fn remove_favorite_sel(&mut self) {
+        if self.fav_sel < self.favorites.len() {
+            self.favorites.remove(self.fav_sel);
+            self.fav_sel = self.fav_sel.min(self.favorites.len().saturating_sub(1));
+            self.write_favorites();
+        }
+    }
+
+    /// Jump the active browser tab to the favorite selected in the popup:
+    /// directories are opened, files are revealed in their parent folder.
+    pub fn jump_to_favorite(&mut self) {
+        let Some(path) = self.favorites.get(self.fav_sel).cloned() else {
+            return;
+        };
+        self.show_favorites = false;
+        let Some(app) = self.active_browser_mut() else {
+            return;
+        };
+        if path.is_dir() {
+            app.cwd = path;
+            app.filter.clear();
+            app.refresh();
+            app.status = String::from("Jumped to favorite");
+        } else if path.is_file() {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+            let parent = path.parent().map(Path::to_path_buf);
+            match (parent, name) {
+                (Some(parent), Some(name)) if parent.is_dir() => {
+                    app.cwd = parent;
+                    app.filter.clear();
+                    app.refresh();
+                    app.select_by_name(&name);
+                }
+                _ => app.status = String::from("Favorite no longer exists"),
+            }
+        } else {
+            app.status = String::from("Favorite no longer exists");
+        }
+    }
+
+    // ------------------------------------------------------------- session
+
+    /// Describe one tab for the session file.
+    fn tab_desc(&self, idx: usize) -> Option<session::TabDesc> {
+        match self.tabs.get(idx)? {
+            Tab::Browser(app) => {
+                if let Some(ed) = app.editor.as_ref() {
+                    Some(session::TabDesc::Editor(session::EditorDesc {
+                        cwd: app.cwd.to_string_lossy().into_owned(),
+                        path: ed.path.to_string_lossy().into_owned(),
+                        backup: ed
+                            .backup
+                            .as_ref()
+                            .and_then(|p| p.file_name())
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                        row: ed.row,
+                        col: ed.col,
+                    }))
+                } else {
+                    Some(session::TabDesc::Browser(session::BrowserDesc {
+                        cwd: app.cwd.to_string_lossy().into_owned(),
+                        selected: app
+                            .selected_entry()
+                            .map(|e| e.name.clone())
+                            .unwrap_or_default(),
+                        view: match app.view {
+                            ViewMode::List => "list",
+                            ViewMode::Columns => "columns",
+                        }
+                        .to_string(),
+                        sort: match app.sort.key {
+                            SortKey::Name => "name",
+                            SortKey::Size => "size",
+                            SortKey::Modified => "modified",
+                            SortKey::Type => "type",
+                        }
+                        .to_string(),
+                        ascending: app.sort.ascending,
+                        show_hidden: app.show_hidden,
+                    }))
+                }
+            }
+            Tab::Shell(sh) => Some(session::TabDesc::Shell(session::ShellDesc {
+                cwd: sh.cwd.to_string_lossy().into_owned(),
+            })),
+        }
+    }
+
+    fn collect_descs(&self) -> Vec<session::TabDesc> {
+        (0..self.tabs.len())
+            .filter_map(|i| self.tab_desc(i))
+            .collect()
+    }
+
+    /// Persist the tab list only (cheap). Called when tabs open, close, or
+    /// switch, so even a crash restores the layout. Dirty editor buffers are
+    /// backed up on quit, not here.
+    pub fn save_tabs_only(&self) {
+        if let Some(dir) = self.config_dir.as_deref() {
+            let _ = session::save_tabs_in(dir, &self.collect_descs(), self.active);
+        }
+    }
+
+    /// Full session save for quit: tab list plus a buffer backup for every
+    /// dirty or untitled editor, so unsaved work survives a restart.
+    pub fn save_session(&mut self) {
+        let Some(dir) = self.config_dir.clone() else {
+            return;
+        };
+        let _ = session::clear_backups_in(&dir);
+        for i in 0..self.tabs.len() {
+            let backup_name = format!("backup-{i}.txt");
+            if let Some(Tab::Browser(app)) = self.tabs.get_mut(i) {
+                if let Some(ed) = app.editor.as_mut() {
+                    let needs_backup = ed.dirty || ed.path.as_os_str().is_empty();
+                    if needs_backup {
+                        if let Some(path) = session::backup_file_in(&dir, &backup_name) {
+                            if std::fs::write(&path, ed.backup_text()).is_ok() {
+                                ed.backup = Some(path);
+                            }
+                        }
+                    } else {
+                        ed.clear_backup();
+                    }
+                }
+            }
+        }
+        self.save_tabs_only();
+    }
+
+    /// Restore tabs from the previous session. Does nothing when there is
+    /// no usable session file (the fresh tab from `new` stands).
+    pub fn restore_session(&mut self) {
+        let Some(dir) = self.config_dir.as_deref() else {
+            return;
+        };
+        let Some((descs, active)) = session::load_tabs_in(dir) else {
+            return;
+        };
+        let mut tabs = Vec::new();
+        for d in descs {
+            if let Some(tab) = self.restore_tab(d) {
+                tabs.push(tab);
+            }
+        }
+        if tabs.is_empty() {
+            return;
+        }
+        self.tabs = tabs;
+        self.active = active.min(self.tabs.len() - 1);
+        if let Some(app) = self.active_browser_mut() {
+            app.status = String::from("Session restored");
+        }
+    }
+
+    /// A browser tab with workspace theme settings applied, like `new` builds.
+    fn restored_app(&self, cwd: PathBuf) -> App {
+        let mut app = App::new(cwd);
+        app.theme_idx = self.theme_idx;
+        app.show_line_numbers = self.show_line_numbers;
+        app
+    }
+
+    fn home_dir() -> PathBuf {
+        std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/"))
+    }
+
+    /// Rebuild one tab from its descriptor. `None` when it can't be
+    /// honored (deleted directory, missing file with no backup, ...).
+    fn restore_tab(&mut self, desc: session::TabDesc) -> Option<Tab> {
+        match desc {
+            session::TabDesc::Browser(b) => {
+                let cwd = PathBuf::from(&b.cwd);
+                if !cwd.is_dir() {
+                    return None;
+                }
+                let mut app = self.restored_app(cwd);
+                app.show_hidden = b.show_hidden;
+                app.sort.key = match b.sort.as_str() {
+                    "name" => SortKey::Name,
+                    "size" => SortKey::Size,
+                    "type" => SortKey::Type,
+                    _ => SortKey::Modified,
+                };
+                app.sort.ascending = b.ascending;
+                app.refresh();
+                if !b.selected.is_empty() {
+                    app.select_by_name(&b.selected);
+                }
+                if b.view == "columns" {
+                    // enter_column_mode carries the list selection into the
+                    // last column, so select first, then switch views.
+                    app.enter_column_mode();
+                }
+                Some(Tab::Browser(app))
+            }
+            session::TabDesc::Editor(e) => {
+                let path = PathBuf::from(&e.path);
+                // Unsaved work comes back from the backup; otherwise reopen
+                // the file from disk. Untitled documents have no file.
+                let dir = self.config_dir.as_deref();
+                let mut ed =
+                    if let Some(bp) = dir.and_then(|d| session::read_backup_in(d, &e.backup)) {
+                        Editor::from_backup(path.clone(), &bp.0, bp.1)
+                    } else if path.as_os_str().is_empty() {
+                        Editor::untitled()
+                    } else if path.is_file() {
+                        Editor::open(&path).ok()?
+                    } else {
+                        return None;
+                    };
+                ed.show_line_numbers = self.show_line_numbers;
+                ed.row = e.row.min(ed.lines.len().saturating_sub(1));
+                ed.col = e
+                    .col
+                    .min(ed.lines.get(ed.row).map(|l| l.chars().count()).unwrap_or(0));
+                // The browser behind the editor: its old cwd, the file's
+                // parent, or home — whichever exists.
+                let cwd = PathBuf::from(&e.cwd);
+                let cwd = if cwd.is_dir() {
+                    cwd
+                } else if let Some(p) = path.parent().filter(|p| p.is_dir()) {
+                    p.to_path_buf()
+                } else {
+                    Self::home_dir()
+                };
+                let mut app = self.restored_app(cwd);
+                app.editor = Some(ed);
+                app.mode = Mode::Editor;
+                Some(Tab::Browser(app))
+            }
+            session::TabDesc::Shell(s) => {
+                let cwd = PathBuf::from(&s.cwd);
+                let cwd = if cwd.is_dir() { cwd } else { Self::home_dir() };
+                // A fresh shell in the old directory; the dead process
+                // itself can't be resurrected.
+                ShellTab::spawn(80, 24, &cwd).ok().map(Tab::Shell)
+            }
+        }
     }
 
     pub fn next_tab(&mut self) {
         if self.tabs.len() > 1 {
             self.active = (self.active + 1) % self.tabs.len();
+            self.show_favorites = false;
+            self.save_tabs_only();
         }
     }
 
     pub fn prev_tab(&mut self) {
         if self.tabs.len() > 1 {
             self.active = (self.active + self.tabs.len() - 1) % self.tabs.len();
+            self.show_favorites = false;
+            self.save_tabs_only();
         }
     }
 
     pub fn goto_tab(&mut self, i: usize) {
         if i < self.tabs.len() {
             self.active = i;
+            self.show_favorites = false;
+            self.save_tabs_only();
         }
     }
 
@@ -2085,6 +2503,37 @@ impl Workspace {
     /// where every other key goes to the shell instead. Returns true when
     /// the key was consumed.
     pub fn handle_tab_key(&mut self, key: KeyEvent) -> bool {
+        // Ctrl+G leader: the key after it jumps tabs. This is the
+        // macOS-friendly alternative to Alt+1-9 (macOS keyboards have no
+        // Alt key, and terminals turn Option+digit into special characters).
+        if self.goto_pending {
+            self.goto_pending = false;
+            let mods = key.modifiers;
+            let plain = !mods.contains(KeyModifiers::CONTROL) && !mods.contains(KeyModifiers::ALT);
+            match key.code {
+                KeyCode::Esc => return true,
+                KeyCode::Char(c) if plain && ('1'..='9').contains(&c) => {
+                    self.goto_tab((c as usize) - ('1' as usize));
+                    return true;
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') if plain => {
+                    self.next_tab();
+                    return true;
+                }
+                KeyCode::Char('p') | KeyCode::Char('P') if plain => {
+                    self.prev_tab();
+                    return true;
+                }
+                // Ctrl+G again: stay armed.
+                KeyCode::Char('g') | KeyCode::Char('G') if mods.contains(KeyModifiers::CONTROL) => {
+                    self.goto_pending = true;
+                    return true;
+                }
+                // Anything else cancels, and the key works normally (so a
+                // Ctrl+C in a shell tab still sends SIGINT, etc.).
+                _ => return false,
+            }
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         if ctrl && !alt {
@@ -2099,6 +2548,10 @@ impl Workspace {
                 }
                 KeyCode::Char('w') | KeyCode::Char('W') => {
                     self.close_active_tab();
+                    return true;
+                }
+                KeyCode::Char('g') | KeyCode::Char('G') => {
+                    self.goto_pending = true;
                     return true;
                 }
                 KeyCode::PageUp => {
@@ -2235,7 +2688,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.txt"), "hello\n").unwrap();
-        (Workspace::new(dir.clone()), dir)
+        // Isolated persistence: tests must never touch the real ~/.config.
+        let mut ws = Workspace::new(dir.clone());
+        ws.set_config_dir(Some(dir.join("config")));
+        (ws, dir)
     }
 
     #[test]
@@ -2266,6 +2722,69 @@ mod tests {
         // The last tab cannot be closed.
         ws.close_active_tab();
         assert_eq!(ws.tabs.len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ctrl_g_leader_jumps_to_tab() {
+        let (mut ws, dir) = test_workspace();
+        let key = |code: KeyCode, mods: KeyModifiers| KeyEvent {
+            code,
+            modifiers: mods,
+            kind: ratatui::crossterm::event::KeyEventKind::Press,
+            state: ratatui::crossterm::event::KeyEventState::NONE,
+        };
+        let ctrl = KeyModifiers::CONTROL;
+        let none = KeyModifiers::NONE;
+        ws.new_browser_tab();
+        ws.new_browser_tab();
+        assert_eq!(ws.tabs.len(), 3);
+        ws.goto_tab(0);
+        // Ctrl+G arms the leader, then a digit jumps.
+        assert!(ws.handle_tab_key(key(KeyCode::Char('g'), ctrl)));
+        assert!(ws.goto_pending);
+        assert!(ws.handle_tab_key(key(KeyCode::Char('3'), none)));
+        assert_eq!(ws.active, 2);
+        assert!(!ws.goto_pending, "leader disarms after the jump");
+        // Out-of-range digits are ignored.
+        assert!(ws.handle_tab_key(key(KeyCode::Char('g'), ctrl)));
+        assert!(ws.handle_tab_key(key(KeyCode::Char('9'), none)));
+        assert_eq!(ws.active, 2);
+        // n / p step to the next / previous tab.
+        assert!(ws.handle_tab_key(key(KeyCode::Char('g'), ctrl)));
+        assert!(ws.handle_tab_key(key(KeyCode::Char('n'), none)));
+        assert_eq!(ws.active, 0, "next wraps around");
+        assert!(ws.handle_tab_key(key(KeyCode::Char('G'), ctrl)));
+        assert!(ws.handle_tab_key(key(KeyCode::Char('p'), none)));
+        assert_eq!(ws.active, 2, "prev wraps around");
+        // Esc cancels the leader without moving.
+        assert!(ws.handle_tab_key(key(KeyCode::Char('g'), ctrl)));
+        assert!(ws.handle_tab_key(key(KeyCode::Esc, none)));
+        assert_eq!(ws.active, 2);
+        assert!(!ws.goto_pending);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ctrl_g_unexpected_key_cancels_and_passes_through() {
+        let (mut ws, dir) = test_workspace();
+        let key = |code: KeyCode, mods: KeyModifiers| KeyEvent {
+            code,
+            modifiers: mods,
+            kind: ratatui::crossterm::event::KeyEventKind::Press,
+            state: ratatui::crossterm::event::KeyEventState::NONE,
+        };
+        let ctrl = KeyModifiers::CONTROL;
+        let none = KeyModifiers::NONE;
+        // An unrelated key after Ctrl+G is not swallowed: the leader
+        // cancels and the key is left for normal handling (so Ctrl+C in a
+        // shell tab still sends SIGINT).
+        assert!(ws.handle_tab_key(key(KeyCode::Char('g'), ctrl)));
+        assert!(!ws.handle_tab_key(key(KeyCode::Char('x'), none)));
+        assert!(!ws.goto_pending);
+        assert!(ws.handle_tab_key(key(KeyCode::Char('g'), ctrl)));
+        assert!(!ws.handle_tab_key(key(KeyCode::Char('c'), ctrl)));
+        assert!(!ws.goto_pending);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2792,6 +3311,314 @@ mod tests {
             }
             _ => panic!("expected a browser tab"),
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn fake_entry(name: &str, is_dir: bool, size: u64, modified: Option<SystemTime>) -> Entry {
+        Entry {
+            path: PathBuf::from(name),
+            name: name.to_string(),
+            is_dir,
+            size,
+            modified,
+            is_hidden: false,
+        }
+    }
+
+    fn names_in(idx: &[usize], entries: &[Entry]) -> Vec<String> {
+        idx.iter().map(|&i| entries[i].name.clone()).collect()
+    }
+
+    fn app0_mut(ws: &mut Workspace) -> &mut App {
+        match &mut ws.tabs[0] {
+            Tab::Browser(app) => app,
+            _ => panic!("expected a browser tab"),
+        }
+    }
+
+    #[test]
+    fn default_sort_is_modified_newest_first() {
+        let (ws, dir) = test_workspace();
+        match &ws.tabs[0] {
+            Tab::Browser(app) => {
+                assert_eq!(app.sort.key, SortKey::Modified);
+                assert!(!app.sort.ascending);
+                assert_eq!(app.sort.label(), "Modified ↓");
+            }
+            _ => panic!("expected a browser tab"),
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sort_name_does_not_force_dirs_first() {
+        let entries = vec![
+            fake_entry("zdir", true, 0, None),
+            fake_entry("apple.txt", false, 1, None),
+        ];
+        let order = SortOrder {
+            key: SortKey::Name,
+            ascending: true,
+        };
+        let idx = view_indices(&entries, "", order, true);
+        // Purely alphabetical: the file comes before the folder.
+        assert_eq!(names_in(&idx, &entries), vec!["apple.txt", "zdir"]);
+    }
+
+    #[test]
+    fn sort_type_groups_dirs_then_files_by_extension() {
+        let entries = vec![
+            fake_entry("b.rs", false, 1, None),
+            fake_entry("zdir", true, 0, None),
+            fake_entry("c.md", false, 1, None),
+            fake_entry("adir", true, 0, None),
+            fake_entry("a.rs", false, 1, None),
+            fake_entry("README", false, 1, None),
+        ];
+        let order = SortOrder {
+            key: SortKey::Type,
+            ascending: true,
+        };
+        let idx = view_indices(&entries, "", order, true);
+        assert_eq!(
+            names_in(&idx, &entries),
+            vec!["adir", "zdir", "README", "c.md", "a.rs", "b.rs"]
+        );
+    }
+
+    #[test]
+    fn sort_type_descending_reverses_groups() {
+        let entries = vec![
+            fake_entry("b.rs", false, 1, None),
+            fake_entry("zdir", true, 0, None),
+            fake_entry("c.md", false, 1, None),
+        ];
+        let order = SortOrder {
+            key: SortKey::Type,
+            ascending: false,
+        };
+        let idx = view_indices(&entries, "", order, true);
+        assert_eq!(names_in(&idx, &entries), vec!["b.rs", "c.md", "zdir"]);
+    }
+
+    #[test]
+    fn sort_modified_descending_puts_newest_first() {
+        let t0 = SystemTime::UNIX_EPOCH;
+        let t1 = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(10);
+        let entries = vec![
+            fake_entry("old.txt", false, 1, Some(t0)),
+            fake_entry("nodate.txt", false, 1, None),
+            fake_entry("new.txt", false, 1, Some(t1)),
+        ];
+        let order = SortOrder {
+            key: SortKey::Modified,
+            ascending: false,
+        };
+        let idx = view_indices(&entries, "", order, true);
+        assert_eq!(
+            names_in(&idx, &entries),
+            vec!["new.txt", "old.txt", "nodate.txt"]
+        );
+    }
+
+    #[test]
+    fn cycle_sort_key_includes_type() {
+        let (mut ws, dir) = test_workspace();
+        let app = app0_mut(&mut ws);
+        assert_eq!(app.sort.key, SortKey::Modified); // default
+        app.cycle_sort_key();
+        assert_eq!(app.sort.key, SortKey::Type);
+        assert_eq!(app.sort.label(), "Type ↓");
+        app.cycle_sort_key();
+        assert_eq!(app.sort.key, SortKey::Name);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ------------------------------------------------------- session/favorites
+
+    #[test]
+    fn favorites_toggle_and_persist() {
+        let (mut ws, dir) = test_workspace();
+        let file = dir.join("a.txt");
+        assert!(!ws.favorites.contains(&file));
+        assert!(ws.toggle_favorite(file.clone()), "first toggle adds");
+        assert!(ws.favorites.contains(&file));
+        // Persisted to the config dir: a fresh workspace sees it too.
+        let mut ws2 = Workspace::new(dir.clone());
+        ws2.set_config_dir(Some(dir.join("config")));
+        assert!(ws2.favorites.contains(&file));
+        // Toggling again removes it.
+        assert!(!ws.toggle_favorite(file.clone()), "second toggle removes");
+        assert!(!ws.favorites.contains(&file));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn session_round_trip_restores_browser_and_dirty_editor() {
+        let (mut ws, dir) = test_workspace();
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("b.txt"), "b\n").unwrap();
+
+        // Tab 1: browser in the subdir with b.txt selected, in column view.
+        ws.new_browser_tab();
+        if let Tab::Browser(app) = &mut ws.tabs[1] {
+            app.cwd = sub.clone();
+            app.refresh();
+            app.select_by_name("b.txt");
+            app.enter_column_mode();
+        }
+
+        // Tab 0: dirty editor on a.txt.
+        if let Tab::Browser(app) = &mut ws.tabs[0] {
+            let mut ed = Editor::open(&dir.join("a.txt")).unwrap();
+            ed.insert_char('X');
+            assert!(ed.dirty);
+            app.editor = Some(ed);
+            app.mode = Mode::Editor;
+        }
+
+        ws.save_session();
+
+        // Restore into a fresh workspace sharing the config dir.
+        let mut ws2 = Workspace::new(dir.clone());
+        ws2.set_config_dir(Some(dir.join("config")));
+        ws2.restore_session();
+        assert_eq!(ws2.tabs.len(), 2);
+
+        // Tab 0: the dirty editor came back from its backup.
+        match &ws2.tabs[0] {
+            Tab::Browser(app) => {
+                let ed = app.editor.as_ref().expect("editor restored");
+                assert!(ed.dirty, "restored editor is dirty");
+                assert_eq!(ed.backup_text(), "Xhello\n");
+            }
+            _ => panic!("tab 0 should be a browser"),
+        }
+
+        // Tab 1: browser back in the subdir, still in column view with
+        // the selection kept in the last column.
+        match &ws2.tabs[1] {
+            Tab::Browser(app) => {
+                assert_eq!(app.cwd, sub);
+                assert_eq!(app.view, ViewMode::Columns);
+                let last = app.columns.last().expect("columns built");
+                let sel = last.entries.get(last.selected).map(|e| e.name.as_str());
+                assert_eq!(sel, Some("b.txt"));
+            }
+            _ => panic!("tab 1 should be a browser"),
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn session_backup_destroyed_when_tab_closed() {
+        let (mut ws, dir) = test_workspace();
+        // Dirty editor on tab 0, saved to disk via save_session.
+        if let Tab::Browser(app) = &mut ws.tabs[0] {
+            let mut ed = Editor::open(&dir.join("a.txt")).unwrap();
+            ed.insert_char('X');
+            app.editor = Some(ed);
+            app.mode = Mode::Editor;
+        }
+        ws.save_session();
+        let config = dir.join("config");
+        let backup = config.join("session").join("backup-0.txt");
+        assert!(backup.is_file(), "backup written by save_session");
+
+        // Opening a second tab keeps the session file honest, then closing
+        // the dirty tab must destroy its backup.
+        ws.new_browser_tab();
+        ws.prev_tab(); // back to tab 0
+        ws.close_active_tab();
+        assert!(!backup.exists(), "backup destroyed with its tab");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // -- mouse: column view ----------------------------------------------------
+
+    /// Fake the rendered column rects: column `i` at (i*28, 4), 28 wide.
+    fn fake_col_hits(app: &mut App) {
+        app.col_hits = (0..app.columns.len())
+            .map(|i| (i, Rect::new(i as u16 * 28, 4, 28, 20)))
+            .collect();
+    }
+
+    #[test]
+    fn column_click_selects_row_and_syncs_preview() {
+        let (mut ws, dir) = test_workspace();
+        std::fs::create_dir_all(dir.join("sub").join("inner")).unwrap();
+        let app = app0_mut(&mut ws);
+        app.refresh();
+        app.enter_column_mode();
+        let n = app.columns.len();
+        let last = n - 1;
+        let row = app.columns[last]
+            .entries
+            .iter()
+            .position(|e| e.name == "sub")
+            .unwrap();
+        fake_col_hits(app);
+        app.click_select((last as u16) * 28 + 2, 4 + 1 + row as u16);
+        assert_eq!(app.col_active, last);
+        assert_eq!(
+            app.columns[last].entries[app.columns[last].selected].name,
+            "sub"
+        );
+        // The trailing preview column for sub/ was rebuilt.
+        assert_eq!(app.columns.len(), n + 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn column_click_on_parent_column_activates_it() {
+        let (mut ws, dir) = test_workspace();
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        let app = app0_mut(&mut ws);
+        app.refresh();
+        app.enter_column_mode();
+        let n = app.columns.len();
+        let parent = n - 2;
+        let row = app.columns[parent]
+            .entries
+            .iter()
+            .position(|e| e.path == dir)
+            .unwrap();
+        fake_col_hits(app);
+        app.click_select((parent as u16) * 28 + 2, 4 + 1 + row as u16);
+        assert_eq!(app.col_active, parent);
+        assert_eq!(app.cwd, app.columns[parent].path.clone());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn column_click_outside_columns_is_ignored() {
+        let (mut ws, dir) = test_workspace();
+        let app = app0_mut(&mut ws);
+        app.refresh();
+        app.enter_column_mode();
+        fake_col_hits(app);
+        let before = (app.col_active, app.columns[app.col_active].selected);
+        app.click_select(200, 30); // past the rendered columns
+        app.click_select(2, 100); // below the column rects
+        assert_eq!(
+            (app.col_active, app.columns[app.col_active].selected),
+            before
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reveal_in_explorer_reports_status() {
+        let (mut ws, dir) = test_workspace();
+        let app = app0_mut(&mut ws);
+        app.refresh();
+        app.reveal_in_explorer();
+        let status = app.status.clone();
+        assert!(
+            status.starts_with("Revealed ") || status.starts_with("Could not open"),
+            "unexpected status: {status}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

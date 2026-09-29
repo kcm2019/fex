@@ -11,7 +11,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::{Color as RColor, Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 
@@ -107,6 +107,9 @@ impl ShellState {
 /// A live shell tab: screen state plus the pty handles and reader channel.
 pub struct ShellTab {
     pub state: ShellState,
+    /// The directory the shell started in (restored as a fresh shell on
+    /// session restore — the process itself can't be resurrected).
+    pub cwd: PathBuf,
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     rx: mpsc::Receiver<ShellEvent>,
@@ -179,6 +182,7 @@ impl ShellTab {
 
         Ok(Self {
             state,
+            cwd: cwd.to_path_buf(),
             master: pair.master,
             writer,
             rx,
