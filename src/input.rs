@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 /// Two left-clicks this close together (same cell) count as a double-click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(500);
 
-pub fn handle_key(ws: &mut Workspace, key: KeyEvent) {
+pub fn handle_key(ws: &mut Workspace, mut key: KeyEvent) {
     // The favorites popup is modal: it eats every key while open.
     if ws.show_favorites {
         handle_favorites(ws, key);
@@ -30,13 +30,18 @@ pub fn handle_key(ws: &mut Workspace, key: KeyEvent) {
     };
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-    // Ctrl+C quits from prompts and popups. In the file list and the editor it
-    // copies instead (OS-style), so those modes handle it themselves below.
-    // The CSV viewer has no clipboard of its own, so Ctrl+C quits there too.
+    // Ctrl+C never quits the app. In the file list and the editor it copies
+    // (OS-style); with the editor's find/replace bar open it closes the bar
+    // like Esc. Everywhere else Ctrl+C acts exactly like Esc: it cancels
+    // inputs, dialogs and popups instead of killing the app. (A shell tab
+    // is unaffected — keys there go straight to the shell as SIGINT.)
     if ctrl && !shift && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')) {
-        if !matches!(mode, Mode::Normal | Mode::Editor) {
-            ws.should_quit = true;
-            return;
+        let bar_open = mode == Mode::Editor
+            && ws
+                .active_browser()
+                .is_some_and(|a| a.editor.as_ref().is_some_and(|ed| ed.find.is_some()));
+        if !matches!(mode, Mode::Normal) && (bar_open || mode != Mode::Editor) {
+            key = KeyEvent::new(KeyCode::Esc, KeyModifiers::empty());
         }
     }
     // Each new keypress in a non-input mode starts with a fresh status line;
@@ -182,6 +187,7 @@ fn handle_network(ws: &mut Workspace, key: KeyEvent) {
 fn handle_editor(app: &mut App, key: KeyEvent) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
     // The save-as dialog eats every key while it's open.
     if app.save_dialog.is_some() {
         app.save_dialog_key(key);
@@ -327,6 +333,14 @@ fn handle_editor(app: &mut App, key: KeyEvent) {
             return;
         }
     }
+    // Ctrl+D duplicates the current line below it (or the selected lines
+    // as a block). After the find-bar check: an open bar eats every key.
+    if ctrl && !shift && matches!(key.code, KeyCode::Char('d') | KeyCode::Char('D')) {
+        if let Some(ed) = app.editor.as_mut() {
+            ed.duplicate_line();
+        }
+        return;
+    }
     if matches!(key.code, KeyCode::Esc) {
         let has_selection = app.editor.as_ref().is_some_and(|e| e.sel_anchor.is_some());
         if has_selection {
@@ -350,6 +364,11 @@ fn handle_editor(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Char(c) if !ctrl => ed.insert_char(c),
         KeyCode::Enter => ed.newline(),
+        // Ctrl/Alt+Backspace deletes to the previous word start,
+        // Ctrl/Alt+Delete to the next word end (some terminals can't send
+        // Ctrl+Backspace distinctly, hence the Alt fallbacks).
+        KeyCode::Backspace if ctrl || alt => ed.delete_word_back(),
+        KeyCode::Delete if ctrl || alt => ed.delete_word_forward(),
         KeyCode::Backspace => ed.backspace(),
         KeyCode::Delete => ed.delete(),
         KeyCode::Left => {
@@ -360,6 +379,8 @@ fn handle_editor(app: &mut App, key: KeyEvent) {
             ed.shift_select(shift);
             ed.move_right();
         }
+        KeyCode::Up if alt => ed.move_line(-1),
+        KeyCode::Down if alt => ed.move_line(1),
         KeyCode::Up => {
             ed.shift_select(shift);
             ed.move_up();
@@ -384,9 +405,30 @@ fn handle_editor(app: &mut App, key: KeyEvent) {
             ed.shift_select(shift);
             ed.page_down();
         }
+        // Tab indents the selected lines (Shift+Tab dedents); with no
+        // selection Tab keeps inserting 4 spaces and Shift+Tab dedents the
+        // current line. Shift+Tab arrives as BackTab on some terminals.
+        KeyCode::Tab if shift => {
+            if ed.has_selection() {
+                ed.dedent_selection();
+            } else {
+                ed.dedent_line();
+            }
+        }
+        KeyCode::BackTab => {
+            if ed.has_selection() {
+                ed.dedent_selection();
+            } else {
+                ed.dedent_line();
+            }
+        }
         KeyCode::Tab => {
-            for _ in 0..4 {
-                ed.insert_char(' ');
+            if ed.has_selection() {
+                ed.indent_selection();
+            } else {
+                for _ in 0..4 {
+                    ed.insert_char(' ');
+                }
             }
         }
         _ => {}
@@ -833,7 +875,12 @@ fn handle_normal(ws: &mut Workspace, key: KeyEvent) {
 
 /// Key handling for the modal favorites popup: move, jump, remove, close.
 fn handle_favorites(ws: &mut Workspace, key: KeyEvent) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
+        // Ctrl+C closes the popup like Esc — it never quits the app.
+        KeyCode::Char('c') | KeyCode::Char('C') if ctrl => {
+            ws.show_favorites = false;
+        }
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('F') => {
             ws.show_favorites = false;
         }
@@ -1091,10 +1138,144 @@ mod tests {
         handle_key(&mut ws, ctrl('v'));
         let ed = browser(&ws).editor.as_ref().unwrap();
         assert_eq!(ed.lines, vec!["hello", "world", "hello"]);
-        // Ctrl+C still quits from a dialog.
+        // Ctrl+C cancels a dialog instead of quitting.
         browser_mut(&mut ws).mode = Mode::ConfirmDelete;
         handle_key(&mut ws, ctrl('c'));
-        assert!(ws.should_quit);
+        assert!(!ws.should_quit, "Ctrl+C must never quit");
+        assert!(
+            matches!(browser(&ws).mode, Mode::Normal),
+            "dialog cancelled, mode is {:?}",
+            browser(&ws).mode
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ctrl_c_cancels_inputs_and_popups() {
+        let (mut ws, dir) = test_app();
+        // Rename input: Ctrl+C cancels, app stays alive.
+        handle_key(&mut ws, key(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(matches!(browser(&ws).mode, Mode::Input(_)));
+        handle_key(&mut ws, ctrl('c'));
+        assert!(!ws.should_quit);
+        assert!(matches!(browser(&ws).mode, Mode::Normal));
+        // Filter input: Ctrl+C cancels.
+        handle_key(&mut ws, key(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert!(matches!(browser(&ws).mode, Mode::Input(_)));
+        handle_key(&mut ws, ctrl('c'));
+        assert!(!ws.should_quit);
+        assert!(matches!(browser(&ws).mode, Mode::Normal));
+        // Find-in-files: Ctrl+F opens the grep input; Ctrl+C cancels it.
+        handle_key(&mut ws, key(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        assert!(matches!(browser(&ws).mode, Mode::Input(_)));
+        handle_key(&mut ws, ctrl('c'));
+        assert!(!ws.should_quit);
+        assert!(matches!(browser(&ws).mode, Mode::Normal));
+        // Favorites popup: Ctrl+C closes it.
+        ws.show_favorites = true;
+        handle_key(&mut ws, ctrl('c'));
+        assert!(!ws.should_quit);
+        assert!(!ws.show_favorites);
+        // Editor find bar: Ctrl+C closes the bar, editor stays open.
+        browser_mut(&mut ws).open_editor();
+        handle_key(&mut ws, ctrl('f'));
+        assert!(browser(&ws).editor.as_ref().unwrap().find.is_some());
+        handle_key(&mut ws, ctrl('c'));
+        assert!(!ws.should_quit);
+        assert!(matches!(browser(&ws).mode, Mode::Editor));
+        assert!(browser(&ws).editor.as_ref().unwrap().find.is_none());
+        // Sheet find bar: Ctrl+C closes it too.
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ctrl_c_in_sheet_cancels_like_esc() {
+        let (mut ws, dir) = test_app();
+        std::fs::write(dir.join("s.csv"), "a,b\n1,2\n").unwrap();
+        browser_mut(&mut ws).open_path_in_editor(&dir.join("s.csv"));
+        assert!(matches!(browser(&ws).mode, Mode::Sheet));
+        // Ctrl+C with a clean sheet closes it (like Esc), never quits.
+        handle_key(&mut ws, ctrl('c'));
+        assert!(!ws.should_quit);
+        assert!(matches!(browser(&ws).mode, Mode::Normal));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ctrl_d_duplicates_line_in_editor() {
+        let (mut ws, dir) = test_app();
+        browser_mut(&mut ws).open_editor(); // a.txt: "hello\nworld\n"
+        handle_key(&mut ws, key(KeyCode::Down, KeyModifiers::NONE));
+        handle_key(&mut ws, ctrl('d'));
+        let ed = browser(&ws).editor.as_ref().unwrap();
+        assert_eq!(ed.lines, vec!["hello", "world", "world"]);
+        assert_eq!((ed.row, ed.col), (2, 0));
+        assert!(ed.dirty);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn alt_up_down_moves_line_in_editor() {
+        let (mut ws, dir) = test_app();
+        browser_mut(&mut ws).open_editor(); // a.txt: "hello\nworld\n"
+        handle_key(&mut ws, key(KeyCode::Up, KeyModifiers::ALT));
+        {
+            let ed = browser(&ws).editor.as_ref().unwrap();
+            assert_eq!(ed.lines, vec!["hello", "world"], "top line: no-op");
+        }
+        handle_key(&mut ws, key(KeyCode::Down, KeyModifiers::NONE));
+        handle_key(&mut ws, key(KeyCode::Up, KeyModifiers::ALT));
+        {
+            let ed = browser(&ws).editor.as_ref().unwrap();
+            assert_eq!(ed.lines, vec!["world", "hello"]);
+            assert_eq!((ed.row, ed.col), (0, 0), "cursor follows the line");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn tab_indents_selection_and_shift_tab_dedents() {
+        let (mut ws, dir) = test_app();
+        browser_mut(&mut ws).open_editor(); // a.txt: "hello\nworld\n"
+                                            // Select into both lines with Shift+Down/Right, then Tab indents.
+        handle_key(&mut ws, key(KeyCode::Down, KeyModifiers::SHIFT));
+        handle_key(&mut ws, key(KeyCode::Right, KeyModifiers::SHIFT));
+        handle_key(&mut ws, key(KeyCode::Tab, KeyModifiers::NONE));
+        {
+            let ed = browser(&ws).editor.as_ref().unwrap();
+            assert_eq!(ed.lines, vec!["    hello", "    world"]);
+        }
+        // Shift+Tab dedents back.
+        handle_key(&mut ws, key(KeyCode::Tab, KeyModifiers::SHIFT));
+        {
+            let ed = browser(&ws).editor.as_ref().unwrap();
+            assert_eq!(ed.lines, vec!["hello", "world"]);
+        }
+        // Without a selection Tab still inserts 4 spaces at the cursor.
+        handle_key(&mut ws, key(KeyCode::Down, KeyModifiers::NONE)); // collapses
+        handle_key(&mut ws, key(KeyCode::Home, KeyModifiers::NONE));
+        handle_key(&mut ws, key(KeyCode::Tab, KeyModifiers::NONE));
+        {
+            let ed = browser(&ws).editor.as_ref().unwrap();
+            assert_eq!(ed.lines[1], "    world");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ctrl_backspace_deletes_word_in_editor() {
+        let (mut ws, dir) = test_app();
+        browser_mut(&mut ws).open_editor(); // a.txt: "hello\nworld\n"
+        {
+            let ed = browser_mut(&mut ws).editor.as_mut().unwrap();
+            ed.col = 5; // end of "hello"
+        }
+        handle_key(&mut ws, key(KeyCode::Backspace, KeyModifiers::CONTROL));
+        {
+            let ed = browser(&ws).editor.as_ref().unwrap();
+            assert_eq!(ed.lines[0], "");
+            assert_eq!((ed.row, ed.col), (0, 0));
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

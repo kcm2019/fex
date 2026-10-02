@@ -20,7 +20,7 @@ umya-spreadsheet = "3"
 # cross-compiler for the Windows GNU target. deflate (+ stored) covers
 # the archives we extract; encrypted entries are refused, not decrypted.
 zip = { version = "2", default-features = false, features = ["deflate"] }
-sevenz-rust = { version = "0.6", features = ["aes256"] }
+sevenz-rust = "0.6"
 tar = "0.4"
 flate2 = "1"
 trash = "5.2.9"

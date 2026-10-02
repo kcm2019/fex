@@ -393,6 +393,19 @@ impl App {
         }
     }
 
+    /// Select the visible entry with this file name (used for `fex <file>`).
+    /// No-op when no entry matches (e.g. a hidden file).
+    pub fn select_file_by_name(&mut self, name: &str) {
+        if let Some(pos) = self
+            .visible
+            .iter()
+            .position(|&i| self.entries[i].name == name)
+        {
+            self.selected = pos;
+            self.list_state.select(Some(pos));
+        }
+    }
+
     fn clamp_selection(&mut self) {
         if self.visible.is_empty() {
             self.selected = 0;
@@ -2241,6 +2254,12 @@ impl SaveDialog {
         let name_edit = matches!(key.code, KeyCode::Char(_) | KeyCode::Backspace);
         match key.code {
             KeyCode::Esc => return SaveAction::Cancel,
+            // Ctrl+C cancels like Esc — it never quits the app.
+            KeyCode::Char('c') | KeyCode::Char('C')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                return SaveAction::Cancel
+            }
             KeyCode::Up => self.move_selection(-1),
             KeyCode::Down => self.move_selection(1),
             KeyCode::Right => self.enter_selected(),
@@ -2359,6 +2378,12 @@ impl MoveDialog {
     pub fn key(&mut self, key: KeyEvent) -> MoveAction {
         match key.code {
             KeyCode::Esc => return MoveAction::Cancel,
+            // Ctrl+C cancels like Esc — it never quits the app.
+            KeyCode::Char('c') | KeyCode::Char('C')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                return MoveAction::Cancel
+            }
             KeyCode::Up => self.move_selection(-1),
             KeyCode::Down => self.move_selection(1),
             KeyCode::Right => self.enter_selected(),

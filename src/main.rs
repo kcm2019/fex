@@ -28,6 +28,32 @@ use std::io;
 use std::time::Duration;
 
 fn main() -> io::Result<()> {
+    // Optional CLI path: `fex [path]`. A directory opens there; a file
+    // opens its parent folder with the file selected. An explicit path
+    // wins over session restore.
+    let arg = std::env::args_os().nth(1).map(std::path::PathBuf::from);
+    let has_arg = arg.is_some();
+    let start_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let (cwd, select_name): (std::path::PathBuf, Option<String>) = match arg {
+        Some(p) => {
+            let p = if p.is_absolute() {
+                p
+            } else {
+                start_dir.join(p)
+            };
+            if p.is_file() {
+                let name = p.file_name().map(|n| n.to_string_lossy().into_owned());
+                let parent = p
+                    .parent()
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                (parent, name)
+            } else {
+                (p, None)
+            }
+        }
+        None => (start_dir, None),
+    };
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(
@@ -39,11 +65,21 @@ fn main() -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let mut ws = Workspace::new(cwd);
-    // Bring back last session's tabs (browser, editor, terminal) when there
-    // is a saved session; otherwise the fresh single tab above stands.
-    ws.restore_session();
+    if has_arg {
+        // An explicit path starts fresh (no session restore) and selects
+        // the named file when one was given.
+        if let Some(app) = ws.active_browser_mut() {
+            app.refresh();
+            if let Some(name) = select_name {
+                app.select_file_by_name(&name);
+            }
+        }
+    } else {
+        // Bring back last session's tabs (browser, editor, terminal) when there
+        // is a saved session; otherwise the fresh single tab above stands.
+        ws.restore_session();
+    }
     let result = run(&mut terminal, &mut ws);
     // Best effort: unmount network shares before the terminal is restored.
     ws.unmount_all();

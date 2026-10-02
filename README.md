@@ -1,38 +1,55 @@
 # fex — a terminal file explorer in Rust
 
-A keyboard-driven file explorer that runs on macOS, Linux, and Windows,
-built with [ratatui](https://ratatui.rs).
+A keyboard-driven file explorer for macOS, Linux, and Windows, built with
+[ratatui](https://ratatui.rs). File browsing (list and Miller-column views),
+a built-in text editor with syntax highlighting, a CSV/Excel table viewer,
+archive browsing and extraction, trash support, git status badges, SMB
+network browsing, and terminal tabs — all in the terminal.
 
-## Install (first time)
+## Install
 
-1. Install Rust. On macOS the easiest way is Homebrew:
+1. Install Rust: [rustup.rs](https://rustup.rs) works on every platform
+   (on macOS, `brew install rust` works too).
+2. From the source directory, install the `fex` command:
    ```sh
-   brew install rust
+   cargo install --path .
    ```
-   (Any platform: [rustup.rs](https://rustup.rs) works too.)
-2. Get the source and build it:
+   This builds the release binary and places it in `~/.cargo/bin`
+   (`%USERPROFILE%\.cargo\bin\fex.exe` on Windows). It takes a couple of
+   minutes the first time while dependencies compile.
+3. Make sure that directory is on your `PATH`:
    ```sh
-   cd "/Users/km/Documents/Scripts/fex 2"
-   cargo build --release
+   export PATH="$HOME/.cargo/bin:$PATH"
    ```
-   This takes a couple of minutes the first time while dependencies compile.
+   On macOS/Linux, add that line to `~/.zshrc` (or `~/.bashrc`) to make it
+   permanent. On Windows the Rust installer normally takes care of this.
+
+### Updating
+
+To move to a newer version of the source, run `cargo install --path .`
+again from the new source tree — it overwrites the installed binary in
+place. Nothing needs to be removed or uninstalled first.
+
+### Developing
+
+```sh
+cargo build --release   # build only -> ./target/release/fex
+cargo run               # build and run in one step
+cargo test              # run the unit tests
+```
 
 ## Run it
 
-From the project folder:
+From anywhere:
 
 ```sh
-cd "/Users/km/Documents/Scripts/fex 2"
-./target/release/fex
+fex                     # opens in the current directory
+fex ~/Documents         # opens that folder
+fex ~/notes/todo.txt    # opens ~/notes with todo.txt selected
 ```
 
-It opens in the directory you run it from. To browse somewhere else, `cd`
-there first, or pass a path: `./target/release/fex ~/Documents`.
-
-> Coming back later? Just `cd` into the folder and run
-> `./target/release/fex` again — no rebuild needed unless the source
-> changed. (While developing, `cargo run` builds and runs in one step, and
-> `cargo test` runs the unit tests.)
+An explicit path always starts fresh — it skips restoring the previous
+session's tabs.
 
 ## Views
 
@@ -59,9 +76,6 @@ the highlighted file is previewed automatically:
 | CSV | Aligned column table (first rows) |
 | Directories | Item count |
 | Anything binary (incl. images) | `[binary file]` placeholder |
-
-Image thumbnails were removed — they were too laggy and don't work in a
-plain text terminal.
 
 `C` copies the preview's text (text, Markdown, PDF text, CSV) to the system
 clipboard. Placeholders report "Nothing to copy."
@@ -282,6 +296,20 @@ status line instead.
     selection.
   - With no selection: VS Code style — the whole current line is
     copied/cut, and paste inserts below the current line.
+- **Line operations** — `Ctrl+D` duplicates the current line below it
+  (cursor follows the duplicate); with a text selection it duplicates every
+  touched line as a block. `Alt+↑`/`Alt+↓` moves the current line (or the
+  selected line block) up/down, no-ops at the top/bottom of the file.
+  (Some terminals don't deliver `Alt+arrows` — where yours doesn't, nothing
+  happens.) `Tab` with a selection indents every touched line by 4 spaces,
+  `Shift+Tab` removes up to 4 leading spaces; with no selection `Tab` still
+  inserts 4 spaces at the cursor and `Shift+Tab` dedents the current line.
+  `Ctrl+Backspace` / `Ctrl+Delete` delete to the previous word start / next
+  word end (`Alt+Backspace` / `Alt+Delete` work too, for terminals that can't
+  send `Ctrl+Backspace` distinctly). Each is one undo step.
+- **Ctrl+C never quits** — in the editor and file list it copies; everywhere
+  else it cancels like `Esc` (closes the find bar, inputs, dialogs and
+  popups) instead of killing the app.
 - **Word wrap** — long lines wrap at word boundaries to fit the window
   (only the first visual row shows the line number). `↑`/`↓` move by
   visual row, so the cursor walks through a wrapped line's segments.
@@ -297,8 +325,8 @@ status line instead.
   highlighted in the accent color (bold, so it stays distinct from a mouse
   selection). `Enter` jumps to the
   next match, `Shift+Enter` to the previous (only where the terminal
-  delivers it), and `Esc` closes the bar, leaving the cursor on the last
-  match. Typing, `Backspace`/`Delete`, and `←`/`→`/`Home`/`End` edit the
+  delivers it), and `Esc` (or `Ctrl+C`) closes the bar, leaving the cursor
+  on the last match. Typing, `Backspace`/`Delete`, and `←`/`→`/`Home`/`End` edit the
   query — the bar eats every key, so none of it lands in the document.
   `Ctrl+F` again also closes the bar.
 - **Find & replace** — `Ctrl+R` opens the same bar with a Replace field:
@@ -395,6 +423,7 @@ src/
   fs.rs      — filesystem ops (list, preview, search, create/rename/delete/copy/move)
   input.rs   — keyboard / paste / mouse handling per UI mode
   net.rs     — network: mDNS discovery, SMB share listing, mount/unmount
+  session.rs — session persistence (tabs, backups, favorites)
   ui.rs      — rendering (tab bar, list, columns, preview, editor, sheet, popups)
   theme.rs   — color themes + settings persistence (~/.config/fex/settings)
 ```

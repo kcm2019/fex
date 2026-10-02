@@ -1468,6 +1468,213 @@ impl Editor {
         }
     }
 
+    // -- line operations --------------------------------------------------
+    // Duplicate line (Ctrl+D), move line (Alt+↑/↓), indent/dedent (Tab with
+    // a selection), word delete (Ctrl+Backspace / Ctrl+Delete). Each is one
+    // undo entry and marks the buffer dirty.
+
+    /// Buffer rows touched by the text selection, inclusive. A selection
+    /// ending at column 0 of a later row doesn't touch that row.
+    fn selected_line_range(&self) -> Option<(usize, usize)> {
+        let ((sr, _), (er, ec)) = self.selection()?;
+        let er = if ec == 0 && er > sr { er - 1 } else { er };
+        Some((sr, er))
+    }
+
+    /// Duplicate the current line directly below it (cursor follows the
+    /// duplicate); with a selection, duplicate the whole touched-line block.
+    pub fn duplicate_line(&mut self) {
+        let (sr, er) = match self.selected_line_range() {
+            Some(r) => r,
+            None => (self.row, self.row),
+        };
+        self.push_undo();
+        let block: Vec<String> = self.lines[sr..=er].to_vec();
+        let n = block.len();
+        for (i, line) in block.into_iter().enumerate() {
+            self.lines.insert(er + 1 + i, line);
+        }
+        self.row += n;
+        if let Some((ar, ac)) = self.sel_anchor {
+            self.sel_anchor = Some((ar + n, ac));
+        }
+        self.dirty = true;
+        self.invalidate_hl(sr);
+        self.ensure_visible();
+    }
+
+    /// Move the current line (or the selected line block) up (`delta` < 0)
+    /// or down, swapping with the neighbor; the cursor follows the moved
+    /// line(s). No-op at the top/bottom of the buffer.
+    pub fn move_line(&mut self, delta: i32) {
+        let (sr, er) = match self.selected_line_range() {
+            Some(r) => r,
+            None => (self.row, self.row),
+        };
+        if delta < 0 {
+            if sr == 0 {
+                return;
+            }
+            self.push_undo();
+            let above = self.lines.remove(sr - 1);
+            self.lines.insert(er, above);
+            self.row -= 1;
+            if let Some((ar, ac)) = self.sel_anchor {
+                self.sel_anchor = Some((ar - 1, ac));
+            }
+            self.invalidate_hl(sr - 1);
+        } else if delta > 0 {
+            if er + 1 >= self.lines.len() {
+                return;
+            }
+            self.push_undo();
+            let below = self.lines.remove(er + 1);
+            self.lines.insert(sr, below);
+            self.row += 1;
+            if let Some((ar, ac)) = self.sel_anchor {
+                self.sel_anchor = Some((ar + 1, ac));
+            }
+            self.invalidate_hl(sr);
+        } else {
+            return;
+        }
+        self.clamp_col();
+        self.dirty = true;
+        self.ensure_visible();
+    }
+
+    /// Indent every line touched by the selection by 4 spaces (Tab).
+    pub fn indent_selection(&mut self) {
+        let Some((sr, er)) = self.selected_line_range() else {
+            return;
+        };
+        self.push_undo();
+        self.apply_indent(sr, er);
+        if let Some((ar, ac)) = self.sel_anchor {
+            self.sel_anchor = Some((ar, ac + 4));
+        }
+        self.col += 4;
+        self.dirty = true;
+        self.invalidate_hl(sr);
+    }
+
+    /// Remove up to 4 leading spaces from every touched line (Shift+Tab).
+    pub fn dedent_selection(&mut self) {
+        let Some((sr, er)) = self.selected_line_range() else {
+            return;
+        };
+        self.push_undo();
+        let removed = self.apply_dedent(sr, er);
+        let unindent = |row: usize, col: usize| col.saturating_sub(removed[row - sr]);
+        if let Some((ar, ac)) = self.sel_anchor {
+            self.sel_anchor = Some((ar, unindent(ar, ac)));
+        }
+        self.col = unindent(self.row, self.col);
+        self.dirty = true;
+        self.invalidate_hl(sr);
+    }
+
+    /// Dedent the current line (Shift+Tab with no selection).
+    pub fn dedent_line(&mut self) {
+        let row = self.row;
+        self.push_undo();
+        let removed = self.apply_dedent(row, row);
+        self.col = self.col.saturating_sub(removed[0]);
+        self.dirty = true;
+        self.invalidate_hl(row);
+    }
+
+    /// True when a non-empty text selection is active.
+    pub fn has_selection(&self) -> bool {
+        self.selection().is_some_and(|(a, b)| a != b)
+    }
+
+    /// Insert 4 spaces at the start of lines [sr..=er].
+    fn apply_indent(&mut self, sr: usize, er: usize) {
+        for r in sr..=er {
+            self.lines[r].insert_str(0, "    ");
+        }
+    }
+
+    /// Remove up to 4 leading spaces from lines [sr..=er]; returns the
+    /// per-line counts removed (for cursor adjustment).
+    fn apply_dedent(&mut self, sr: usize, er: usize) -> Vec<usize> {
+        let mut removed = Vec::with_capacity(er - sr + 1);
+        for r in sr..=er {
+            let n = self.lines[r]
+                .chars()
+                .take_while(|c| *c == ' ')
+                .take(4)
+                .count();
+            let b = char_idx_to_byte(&self.lines[r], n);
+            self.lines[r].replace_range(..b, "");
+            removed.push(n);
+        }
+        removed
+    }
+
+    /// Delete the char range [start, end), joining lines as needed.
+    fn delete_range(&mut self, start: (usize, usize), end: (usize, usize)) {
+        debug_assert!(start <= end);
+        if start == end {
+            return;
+        }
+        let (sr, sc) = start;
+        let (er, ec) = end;
+        self.push_undo();
+        if sr == er {
+            let b0 = char_idx_to_byte(&self.lines[sr], sc);
+            let b1 = char_idx_to_byte(&self.lines[sr], ec);
+            self.lines[sr].replace_range(b0..b1, "");
+        } else {
+            let b0 = char_idx_to_byte(&self.lines[sr], sc);
+            let tail = self.lines[er][char_idx_to_byte(&self.lines[er], ec)..].to_string();
+            self.lines[sr].truncate(b0);
+            self.lines[sr].push_str(&tail);
+            self.lines.drain(sr + 1..=er);
+        }
+        self.row = sr;
+        self.col = sc;
+        self.dirty = true;
+        self.invalidate_hl(sr);
+        self.ensure_visible();
+    }
+
+    /// Delete from the cursor back to the previous word start
+    /// (Ctrl+Backspace); at a line start it joins with the previous line
+    /// like Backspace. A selection deletes as usual.
+    pub fn delete_word_back(&mut self) {
+        if self.sel_anchor.is_some() {
+            self.delete_selection();
+            return;
+        }
+        if self.col == 0 {
+            self.backspace();
+            return;
+        }
+        let orig = (self.row, self.col);
+        self.word_start();
+        let target = (self.row, self.col);
+        self.row = orig.0;
+        self.col = orig.1;
+        self.delete_range(target, orig);
+    }
+
+    /// Delete from the cursor forward to the next word end (Ctrl+Delete),
+    /// crossing lines; a selection deletes as usual.
+    pub fn delete_word_forward(&mut self) {
+        if self.sel_anchor.is_some() {
+            self.delete_selection();
+            return;
+        }
+        let orig = (self.row, self.col);
+        self.word_end();
+        let target = (self.row, self.col);
+        self.row = orig.0;
+        self.col = orig.1;
+        self.delete_range(orig, target);
+    }
+
     // -- clipboard --------------------------------------------------------
     // Line-based copy/cut/paste, VS Code style: with no selection the whole
     // current line is copied. With a mouse selection, the exact selected
@@ -3437,6 +3644,152 @@ mod tests {
         assert_eq!(ed.lines, vec!["foo".to_string()]);
         assert!(!ed.dirty);
         assert_eq!(ed.undo.len(), 0, "no undo entry for a no-op batch");
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn duplicate_line_copies_below_and_follows() {
+        let p = tmpfile("d.txt", "aaa\nbbb\nccc\n".as_bytes());
+        let mut ed = Editor::open(&p).unwrap();
+        ed.row = 1;
+        ed.col = 2;
+        ed.duplicate_line();
+        assert_eq!(ed.lines, vec!["aaa", "bbb", "bbb", "ccc"]);
+        assert_eq!((ed.row, ed.col), (2, 2), "cursor follows the duplicate");
+        assert!(ed.dirty);
+        ed.undo();
+        assert_eq!(ed.lines, vec!["aaa", "bbb", "ccc"], "one undo entry");
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn duplicate_line_with_selection_duplicates_block() {
+        let p = tmpfile("d2.txt", "aaa\nbbb\nccc\n".as_bytes());
+        let mut ed = Editor::open(&p).unwrap();
+        // Select all of lines 0..=1 (anchor at (0,0), cursor at (2,0)).
+        ed.sel_anchor = Some((0, 0));
+        ed.row = 2;
+        ed.col = 0;
+        ed.duplicate_line();
+        assert_eq!(ed.lines, vec!["aaa", "bbb", "aaa", "bbb", "ccc"]);
+        assert_eq!((ed.row, ed.col), (4, 0), "cursor moves with the block");
+        assert_eq!(ed.sel_anchor, Some((2, 0)), "anchor moves with the block");
+        ed.undo();
+        assert_eq!(ed.lines, vec!["aaa", "bbb", "ccc"]);
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn move_line_up_down_and_boundaries() {
+        let p = tmpfile("m.txt", "aaa\nbbb\nccc\n".as_bytes());
+        let mut ed = Editor::open(&p).unwrap();
+        ed.row = 1;
+        ed.col = 1;
+        ed.move_line(-1);
+        assert_eq!(ed.lines, vec!["bbb", "aaa", "ccc"]);
+        assert_eq!((ed.row, ed.col), (0, 1), "cursor follows the moved line");
+        ed.move_line(-1); // already at top: no-op
+        assert_eq!(ed.lines, vec!["bbb", "aaa", "ccc"]);
+        ed.move_line(1);
+        ed.move_line(1);
+        assert_eq!(ed.lines, vec!["aaa", "ccc", "bbb"]);
+        ed.move_line(1); // already at bottom: no-op
+        assert_eq!(ed.lines, vec!["aaa", "ccc", "bbb"]);
+        assert!(ed.dirty);
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn move_line_block_with_selection() {
+        let p = tmpfile("m2.txt", "aaa\nbbb\nccc\nddd\n".as_bytes());
+        let mut ed = Editor::open(&p).unwrap();
+        ed.sel_anchor = Some((1, 0));
+        ed.row = 2;
+        ed.col = 3;
+        ed.move_line(1);
+        assert_eq!(ed.lines, vec!["aaa", "ddd", "bbb", "ccc"]);
+        assert_eq!((ed.row, ed.col), (3, 3));
+        assert_eq!(ed.sel_anchor, Some((2, 0)), "selection rides along");
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn indent_and_dedent_selection() {
+        let p = tmpfile("i.txt", "aaa\n  bbb\nccc\n".as_bytes());
+        let mut ed = Editor::open(&p).unwrap();
+        ed.sel_anchor = Some((0, 1));
+        ed.row = 2;
+        ed.col = 2;
+        ed.indent_selection();
+        assert_eq!(ed.lines, vec!["    aaa", "      bbb", "    ccc"]);
+        assert_eq!(ed.sel_anchor, Some((0, 5)));
+        assert_eq!((ed.row, ed.col), (2, 6));
+        ed.dedent_selection();
+        assert_eq!(ed.lines, vec!["aaa", "  bbb", "ccc"]);
+        assert_eq!(ed.sel_anchor, Some((0, 1)));
+        assert_eq!((ed.row, ed.col), (2, 2));
+        // Dedent removes fewer than 4 spaces when there are fewer.
+        ed.dedent_selection();
+        assert_eq!(ed.lines, vec!["aaa", "bbb", "ccc"]);
+        ed.undo();
+        assert_eq!(ed.lines, vec!["aaa", "  bbb", "ccc"], "one undo entry");
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn dedent_line_without_selection() {
+        let p = tmpfile("i2.txt", "    aaa\nbbb\n".as_bytes());
+        let mut ed = Editor::open(&p).unwrap();
+        ed.row = 0;
+        ed.col = 6;
+        ed.dedent_line();
+        assert_eq!(ed.lines[0], "aaa");
+        assert_eq!((ed.row, ed.col), (0, 2));
+        assert!(ed.dirty);
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn delete_word_back_and_forward() {
+        let p = tmpfile("w.txt", "foo bar baz\n".as_bytes());
+        let mut ed = Editor::open(&p).unwrap();
+        ed.row = 0;
+        ed.col = 11; // end of "baz"
+        ed.delete_word_back();
+        assert_eq!(ed.lines[0], "foo bar ");
+        assert_eq!((ed.row, ed.col), (0, 8));
+        ed.delete_word_forward(); // at end of line: no-op
+        assert_eq!(ed.lines[0], "foo bar ");
+        ed.col = 4; // start of "bar"
+        ed.delete_word_forward();
+        assert_eq!(ed.lines[0], "foo  ");
+        assert_eq!((ed.row, ed.col), (0, 4));
+        ed.undo();
+        assert_eq!(ed.lines[0], "foo bar ");
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn delete_word_back_at_line_start_joins_lines() {
+        let p = tmpfile("w2.txt", "foo\nbar\n".as_bytes());
+        let mut ed = Editor::open(&p).unwrap();
+        ed.row = 1;
+        ed.col = 0;
+        ed.delete_word_back();
+        assert_eq!(ed.lines, vec!["foobar"], "newline joined like Backspace");
+        assert_eq!((ed.row, ed.col), (0, 3));
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn delete_word_at_buffer_start_is_noop() {
+        let p = tmpfile("w3.txt", "foo\n".as_bytes());
+        let mut ed = Editor::open(&p).unwrap();
+        ed.row = 0;
+        ed.col = 0;
+        ed.delete_word_back();
+        assert_eq!(ed.lines, vec!["foo".to_string()]);
+        assert_eq!(ed.undo.len(), 0, "no undo entry for a no-op");
         std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
     }
 }

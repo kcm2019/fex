@@ -658,6 +658,12 @@ fn sevenz_err(e: sevenz_rust::Error) -> io::Error {
         sevenz_rust::Error::PasswordRequired | sevenz_rust::Error::MaybeBadPassword(_) => {
             other_err("password-protected archives are not supported")
         }
+        // Without the aes256 feature, encrypted entries surface as an
+        // unsupported AES method instead of PasswordRequired — same meaning
+        // to the user.
+        sevenz_rust::Error::UnsupportedCompressionMethod(m) if m.contains("AES") => {
+            other_err("password-protected archives are not supported")
+        }
         _ => other_err(e),
     }
 }
@@ -1489,17 +1495,12 @@ mod tests {
 
     #[test]
     fn extract_password_protected_7z_fails_cleanly() {
+        // Fixture generated with py7zr using password "hunter2" (the
+        // aes256 feature is disabled, so the crate can't create one).
+        const LOCKED: &[u8] = include_bytes!("../tests/fixtures/locked.7z");
         let dir = tmpdir("xpass");
-        let srcdir = dir.join("srcdir");
-        fs::create_dir_all(&srcdir).unwrap();
-        fs::write(srcdir.join("a.txt"), "secret").unwrap();
         let src = dir.join("locked.7z");
-        sevenz_rust::compress_to_path_encrypted(
-            &srcdir,
-            &src,
-            sevenz_rust::Password::from("hunter2"),
-        )
-        .unwrap();
+        fs::write(&src, LOCKED).unwrap();
         let dest = dir.join("out");
         match extract_archive(&src, &dest) {
             Ok(_) => panic!("expected a password error"),
