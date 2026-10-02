@@ -1,6 +1,7 @@
 //! Keyboard input handling, dispatched by UI mode.
 
 use crate::app::{App, InputKind, Mode, NetState, Tab, ViewMode, Workspace};
+use crate::fs;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -186,6 +187,53 @@ fn handle_editor(app: &mut App, key: KeyEvent) {
         app.save_dialog_key(key);
         return;
     }
+    // Ctrl+R opens find & replace in the editor. Placed before the find-bar
+    // routing so Ctrl+R switches an open Ctrl+F bar into replace mode
+    // instead of being eaten as query text (r is free in the editor).
+    if ctrl && !shift && matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R')) {
+        if let Some(ed) = app.editor.as_mut() {
+            ed.open_replace();
+        }
+        return;
+    }
+    // Ctrl+F toggles the find bar in the editor (f is free: s/o/z/y/c/x/v
+    // are already taken).
+    if ctrl && !shift && matches!(key.code, KeyCode::Char('f') | KeyCode::Char('F')) {
+        if let Some(ed) = app.editor.as_mut() {
+            if ed.find.is_some() {
+                ed.close_find();
+            } else {
+                ed.open_find();
+            }
+        }
+        return;
+    }
+    // While the find bar is open it eats every key, like the save dialog:
+    // Esc closes it, Enter jumps to the next match, Shift+Enter to the
+    // previous one (only where the terminal delivers it), everything else
+    // edits the query — never the document. In replace mode (Ctrl+R) Enter
+    // replaces the current match instead, Tab switches the Find/Replace
+    // fields, and Ctrl+A replaces every match.
+    if app.editor.as_ref().is_some_and(|ed| ed.find.is_some()) {
+        if let Some(ed) = app.editor.as_mut() {
+            match key.code {
+                KeyCode::Esc => ed.close_find(),
+                KeyCode::Enter => {
+                    if ed.find.as_ref().is_some_and(|f| f.replace_mode) {
+                        ed.replace_current();
+                    } else if shift {
+                        ed.find_jump(-1);
+                    } else {
+                        ed.find_jump(1);
+                    }
+                }
+                _ => {
+                    ed.find_input(key);
+                }
+            }
+        }
+        return;
+    }
     // Ctrl+S saves; Ctrl+O is a second save binding (nano-style) for
     // terminals that intercept Ctrl+S before the app sees it.
     if ctrl
@@ -202,6 +250,8 @@ fn handle_editor(app: &mut App, key: KeyEvent) {
         } else if let Some(ed) = app.editor.as_mut() {
             if let Err(e) = ed.save() {
                 ed.message = format!("Save failed: {e}");
+            } else {
+                app.invalidate_git(); // the file's git status may have changed
             }
         }
         return;
@@ -365,6 +415,32 @@ fn handle_sheet(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // Ctrl+F toggles find-in-sheet; while the bar is open it eats every
+    // key (Esc closes it before the dirty-check below can fire).
+    if ctrl && !shift && matches!(key.code, KeyCode::Char('f') | KeyCode::Char('F')) {
+        if let Some(sh) = app.sheet.as_mut() {
+            if sh.find.is_some() {
+                sh.close_find();
+            } else {
+                sh.open_find();
+            }
+        }
+        return;
+    }
+    if app.sheet.as_ref().is_some_and(|s| s.find.is_some()) {
+        if let Some(sh) = app.sheet.as_mut() {
+            match key.code {
+                KeyCode::Esc => sh.close_find(),
+                KeyCode::Enter if !shift => sh.find_jump(1),
+                KeyCode::Enter => sh.find_jump(-1),
+                _ => {
+                    sh.find_input(key);
+                }
+            }
+        }
+        return;
+    }
+
     // Ctrl+S saves; Ctrl+O is a second save binding for terminals that
     // intercept Ctrl+S before the app sees it.
     if ctrl
@@ -377,6 +453,8 @@ fn handle_sheet(app: &mut App, key: KeyEvent) {
         if let Some(sh) = app.sheet.as_mut() {
             if let Err(e) = sh.save() {
                 sh.message = format!("Save failed: {e}");
+            } else {
+                app.invalidate_git(); // the file's git status may have changed
             }
         }
         return;
@@ -424,6 +502,9 @@ fn handle_sheet(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Enter => app.start_input(InputKind::CsvCell),
         KeyCode::Char('a') if !ctrl => sh.add_row(),
+        // xlsx sheet switching (no-op for CSV).
+        KeyCode::Char('[') => sh.switch_sheet(-1),
+        KeyCode::Char(']') => sh.switch_sheet(1),
         _ => {}
     }
 }
@@ -523,10 +604,24 @@ pub fn handle_mouse(ws: &mut Workspace, m: MouseEvent) {
                 let double = matches!(app.last_click,
                     Some((px, py, t)) if px == m.column && py == m.row && now.duration_since(t) <= DOUBLE_CLICK);
                 app.last_click = Some((m.column, m.row, now));
-                if double {
-                    app.dblclick_open(m.column, m.row);
+                // Select the clicked row first: a double-click acts on it,
+                // and double-clicking an archive opens the read-only
+                // archive tab instead of the normal enter.
+                app.click_select(m.column, m.row);
+                let arch_src: Option<PathBuf> = if double && app.archive.is_none() {
+                    app.selected_entry()
+                        .filter(|e| fs::is_archive(&e.path))
+                        .map(|e| e.path.clone())
                 } else {
-                    app.click_select(m.column, m.row);
+                    None
+                };
+                if double {
+                    match arch_src {
+                        // `app` is not used in this branch, so its borrow
+                        // ends here and `ws` can be used.
+                        Some(src) => ws.open_archive_tab(src),
+                        None => app.enter_selected(),
+                    }
                 }
             }
             Kind::ScrollUp => app.move_selection(-3),
@@ -539,6 +634,14 @@ pub fn handle_mouse(ws: &mut Workspace, m: MouseEvent) {
 
 fn handle_normal(ws: &mut Workspace, key: KeyEvent) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    // The move dialog eats every key while it's open.
+    if ws.active_browser().is_some_and(|a| a.move_dialog.is_some()) {
+        if let Some(app) = ws.active_browser_mut() {
+            app.move_dialog_key(key);
+        }
+        return;
+    }
     // Workspace-level keys: shared clipboard, quit, new terminal tab.
     match key.code {
         // OS-style clipboard for files and folders, shared across tabs
@@ -577,13 +680,50 @@ fn handle_normal(ws: &mut Workspace, key: KeyEvent) {
             return;
         }
         KeyCode::Esc => {
-            let empty = ws.active_browser().is_some_and(|a| a.filter.is_empty());
-            if empty {
+            // In an archive tab Esc climbs out: one virtual level up, or
+            // closes the tab at the archive root (the last tab becomes a
+            // normal browser instead of closing).
+            if ws.active_browser().is_some_and(|a| a.archive.is_some()) {
+                ws.archive_back();
+                return;
+            }
+            let quit = match ws.active_browser_mut() {
+                Some(app) if !app.multi.is_empty() => {
+                    app.clear_multi();
+                    app.status.clear();
+                    false
+                }
+                Some(app) if app.filter.is_empty() => true,
+                Some(app) => {
+                    app.clear_filter();
+                    false
+                }
+                None => true,
+            };
+            if quit {
                 ws.should_quit = true;
-            } else if let Some(app) = ws.active_browser_mut() {
-                app.clear_filter();
             }
             return;
+        }
+        _ => {}
+    }
+    // Navigation that may need the workspace: opening an archive creates
+    // a new tab (App can't do that alone), and ←/Backspace in an archive
+    // tab climbs out or closes the tab. Runs before the `app` borrow
+    // below so it can take `&mut ws`.
+    match key.code {
+        KeyCode::Right | KeyCode::Enter => {
+            // An archive opens in a new read-only tab that browses inside
+            // it; everything else falls through to the normal enter.
+            if ws.open_archive_if_selected() {
+                return;
+            }
+        }
+        KeyCode::Left | KeyCode::Backspace => {
+            if ws.active_browser().is_some_and(|a| a.archive.is_some()) {
+                ws.archive_back();
+                return;
+            }
         }
         _ => {}
     }
@@ -592,6 +732,8 @@ fn handle_normal(ws: &mut Workspace, key: KeyEvent) {
     };
     match key.code {
         // Navigation
+        KeyCode::Up if shift => app.shift_extend(-1),
+        KeyCode::Down if shift => app.shift_extend(1),
         KeyCode::Up => app.move_selection(-1),
         KeyCode::Down => app.move_selection(1),
         KeyCode::PageUp => app.move_selection(-10),
@@ -615,6 +757,11 @@ fn handle_normal(ws: &mut Workspace, key: KeyEvent) {
             }
             app.start_input(InputKind::Filter);
         }
+        // Find in files (Ctrl+F): contents search on a background thread.
+        // Plain f keeps its filename search.
+        KeyCode::Char('f') | KeyCode::Char('F') if ctrl => {
+            app.start_input(InputKind::Grep);
+        }
         KeyCode::Char('f') => app.start_search(),
         KeyCode::Char('s') => app.cycle_sort_key(),
         KeyCode::Char('S') => app.toggle_sort_dir(),
@@ -624,7 +771,12 @@ fn handle_normal(ws: &mut Workspace, key: KeyEvent) {
         KeyCode::Char('n') => app.start_input(InputKind::NewFile),
         KeyCode::Char('N') => app.start_input(InputKind::NewDir),
         KeyCode::Char('r') => app.start_input(InputKind::Rename),
-        KeyCode::Char('d') => app.confirm_delete(),
+        KeyCode::Char('d') => app.confirm_trash(),
+        KeyCode::Char('D') => app.confirm_delete(),
+        // Move the selected file(s) to another folder (popup dialog).
+        KeyCode::Char('m') => app.open_move_dialog(),
+        // X extracts archives; lowercase x still cuts.
+        KeyCode::Char('X') if !ctrl => app.extract_selected(),
         KeyCode::Char('Y') => app.copy_path(),
         KeyCode::Char('C') if !ctrl => app.copy_preview_text(),
         KeyCode::Char('e') => app.open_editor(),
@@ -640,28 +792,33 @@ fn handle_normal(ws: &mut Workspace, key: KeyEvent) {
 
         // Favorites: star the selected file/folder, F opens the list.
         KeyCode::Char('*') => {
-            let path = ws
-                .active_browser()
-                .and_then(|a| a.selected_entry())
-                .map(|e| e.path.clone());
-            match path {
-                Some(path) => {
-                    let name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    let added = ws.toggle_favorite(path);
-                    if let Some(app) = ws.active_browser_mut() {
-                        app.status = if added {
-                            format!("★ {name} added to favorites (F to view)")
-                        } else {
-                            format!("{name} removed from favorites")
-                        };
+            // Virtual archive entries have no real path to favorite.
+            if app.archive.is_some() {
+                app.status = String::from("Archives are read-only");
+            } else {
+                let path = ws
+                    .active_browser()
+                    .and_then(|a| a.selected_entry())
+                    .map(|e| e.path.clone());
+                match path {
+                    Some(path) => {
+                        let name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        let added = ws.toggle_favorite(path);
+                        if let Some(app) = ws.active_browser_mut() {
+                            app.status = if added {
+                                format!("★ {name} added to favorites (F to view)")
+                            } else {
+                                format!("{name} removed from favorites")
+                            };
+                        }
                     }
-                }
-                None => {
-                    if let Some(app) = ws.active_browser_mut() {
-                        app.status = String::from("Nothing to favorite");
+                    None => {
+                        if let Some(app) = ws.active_browser_mut() {
+                            app.status = String::from("Nothing to favorite");
+                        }
                     }
                 }
             }
@@ -712,15 +869,46 @@ fn handle_input(app: &mut App, key: KeyEvent) {
 }
 
 /// Key handling in search mode: type to search live, Tab toggles
-/// filename/deep search, Enter jumps to the hit, Esc exits.
+/// filename/deep search, Enter jumps to the hit, Esc exits. In find-in-files
+/// (grep) mode typing clears stale results instead of searching live — Enter
+/// re-runs the background search, Tab is ignored.
 fn handle_search(app: &mut App, key: KeyEvent) {
+    let grep = app.grep_mode;
     match key.code {
-        KeyCode::Esc => app.cancel_search(),
-        KeyCode::Enter => app.search_jump(),
-        KeyCode::Tab => app.toggle_search_deep(),
+        KeyCode::Esc => {
+            if grep {
+                app.grep_rx = None;
+                app.grep_active = false;
+                app.grep_mode = false;
+            }
+            app.cancel_search();
+        }
+        KeyCode::Enter => {
+            if grep {
+                let q = app.input.clone();
+                if app.grep_active || q != app.grep_query || app.search_results.is_empty() {
+                    app.start_grep(q);
+                } else {
+                    app.search_jump();
+                }
+            } else {
+                app.search_jump();
+            }
+        }
+        KeyCode::Tab => {
+            if !grep {
+                app.toggle_search_deep();
+            }
+        }
         KeyCode::Backspace => {
             app.input_backspace();
-            app.run_search();
+            if grep {
+                // Results are stale until Enter re-runs the search.
+                app.search_results.clear();
+                app.search_selected = 0;
+            } else {
+                app.run_search();
+            }
         }
         KeyCode::Left => app.input_move_cursor(-1),
         KeyCode::Right => app.input_move_cursor(1),
@@ -728,7 +916,12 @@ fn handle_search(app: &mut App, key: KeyEvent) {
         KeyCode::Down => app.search_move(1),
         KeyCode::Char(c) => {
             app.input_insert(c);
-            app.run_search();
+            if grep {
+                app.search_results.clear();
+                app.search_selected = 0;
+            } else {
+                app.run_search();
+            }
         }
         _ => {}
     }
@@ -736,7 +929,13 @@ fn handle_search(app: &mut App, key: KeyEvent) {
 
 fn handle_confirm(app: &mut App, key: KeyEvent) {
     match key.code {
-        KeyCode::Char('y') | KeyCode::Char('Y') => app.do_delete(),
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            if app.confirm_is_trash {
+                app.do_trash()
+            } else {
+                app.do_delete()
+            }
+        }
         KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => app.mode = Mode::Normal,
         _ => {}
     }
@@ -828,6 +1027,30 @@ mod tests {
         }
         assert_eq!(browser(&ws).search_results.len(), 1);
         assert_eq!(browser(&ws).search_results[0].line_no, Some(2));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn trash_and_delete_keybindings() {
+        let (mut ws, dir) = test_app();
+        // d opens the trash confirm; y trashes the selected file.
+        handle_key(&mut ws, key(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert!(matches!(browser(&ws).mode, Mode::ConfirmDelete));
+        assert!(browser(&ws).confirm_is_trash);
+        handle_key(&mut ws, key(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(!dir.join("a.txt").exists());
+        let status = browser(&ws).status.clone();
+        assert!(status.contains("trash"), "status was {:?}", status);
+        // D opens the permanent-delete confirm; y deletes for real.
+        std::fs::write(dir.join("b.txt"), "bye\n").unwrap();
+        browser_mut(&mut ws).refresh();
+        handle_key(&mut ws, key(KeyCode::Char('D'), KeyModifiers::SHIFT));
+        assert!(matches!(browser(&ws).mode, Mode::ConfirmDelete));
+        assert!(!browser(&ws).confirm_is_trash);
+        handle_key(&mut ws, key(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(!dir.join("b.txt").exists());
+        let status = browser(&ws).status.clone();
+        assert!(status.contains("Deleted"), "status was {:?}", status);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1076,12 +1299,40 @@ mod tests {
     }
 
     #[test]
+    fn shift_down_multi_selects_and_esc_clears() {
+        let (mut ws, dir) = test_app();
+        std::fs::write(dir.join("b.txt"), "x").unwrap();
+        browser_mut(&mut ws).refresh();
+        browser_mut(&mut ws).jump_to(0);
+        handle_key(&mut ws, key(KeyCode::Down, KeyModifiers::SHIFT));
+        handle_key(&mut ws, key(KeyCode::Down, KeyModifiers::SHIFT));
+        assert_eq!(browser(&ws).multi.len(), 2);
+        // Esc clears the selection instead of quitting.
+        handle_key(&mut ws, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(browser(&ws).multi.is_empty());
+        assert!(!ws.should_quit);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn m_key_opens_move_dialog_and_esc_cancels() {
+        let (mut ws, dir) = test_app();
+        handle_key(&mut ws, key(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert!(browser(&ws).move_dialog.is_some());
+        // The dialog eats keys: Esc cancels it.
+        handle_key(&mut ws, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(browser(&ws).move_dialog.is_none());
+        assert!(!ws.should_quit);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn o_key_reveals_in_explorer() {
         let (mut ws, dir) = test_app();
         handle_key(&mut ws, key(KeyCode::Char('o'), KeyModifiers::empty()));
         let status = browser(&ws).status.clone();
         assert!(
-            status.starts_with("Revealed ") || status.starts_with("Could not open"),
+            status.starts_with("Opened ") || status.starts_with("Could not open"),
             "unexpected status: {status}"
         );
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1154,5 +1405,261 @@ mod tests {
             Tab::Browser(app) => assert_eq!(app.cwd, dir),
             _ => panic!("expected a browser tab"),
         }
+    }
+
+    fn ed_cursor(ws: &Workspace) -> (usize, usize) {
+        let ed = browser(ws).editor.as_ref().unwrap();
+        (ed.row, ed.col)
+    }
+
+    #[test]
+    fn ctrl_f_find_bar_flow() {
+        let (mut ws, dir) = test_app();
+        std::fs::write(dir.join("a.txt"), "foo bar\nbaz foo\nfoo qux\n").unwrap();
+        browser_mut(&mut ws).refresh();
+        browser_mut(&mut ws).open_editor();
+        assert!(matches!(browser(&ws).mode, Mode::Editor));
+        // Ctrl+F opens the find bar.
+        handle_key(&mut ws, ctrl('f'));
+        assert!(browser(&ws).editor.as_ref().unwrap().find.is_some());
+        // Typing edits the query and jumps live to the first match at/after
+        // the cursor; the document is untouched.
+        for c in "foo".chars() {
+            handle_key(&mut ws, key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let ed = browser(&ws).editor.as_ref().unwrap();
+        assert_eq!(ed.find.as_ref().unwrap().query, "foo");
+        assert_eq!(ed.lines, vec!["foo bar", "baz foo", "foo qux"]);
+        assert!(!ed.dirty);
+        assert_eq!(ed_cursor(&ws), (0, 0));
+        assert_eq!(ed.find_bar_text(), "Find: foo [1/3]");
+        // Enter advances to the next match and wraps around.
+        handle_key(&mut ws, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(ed_cursor(&ws), (1, 4));
+        handle_key(&mut ws, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(ed_cursor(&ws), (2, 0));
+        handle_key(&mut ws, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(ed_cursor(&ws), (0, 0), "Enter wraps to the first match");
+        // Shift+Enter goes to the previous match (wraps to the last).
+        handle_key(&mut ws, key(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert_eq!(ed_cursor(&ws), (2, 0));
+        // Esc closes the bar, leaving the cursor at the last match.
+        handle_key(&mut ws, key(KeyCode::Esc, KeyModifiers::NONE));
+        let ed = browser(&ws).editor.as_ref().unwrap();
+        assert!(ed.find.is_none());
+        assert_eq!(ed_cursor(&ws), (2, 0));
+        // Ctrl+F toggles the bar back open and closed again.
+        handle_key(&mut ws, ctrl('f'));
+        assert!(browser(&ws).editor.as_ref().unwrap().find.is_some());
+        handle_key(&mut ws, ctrl('f'));
+        assert!(browser(&ws).editor.as_ref().unwrap().find.is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn find_bar_eats_keys_and_reports_no_match() {
+        let (mut ws, dir) = test_app();
+        browser_mut(&mut ws).open_editor(); // a.txt is "hello\nworld\n"
+        handle_key(&mut ws, ctrl('f'));
+        // A query with no matches sets not_found; the document is untouched.
+        for c in "zzz".chars() {
+            handle_key(&mut ws, key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let ed = browser(&ws).editor.as_ref().unwrap();
+        assert!(ed.find.as_ref().unwrap().not_found);
+        assert_eq!(ed.find_bar_text(), "Find: zzz — not found");
+        assert_eq!(ed.lines, vec!["hello", "world"]);
+        // Ctrl+S is eaten by the bar (no save dialog, no save); Backspace
+        // edits the query instead of the document.
+        handle_key(&mut ws, ctrl('s'));
+        assert!(browser(&ws).editor.as_ref().unwrap().find.is_some());
+        handle_key(&mut ws, key(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(
+            browser(&ws)
+                .editor
+                .as_ref()
+                .unwrap()
+                .find
+                .as_ref()
+                .unwrap()
+                .query,
+            "zz"
+        );
+        assert_eq!(
+            browser(&ws).editor.as_ref().unwrap().lines,
+            vec!["hello", "world"]
+        );
+        // Esc closes the bar; a following Esc then closes the editor
+        // (unchanged behavior).
+        handle_key(&mut ws, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(browser(&ws).editor.as_ref().unwrap().find.is_none());
+        handle_key(&mut ws, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(browser(&ws).editor.is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ctrl_r_replace_bar_flow() {
+        let (mut ws, dir) = test_app();
+        std::fs::write(dir.join("a.txt"), "foo bar\nbaz foo\nfoo qux\n").unwrap();
+        browser_mut(&mut ws).refresh();
+        browser_mut(&mut ws).open_editor();
+        // Ctrl+F opens the find bar; Ctrl+R switches it into replace mode
+        // keeping the query (not eaten as query text).
+        handle_key(&mut ws, ctrl('f'));
+        for c in "foo".chars() {
+            handle_key(&mut ws, key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        handle_key(&mut ws, ctrl('r'));
+        {
+            let ed = browser(&ws).editor.as_ref().unwrap();
+            let f = ed.find.as_ref().unwrap();
+            assert!(f.replace_mode);
+            assert_eq!(f.query, "foo");
+            assert!(!f.replace_active);
+        }
+        // Tab moves to the Replace field; typing lands there.
+        handle_key(&mut ws, key(KeyCode::Tab, KeyModifiers::NONE));
+        for c in "qux".chars() {
+            handle_key(&mut ws, key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(
+            browser(&ws).editor.as_ref().unwrap().find_bar_text(),
+            "Find: foo → Replace: qux█ [1/3]"
+        );
+        // Enter replaces the current match and advances to the next one.
+        handle_key(&mut ws, key(KeyCode::Enter, KeyModifiers::NONE));
+        let ed = browser(&ws).editor.as_ref().unwrap();
+        assert_eq!(ed.lines[0], "qux bar");
+        assert_eq!(ed_cursor(&ws), (1, 4));
+        assert_eq!(ed.find_bar_text(), "Find: foo → Replace: qux█ [1/2]");
+        assert!(ed.dirty);
+        // Ctrl+A replaces the rest; Esc closes the bar (the bar eats Ctrl+Z
+        // while open, so undo happens after). One undo restores the Ctrl+A
+        // batch, a second undo restores the Enter replacement too.
+        handle_key(&mut ws, ctrl('a'));
+        let ed = browser(&ws).editor.as_ref().unwrap();
+        assert_eq!(ed.lines, vec!["qux bar", "baz qux", "qux qux"]);
+        assert!(ed.find_bar_text().contains("— replaced 2"));
+        handle_key(&mut ws, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(browser(&ws).editor.as_ref().unwrap().find.is_none());
+        handle_key(&mut ws, ctrl('z'));
+        assert_eq!(
+            browser(&ws).editor.as_ref().unwrap().lines,
+            vec!["qux bar", "baz foo", "foo qux"]
+        );
+        handle_key(&mut ws, ctrl('z'));
+        assert_eq!(
+            browser(&ws).editor.as_ref().unwrap().lines,
+            vec!["foo bar", "baz foo", "foo qux"]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn x_extracts_selected_archive_into_named_folder() {
+        let (mut ws, dir) = test_app();
+        // Build a real zip inside the browser dir.
+        let src = dir.join("bundle.zip");
+        {
+            let f = std::fs::File::create(&src).unwrap();
+            let mut w = zip::ZipWriter::new(f);
+            let opts = zip::write::SimpleFileOptions::default();
+            w.start_file("a.txt", opts).unwrap();
+            use std::io::Write as _;
+            w.write_all(b"hello").unwrap();
+            w.finish().unwrap();
+        }
+        browser_mut(&mut ws).refresh();
+        browser_mut(&mut ws).select_by_name("bundle.zip");
+        handle_key(&mut ws, key(KeyCode::Char('X'), KeyModifiers::empty()));
+        let app = browser(&ws);
+        assert!(
+            app.status.starts_with("Extracted 1 files to bundle/"),
+            "status was {:?}",
+            app.status
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("bundle").join("a.txt")).unwrap(),
+            "hello"
+        );
+        // Extracting again must not collide: a fresh non-colliding folder.
+        browser_mut(&mut ws).select_by_name("bundle.zip");
+        handle_key(&mut ws, key(KeyCode::Char('X'), KeyModifiers::empty()));
+        assert!(
+            browser(&ws).status.contains("bundle copy/"),
+            "status was {:?}",
+            browser(&ws).status
+        );
+        assert!(dir.join("bundle copy").join("a.txt").exists());
+        // X on a non-archive: quiet status, nothing happens. x still cuts.
+        browser_mut(&mut ws).select_by_name("a.txt");
+        handle_key(&mut ws, key(KeyCode::Char('X'), KeyModifiers::empty()));
+        assert_eq!(browser(&ws).status, "No archive selected");
+        handle_key(&mut ws, key(KeyCode::Char('x'), KeyModifiers::empty()));
+        assert!(ws.clipboard.is_some(), "x must still cut files");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sheet_ctrl_f_find_bar_routing() {
+        let (mut ws, dir) = test_app();
+        std::fs::write(dir.join("d.csv"), "name,city\nfoo,bar\nbaz,foo\n").unwrap();
+        browser_mut(&mut ws).refresh();
+        browser_mut(&mut ws).select_by_name("d.csv");
+        let path = dir.join("d.csv");
+        browser_mut(&mut ws).open_path_in_sheet(&path);
+        assert!(matches!(browser(&ws).mode, Mode::Sheet));
+        // Ctrl+F opens the bar; typing jumps live; Enter goes to the
+        // next match; Esc closes the bar, not the sheet.
+        handle_key(&mut ws, ctrl('f'));
+        assert!(browser(&ws).sheet.as_ref().unwrap().find.is_some());
+        for c in "foo".chars() {
+            handle_key(&mut ws, key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let sh = browser(&ws).sheet.as_ref().unwrap();
+        assert_eq!((sh.row, sh.col), (0, 0));
+        assert_eq!(sh.find_bar_text(), "Find: foo [1/2]");
+        handle_key(&mut ws, key(KeyCode::Enter, KeyModifiers::NONE));
+        let sh = browser(&ws).sheet.as_ref().unwrap();
+        assert_eq!((sh.row, sh.col), (1, 1));
+        handle_key(&mut ws, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(browser(&ws).sheet.as_ref().unwrap().find.is_none());
+        assert!(matches!(browser(&ws).mode, Mode::Sheet));
+        // Ctrl+F toggles back open.
+        handle_key(&mut ws, ctrl('f'));
+        assert!(browser(&ws).sheet.as_ref().unwrap().find.is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ctrl_f_browser_starts_grep_search() {
+        let (mut ws, dir) = test_app();
+        std::fs::write(dir.join("n.txt"), "needle in a haystack\n").unwrap();
+        // Ctrl+F in the browser opens the find-in-files prompt.
+        handle_key(&mut ws, ctrl('f'));
+        assert!(matches!(browser(&ws).mode, Mode::Input(InputKind::Grep)));
+        // Type a query; Enter runs it on the background thread.
+        for c in "needle".chars() {
+            handle_key(&mut ws, key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        handle_key(&mut ws, key(KeyCode::Enter, KeyModifiers::NONE));
+        {
+            let app = browser(&ws);
+            assert!(matches!(app.mode, Mode::Search));
+            assert!(app.grep_mode);
+            assert!(app.grep_active);
+            assert!(app.grep_rx.is_some());
+        }
+        // Typing clears stale results; Tab is ignored; Esc exits.
+        handle_key(&mut ws, key(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(browser(&ws).search_results.is_empty());
+        handle_key(&mut ws, key(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(browser(&ws).grep_mode);
+        handle_key(&mut ws, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(browser(&ws).mode, Mode::Normal));
+        assert!(!browser(&ws).grep_mode);
+        assert!(browser(&ws).grep_rx.is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

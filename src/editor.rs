@@ -5,6 +5,7 @@
 
 use crate::theme::Theme;
 use ratatui::{
+    crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
     style::{Modifier, Style},
     text::Span,
 };
@@ -843,6 +844,84 @@ fn scan_line(line: &str, lang: Lang, in_block: bool) -> (Vec<(Tok, String)>, boo
     (postprocess(buf.finish(), lang), in_block)
 }
 
+/// Find the next `<style ...>` or `</style ...>` tag at or after byte
+/// offset `from` (ASCII case-insensitive). Returns (tag_start, tag_end,
+/// is_open). `<stylesheet>` and friends don't match: the character after
+/// "style" must end the tag name.
+fn find_style_tag(line: &str, from: usize) -> Option<(usize, usize, bool)> {
+    let b = line.as_bytes();
+    let mut i = from.min(b.len());
+    while i < b.len() {
+        if b[i] == b'<' {
+            let mut j = i + 1;
+            let is_close = if j < b.len() && b[j] == b'/' {
+                j += 1;
+                true
+            } else {
+                false
+            };
+            if b.len() >= j + 5 && b[j..j + 5].eq_ignore_ascii_case(b"style") {
+                let k = j + 5;
+                let name_ok = match b.get(k) {
+                    Some(c) => c.is_ascii_whitespace() || *c == b'/' || *c == b'>',
+                    None => false,
+                };
+                if name_ok {
+                    if let Some(rel) = b[k..].iter().position(|&c| c == b'>') {
+                        return Some((i, k + rel + 1, !is_close));
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Highlight one HTML line, running the CSS highlighter inside
+/// `<style>...</style>` regions (case-insensitive). Returns the segments
+/// plus (in_block_comment, in_style_block) carried into the next line.
+///
+/// A `<style` candidate that turns out to sit inside an HTML comment is
+/// left alone: the tag only toggles the style state when the text before
+/// it on this line ends outside a block comment. Multi-line CSS comments
+/// inside a style block are not carried across lines.
+fn scan_html_line(line: &str, in_block: bool, in_style: bool) -> (Vec<(Tok, String)>, bool, bool) {
+    let mut segs = Vec::new();
+    let mut ib = in_block;
+    let mut is = in_style;
+    let mut pos = 0;
+    while let Some((ts, te, open)) = find_style_tag(line, pos) {
+        let lang = if is { Lang::Css } else { Lang::Html };
+        // CSS regions scan standalone: an HTML block comment can't be
+        // open inside a style block (we only enter one outside comments).
+        let (mut s, nib) = scan_line(&line[pos..ts], lang, ib && lang == Lang::Html);
+        segs.append(&mut s);
+        if lang == Lang::Html {
+            ib = nib;
+        }
+        if ib {
+            // Inside an HTML comment: the "tag" is comment text, no toggle.
+            let (mut s2, nib2) = scan_line(&line[ts..te], Lang::Html, ib);
+            segs.append(&mut s2);
+            ib = nib2;
+        } else {
+            let (mut s2, nib2) = scan_line(&line[ts..te], Lang::Html, ib);
+            segs.append(&mut s2);
+            ib = nib2;
+            is = open;
+        }
+        pos = te;
+    }
+    let lang = if is { Lang::Css } else { Lang::Html };
+    let (mut s, nib) = scan_line(&line[pos..], lang, ib && lang == Lang::Html);
+    segs.append(&mut s);
+    if lang == Lang::Html {
+        ib = nib;
+    }
+    (segs, ib, is)
+}
+
 /// Feed an HTML tag `<name attrs...>`: brackets plain, the tag name as a
 /// keyword, quoted attribute values as strings.
 fn feed_html_tag(buf: &mut SegBuf, tag: &str) {
@@ -864,6 +943,11 @@ fn feed_html_tag(buf: &mut SegBuf, tag: &str) {
         }
     }
     buf.feed(Tok::Keyword, &name);
+    // Track the attribute name so `style="..."` values highlight as CSS.
+    // `word` is the alphanumeric run in progress; `attr` is the name of
+    // the attribute whose value may follow (set by `name =`).
+    let mut word = String::new();
+    let mut attr: Option<String> = None;
     while let Some(c) = chars.next() {
         if c == '"' || c == '\'' {
             let mut s = String::new();
@@ -874,8 +958,34 @@ fn feed_html_tag(buf: &mut SegBuf, tag: &str) {
                     break;
                 }
             }
-            buf.feed(Tok::Str, &s);
+            let is_style = attr
+                .as_deref()
+                .is_some_and(|a| a.eq_ignore_ascii_case("style"));
+            attr = None;
+            word.clear();
+            if is_style && s.len() >= 2 {
+                // Quotes stay strings; the declaration block scans as CSS.
+                buf.feed(Tok::Str, &s[..1]);
+                for (k, t) in scan_line(&s[1..s.len() - 1], Lang::Css, false).0 {
+                    buf.feed(k, &t);
+                }
+                buf.feed(Tok::Str, &s[s.len() - 1..]);
+            } else {
+                buf.feed(Tok::Str, &s);
+            }
+        } else if c.is_ascii_alphanumeric() || c == '-' || c == ':' || c == '_' {
+            word.push(c);
+            buf.feed_ch(Tok::Normal, c);
         } else {
+            if c == '=' {
+                if !word.is_empty() {
+                    attr = Some(std::mem::take(&mut word));
+                }
+                // `=` after whitespace (`style = "..."`): attr already set.
+            } else if !c.is_whitespace() {
+                word.clear();
+                attr = None;
+            }
             buf.feed_ch(Tok::Normal, c);
         }
     }
@@ -922,6 +1032,60 @@ const MAX_UNDO: usize = 200;
 /// tmux) and fast typing undo as a unit instead of character by character.
 const INSERT_GROUP: Duration = Duration::from_secs(1);
 
+/// Find-bar state for Ctrl+F in the editor: a small query field rendered in
+/// the message line. Typing re-searches live from the text cursor.
+/// Ctrl+R opens the same bar in replace mode, adding a second field.
+#[derive(Debug, Clone)]
+pub struct FindBar {
+    /// The search query (chars), edited while the bar is open.
+    pub query: String,
+    /// Char index of the query cursor within `query`.
+    pub cursor: usize,
+    /// The last search found nothing (the bar shows "not found").
+    pub not_found: bool,
+    /// Replace mode (Ctrl+R): the bar also edits a replacement string.
+    pub replace_mode: bool,
+    /// The replacement text (chars), edited while the replace bar is open.
+    pub replace: String,
+    /// Char index of the replace cursor within `replace`.
+    pub rcursor: usize,
+    /// Which field the bar is editing: false = Find, true = Replace.
+    pub replace_active: bool,
+    /// Result count of the last replace-all, shown until the next edit.
+    pub replace_done: Option<usize>,
+}
+
+impl FindBar {
+    /// The field the bar is currently editing (query or replace), with its
+    /// char cursor. The replace field is only active in replace mode.
+    fn active_field(&mut self) -> (&mut String, &mut usize) {
+        if self.replace_mode && self.replace_active {
+            (&mut self.replace, &mut self.rcursor)
+        } else {
+            (&mut self.query, &mut self.cursor)
+        }
+    }
+
+    /// True when the active field is the query (so edits re-search).
+    fn active_is_query(&self) -> bool {
+        !(self.replace_mode && self.replace_active)
+    }
+
+    /// Char offset of the cursor glyph from the start of the replace-mode
+    /// bar text (see `Editor::find_bar_text`): the renderer puts the
+    /// terminal cursor on the glyph so it picks up the cursor style.
+    pub fn replace_cursor_offset(&self) -> usize {
+        let base = "Find: ".chars().count();
+        if self.replace_active {
+            base + self.query.chars().count()
+                + " → Replace: ".chars().count()
+                + self.rcursor.min(self.replace.chars().count())
+        } else {
+            base + self.cursor.min(self.query.chars().count())
+        }
+    }
+}
+
 pub struct Editor {
     pub path: PathBuf,
     pub lines: Vec<String>,
@@ -947,6 +1111,11 @@ pub struct Editor {
     pub view_y: u16,
     /// Line-number gutter toggle (synced from App on open).
     pub show_line_numbers: bool,
+    /// Find bar opened with Ctrl+F (`None` when closed).
+    pub find: Option<FindBar>,
+    /// Current find match as (row, start char col, end char col), painted
+    /// while the find bar is open. Cleared when the bar closes.
+    pub find_match: Option<(usize, usize, usize)>,
     /// Session-restore backup holding unsaved buffer content
     /// (`~/.config/fex/session/backup-N.txt`). `None` when the on-disk file
     /// is the source of truth. Deleted on save and when the tab closes.
@@ -954,6 +1123,7 @@ pub struct Editor {
     lang: Lang,
     trailing_newline: bool,
     block_end: Vec<bool>, // in-block-comment at end of line i
+    style_end: Vec<bool>, // inside <style>..</style> at end of line i (HTML)
     hl_valid: usize,      // rows [0, hl_valid) have valid block_end entries
     undo: Vec<UndoSnap>,
     redo: Vec<UndoSnap>,
@@ -1010,8 +1180,11 @@ impl Editor {
             lang: Lang::from_path(path),
             trailing_newline,
             show_line_numbers: true,
+            find: None,
+            find_match: None,
             backup: None,
             block_end: Vec::new(),
+            style_end: Vec::new(),
             hl_valid: 0,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -1052,8 +1225,11 @@ impl Editor {
             lang: Lang::Plain,
             trailing_newline: true,
             show_line_numbers: true,
+            find: None,
+            find_match: None,
             backup: None,
             block_end: Vec::new(),
+            style_end: Vec::new(),
             hl_valid: 0,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -1523,6 +1699,15 @@ impl Editor {
 
     // -- cursor movement ----------------------------------------------------
 
+    /// Move the cursor to the given 1-based line (clamped), first column,
+    /// scrolled into view.
+    pub fn goto_line(&mut self, n: usize) {
+        let max = self.lines.len().max(1);
+        self.row = n.saturating_sub(1).min(max - 1);
+        self.col = 0;
+        self.ensure_visible();
+    }
+
     fn clamp_col(&mut self) {
         self.col = self.col.min(self.lines[self.row].chars().count());
     }
@@ -1624,6 +1809,432 @@ impl Editor {
         self.row = r;
         self.col = c;
         self.ensure_visible();
+    }
+
+    // -- find -----------------------------------------------------------------
+    // Ctrl+F opens a small query field in the message line. Search is a
+    // case-insensitive substring match, char-based like the text cursor.
+
+    /// Open the find bar (empty query, no jump yet).
+    pub fn open_find(&mut self) {
+        if self.find.is_none() {
+            self.find = Some(FindBar {
+                query: String::new(),
+                cursor: 0,
+                not_found: false,
+                replace_mode: false,
+                replace: String::new(),
+                rcursor: 0,
+                replace_active: false,
+                replace_done: None,
+            });
+            self.find_match = None;
+        }
+    }
+
+    /// Open the replace bar (Ctrl+R). When a Ctrl+F bar is already open its
+    /// query is kept; otherwise the bar starts empty like `open_find`.
+    pub fn open_replace(&mut self) {
+        if self.find.is_none() {
+            self.open_find();
+        }
+        if let Some(find) = self.find.as_mut() {
+            find.replace_mode = true;
+        }
+    }
+
+    /// Close the find bar, leaving the text cursor at the last match.
+    pub fn close_find(&mut self) {
+        self.find = None;
+        self.find_match = None;
+    }
+
+    /// All match starts as (row, char col), in buffer order.
+    pub fn find_matches(&self) -> Vec<(usize, usize)> {
+        let Some(find) = &self.find else {
+            return Vec::new();
+        };
+        let q: Vec<char> = find.query.to_lowercase().chars().collect();
+        if q.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for (row, line) in self.lines.iter().enumerate() {
+            let lc: Vec<char> = line.to_lowercase().chars().collect();
+            if lc.len() < q.len() {
+                continue;
+            }
+            for i in 0..=lc.len() - q.len() {
+                if lc[i..i + q.len()] == q[..] {
+                    out.push((row, i));
+                }
+            }
+        }
+        out
+    }
+
+    /// Re-search from the text cursor after the query changed: jump to the
+    /// first match at/after the cursor, wrapping around the buffer. An
+    /// empty query does nothing; no matches sets `not_found`.
+    fn find_research(&mut self) {
+        let matches = self.find_matches();
+        let Some(find) = self.find.as_mut() else {
+            return;
+        };
+        if find.query.is_empty() {
+            find.not_found = false;
+            self.find_match = None;
+            return;
+        }
+        if matches.is_empty() {
+            find.not_found = true;
+            self.find_match = None;
+            return;
+        }
+        find.not_found = false;
+        // First match at/after the cursor, else wrap to the first.
+        let mut target = matches[0];
+        for &m in &matches {
+            if m >= (self.row, self.col) {
+                target = m;
+                break;
+            }
+        }
+        self.row = target.0;
+        self.col = target.1;
+        self.find_match = Some((target.0, target.1, target.1 + find.query.chars().count()));
+        self.sel_anchor = None;
+        self.ensure_visible();
+    }
+
+    /// Replace the highlighted match with the replace text (Ctrl+R, Enter).
+    /// The text cursor lands after the inserted text, so the next Enter
+    /// replaces the following match instead of re-matching the
+    /// replacement. An empty query is a no-op. One undo entry per call.
+    pub fn replace_current(&mut self) {
+        let replacement: String;
+        {
+            let Some(find) = &self.find else {
+                return;
+            };
+            if find.query.is_empty() {
+                return;
+            }
+            replacement = find.replace.clone();
+        }
+        let Some((row, s, e)) = self.find_match else {
+            if let Some(find) = self.find.as_mut() {
+                find.not_found = true;
+            }
+            return;
+        };
+        self.push_undo();
+        {
+            let line = &mut self.lines[row];
+            let mut lc: Vec<char> = line.chars().collect();
+            lc.splice(s..e, replacement.chars());
+            *line = lc.into_iter().collect();
+            self.row = row;
+            self.col = s + replacement.chars().count();
+        }
+        self.dirty = true;
+        self.invalidate_hl(row);
+        self.find_research();
+    }
+
+    /// Replace every non-overlapping case-insensitive occurrence of the
+    /// query with the replace text across all lines. Returns the number of
+    /// replacements; the whole batch is a single undo entry. An empty
+    /// query is a no-op returning 0.
+    pub fn replace_all(&mut self) -> usize {
+        let (q, replacement) = {
+            let Some(find) = &self.find else {
+                return 0;
+            };
+            if find.query.is_empty() {
+                return 0;
+            }
+            (find.query.to_lowercase(), find.replace.clone())
+        };
+        let qchars: Vec<char> = q.chars().collect();
+        let rchars: Vec<char> = replacement.chars().collect();
+        // Build the new lines first so a no-match run pushes no undo entry.
+        let mut count = 0;
+        let mut new_lines: Vec<String> = Vec::with_capacity(self.lines.len());
+        for line in &self.lines {
+            let lc: Vec<char> = line.to_lowercase().chars().collect();
+            let mut starts: Vec<usize> = Vec::new();
+            let mut i = 0;
+            while i + qchars.len() <= lc.len() {
+                if lc[i..i + qchars.len()] == qchars[..] {
+                    starts.push(i);
+                    i += qchars.len(); // non-overlapping
+                } else {
+                    i += 1;
+                }
+            }
+            if starts.is_empty() {
+                new_lines.push(line.clone());
+                continue;
+            }
+            let orig: Vec<char> = line.chars().collect();
+            let mut out: Vec<char> = Vec::with_capacity(orig.len());
+            let mut prev = 0;
+            for &m in &starts {
+                out.extend_from_slice(&orig[prev..m]);
+                out.extend_from_slice(&rchars);
+                prev = m + qchars.len();
+            }
+            out.extend_from_slice(&orig[prev..]);
+            new_lines.push(out.into_iter().collect());
+            count += starts.len();
+        }
+        if count > 0 {
+            self.push_undo();
+            self.lines = new_lines;
+            self.dirty = true;
+            self.invalidate_hl(0);
+        }
+        if let Some(find) = self.find.as_mut() {
+            find.replace_done = Some(count);
+        }
+        self.find_research();
+        count
+    }
+
+    /// Jump to the next (`dir` > 0) or previous (`dir` < 0) match, wrapping
+    /// around the buffer. The cursor lands on the match start, any mouse
+    /// selection is cleared, and the view scrolls so it stays visible.
+    pub fn find_jump(&mut self, dir: i8) {
+        let matches = self.find_matches();
+        let Some(find) = self.find.as_mut() else {
+            return;
+        };
+        if matches.is_empty() {
+            find.not_found = true;
+            self.find_match = None;
+            return;
+        }
+        find.not_found = false;
+        let target = if dir < 0 {
+            // Last match strictly before the cursor, else wrap to the last.
+            let mut target = matches[matches.len() - 1];
+            for &m in matches.iter().rev() {
+                if m < (self.row, self.col) {
+                    target = m;
+                    break;
+                }
+            }
+            target
+        } else {
+            // First match strictly after the cursor, else wrap to the first.
+            let mut target = matches[0];
+            for &m in &matches {
+                if m > (self.row, self.col) {
+                    target = m;
+                    break;
+                }
+            }
+            target
+        };
+        self.row = target.0;
+        self.col = target.1;
+        self.find_match = Some((target.0, target.1, target.1 + find.query.chars().count()));
+        self.sel_anchor = None;
+        self.ensure_visible();
+    }
+
+    /// Edit the find bar with one key while it is open. Returns true when the
+    /// key was consumed (the bar eats every key so none reach the document).
+    ///
+    /// Editing the query re-searches from the text cursor; editing the
+    /// replace field does not. In replace mode (Ctrl+R) Tab switches the
+    /// Find/Replace fields and Ctrl+A replaces every match (in plain find
+    /// mode Ctrl+A is eaten like any other Ctrl key — select-all only
+    /// applies with the bar closed).
+    pub fn find_input(&mut self, key: KeyEvent) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let mut query_changed = false;
+        let mut do_replace_all = false;
+        {
+            let Some(find) = self.find.as_mut() else {
+                return false;
+            };
+            match key.code {
+                // Tab switches the Find/Replace fields (replace mode only;
+                // in plain find mode Tab is eaten like today).
+                KeyCode::Tab if find.replace_mode => {
+                    find.replace_active = !find.replace_active;
+                }
+                // Ctrl+A replaces all matches (replace mode only).
+                KeyCode::Char('a') | KeyCode::Char('A') if ctrl && find.replace_mode => {
+                    do_replace_all = true;
+                }
+                KeyCode::Char(c) if !ctrl => {
+                    let is_query = find.active_is_query();
+                    {
+                        let (field, fcursor) = find.active_field();
+                        let len = field.chars().count();
+                        let at = (*fcursor).min(len);
+                        let mut chars: Vec<char> = field.chars().collect();
+                        chars.insert(at, c);
+                        *field = chars.into_iter().collect();
+                        *fcursor = at + 1;
+                    }
+                    if is_query {
+                        query_changed = true;
+                    }
+                    find.replace_done = None;
+                }
+                KeyCode::Backspace => {
+                    let is_query = find.active_is_query();
+                    let mut edited = false;
+                    {
+                        let (field, fcursor) = find.active_field();
+                        if *fcursor > 0 {
+                            let mut chars: Vec<char> = field.chars().collect();
+                            chars.remove(*fcursor - 1);
+                            *field = chars.into_iter().collect();
+                            *fcursor -= 1;
+                            edited = true;
+                        }
+                    }
+                    if edited {
+                        if is_query {
+                            query_changed = true;
+                        }
+                        find.replace_done = None;
+                    }
+                }
+                KeyCode::Delete => {
+                    let is_query = find.active_is_query();
+                    let mut edited = false;
+                    {
+                        let (field, fcursor) = find.active_field();
+                        let len = field.chars().count();
+                        if *fcursor < len {
+                            let mut chars: Vec<char> = field.chars().collect();
+                            chars.remove(*fcursor);
+                            *field = chars.into_iter().collect();
+                            edited = true;
+                        }
+                    }
+                    if edited {
+                        if is_query {
+                            query_changed = true;
+                        }
+                        find.replace_done = None;
+                    }
+                }
+                KeyCode::Left => {
+                    let is_query = find.active_is_query();
+                    {
+                        let (_, fcursor) = find.active_field();
+                        if *fcursor > 0 {
+                            *fcursor -= 1;
+                        }
+                    }
+                    if is_query {
+                        query_changed = true;
+                    }
+                }
+                KeyCode::Right => {
+                    let is_query = find.active_is_query();
+                    {
+                        let (field, fcursor) = find.active_field();
+                        let len = field.chars().count();
+                        if *fcursor < len {
+                            *fcursor += 1;
+                        }
+                    }
+                    if is_query {
+                        query_changed = true;
+                    }
+                }
+                KeyCode::Home => {
+                    let is_query = find.active_is_query();
+                    {
+                        let (_, fcursor) = find.active_field();
+                        *fcursor = 0;
+                    }
+                    if is_query {
+                        query_changed = true;
+                    }
+                }
+                KeyCode::End => {
+                    let is_query = find.active_is_query();
+                    {
+                        let (field, fcursor) = find.active_field();
+                        *fcursor = field.chars().count();
+                    }
+                    if is_query {
+                        query_changed = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if do_replace_all {
+            self.replace_all();
+        } else if query_changed {
+            self.find_research();
+        }
+        true
+    }
+
+    /// Text for the find bar. Plain find mode is unchanged: `Find: <query>
+    /// [i/N]`, the not-found form, or just `Find: ` for an empty query.
+    /// Replace mode (Ctrl+R) shows both fields — `Find: <q> → Replace: <r>
+    /// [i/N]` — with a `█` block at the active field's cursor, the same
+    /// `[i/N]` / `— not found` forms, and `— replaced {n}` after a
+    /// replace-all.
+    pub fn find_bar_text(&self) -> String {
+        let Some(find) = &self.find else {
+            return String::new();
+        };
+        if !find.replace_mode {
+            if find.query.is_empty() {
+                return "Find: ".to_string();
+            }
+            let matches = self.find_matches();
+            if matches.is_empty() {
+                return format!("Find: {} — not found", find.query);
+            }
+            return match matches.iter().position(|&m| m == (self.row, self.col)) {
+                Some(i) => format!("Find: {} [{}/{}]", find.query, i + 1, matches.len()),
+                None => format!("Find: {} [{} matches]", find.query, matches.len()),
+            };
+        }
+        let q = Self::bar_field(&find.query, find.cursor, !find.replace_active);
+        let r = Self::bar_field(&find.replace, find.rcursor, find.replace_active);
+        let mut s = format!("Find: {q} → Replace: {r}");
+        if !find.query.is_empty() {
+            let matches = self.find_matches();
+            if matches.is_empty() {
+                s.push_str(" — not found");
+            } else {
+                match matches.iter().position(|&m| m == (self.row, self.col)) {
+                    Some(i) => s.push_str(&format!(" [{}/{}]", i + 1, matches.len())),
+                    None => s.push_str(&format!(" [{} matches]", matches.len())),
+                }
+            }
+        }
+        if let Some(n) = find.replace_done {
+            s.push_str(&format!(" — replaced {n}"));
+        }
+        s
+    }
+
+    /// One find-bar field for `find_bar_text`: inserts a `█` block at the
+    /// char cursor when it is the field being edited.
+    fn bar_field(field: &str, cursor: usize, active: bool) -> String {
+        if !active {
+            return field.to_string();
+        }
+        let mut chars: Vec<char> = field.chars().collect();
+        let at = cursor.min(chars.len());
+        chars.insert(at, '█');
+        chars.into_iter().collect()
     }
 
     pub fn move_left(&mut self) {
@@ -1788,17 +2399,32 @@ impl Editor {
         let upto = upto.min(self.lines.len());
         if self.block_end.len() < upto {
             self.block_end.resize(upto, false);
+            self.style_end.resize(upto, false);
         }
         let mut state = if self.hl_valid == 0 {
             false
         } else {
             self.block_end[self.hl_valid - 1]
         };
+        let mut sstate = if self.hl_valid == 0 {
+            false
+        } else {
+            self.style_end[self.hl_valid - 1]
+        };
         let mut i = self.hl_valid;
         while i < upto {
-            let (_, end) = scan_line(&self.lines[i], self.lang, state);
-            state = end;
-            self.block_end[i] = state;
+            if self.lang == Lang::Html {
+                let (_, b, s) = scan_html_line(&self.lines[i], state, sstate);
+                state = b;
+                sstate = s;
+                self.block_end[i] = b;
+                self.style_end[i] = s;
+            } else {
+                let (_, b) = scan_line(&self.lines[i], self.lang, state);
+                state = b;
+                self.block_end[i] = b;
+                self.style_end[i] = false;
+            }
             i += 1;
         }
         self.hl_valid = upto.max(self.hl_valid);
@@ -1843,7 +2469,12 @@ impl Editor {
         let mut out = Vec::new();
         for i in first..last {
             let start_state = if i == 0 { false } else { self.block_end[i - 1] };
-            let (segs, _) = scan_line(&self.lines[i], self.lang, start_state);
+            let segs = if self.lang == Lang::Html {
+                let start_style = if i == 0 { false } else { self.style_end[i - 1] };
+                scan_html_line(&self.lines[i], start_state, start_style).0
+            } else {
+                scan_line(&self.lines[i], self.lang, start_state).0
+            };
             let spans: Vec<Span<'static>> = segs
                 .into_iter()
                 .map(|(k, s)| span_for(theme, k, s))
@@ -2014,6 +2645,66 @@ mod tests {
         let (segs, _) = scan_line("int main() {}", Lang::C, false);
         assert!(segs.iter().any(|(k, s)| *k == Tok::Keyword && s == "int"));
         assert!(segs.iter().any(|(k, s)| *k == Tok::Func && s == "main"));
+    }
+
+    #[test]
+    fn highlight_html_style_block_as_css() {
+        // One-line block: tag names keep HTML highlighting, the CSS
+        // inside scans as CSS (@media is a CSS keyword).
+        let (segs, _, in_style) = scan_html_line("<style>@media x {</style>", false, false);
+        assert!(segs.iter().any(|(k, s)| *k == Tok::Keyword && s == "style"));
+        assert!(segs
+            .iter()
+            .any(|(k, s)| *k == Tok::Keyword && s == "@media"));
+        assert!(!in_style, "closed on the same line");
+        // Multi-line: the style state carries across lines.
+        let (_, _, in_style) = scan_html_line("<style>", false, false);
+        assert!(in_style);
+        let (segs, _, in_style) = scan_html_line("@media x {", false, in_style);
+        assert!(segs
+            .iter()
+            .any(|(k, s)| *k == Tok::Keyword && s == "@media"));
+        assert!(in_style);
+        let (_, _, in_style) = scan_html_line("}", false, in_style);
+        assert!(in_style, "still inside until </style>");
+        let (segs, _, in_style) = scan_html_line("</style>", false, in_style);
+        assert!(!in_style);
+        assert!(segs.iter().any(|(k, s)| *k == Tok::Keyword && s == "style"));
+        // Case-insensitive, attributes allowed on the tag.
+        let (_, _, in_style) = scan_html_line("<STYLE type=\"text/css\">", false, false);
+        assert!(in_style);
+        // Outside the block, HTML highlighting is unchanged.
+        let (segs, _, _) = scan_html_line("<div>hi</div>", false, false);
+        assert!(segs.iter().any(|(k, s)| *k == Tok::Keyword && s == "div"));
+        assert!(!segs
+            .iter()
+            .any(|(k, s)| *k == Tok::Keyword && s == "@media"));
+        // A <style> inside an HTML comment does not toggle the state.
+        let (segs, in_block, in_style) = scan_html_line("<!-- <style>", false, false);
+        assert!(in_block);
+        assert!(!in_style);
+        assert!(segs.iter().all(|(k, _)| *k == Tok::Comment));
+        // `<stylesheet>` is not a style tag.
+        let (_, _, in_style) = scan_html_line("<stylesheet>", false, false);
+        assert!(!in_style);
+    }
+
+    #[test]
+    fn highlight_html_inline_style_attr_as_css() {
+        // The declaration scans as CSS: /* */ becomes a comment, which
+        // plain HTML highlighting would leave as normal text.
+        let (segs, _) = scan_line(r#"<p style="/* hi */ color: red">x</p>"#, Lang::Html, false);
+        assert!(segs
+            .iter()
+            .any(|(k, s)| *k == Tok::Comment && s == "/* hi */"));
+        // Other attributes are untouched.
+        let (segs, _) = scan_line(
+            r#"<p class="x" STYLE="color: red">y</p>"#,
+            Lang::Html,
+            false,
+        );
+        assert!(segs.iter().any(|(k, s)| *k == Tok::Str && s == "\"x\""));
+        assert!(!segs.iter().any(|(k, _)| *k == Tok::Comment));
     }
 
     #[test]
@@ -2414,6 +3105,338 @@ mod tests {
             .collect::<Vec<_>>()
             .join("|");
         assert_eq!(text, "aa |bb |cc");
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    // -- find -----------------------------------------------------------------
+
+    use ratatui::crossterm::event::{KeyEventKind, KeyEventState};
+
+    fn find_key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: mods,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    #[test]
+    fn find_matches_are_case_insensitive_and_char_based() {
+        let p = tmpfile("f.txt", "abc ABC\nxabc\nnothing\n".as_bytes());
+        let mut ed = Editor::open(&p).unwrap();
+        assert!(ed.find.is_none(), "bar starts closed");
+        ed.open_find();
+        assert!(ed.find.is_some());
+        assert_eq!(ed.find_bar_text(), "Find: ");
+        ed.find.as_mut().unwrap().query = "ABC".to_string();
+        // Uppercase query matches lowercase text; char-based columns.
+        assert_eq!(ed.find_matches(), vec![(0, 0), (0, 4), (1, 1)]);
+        assert!(!ed.find.as_ref().unwrap().not_found);
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn find_typing_jumps_live_and_wraps() {
+        let p = tmpfile("f.txt", "nothing here\nfoo bar\n".as_bytes());
+        let mut ed = Editor::open(&p).unwrap();
+        ed.open_find();
+        // Typing "foo" jumps live to the first match at/after the cursor,
+        // wrapping past the end of the buffer.
+        for c in "foo".chars() {
+            assert!(ed.find_input(find_key(KeyCode::Char(c), KeyModifiers::NONE)));
+        }
+        assert_eq!(ed.find.as_ref().unwrap().query, "foo");
+        assert_eq!((ed.row, ed.col), (1, 0));
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn find_jump_next_prev_wrap() {
+        let p = tmpfile("f.txt", "foo bar\nbaz foo\nfoo qux\n".as_bytes());
+        let mut ed = Editor::open(&p).unwrap();
+        ed.open_find();
+        ed.find.as_mut().unwrap().query = "foo".to_string();
+        ed.find_research();
+        assert_eq!((ed.row, ed.col), (0, 0));
+        assert_eq!(ed.find_bar_text(), "Find: foo [1/3]");
+        ed.find_jump(1);
+        assert_eq!((ed.row, ed.col), (1, 4));
+        assert_eq!(ed.find_bar_text(), "Find: foo [2/3]");
+        ed.find_jump(1);
+        assert_eq!((ed.row, ed.col), (2, 0));
+        ed.find_jump(1); // wraps around
+        assert_eq!((ed.row, ed.col), (0, 0));
+        ed.find_jump(-1); // previous wraps to the last match
+        assert_eq!((ed.row, ed.col), (2, 0));
+        ed.find_jump(-1);
+        assert_eq!((ed.row, ed.col), (1, 4));
+        // Closing the bar leaves the text cursor at the last match.
+        ed.close_find();
+        assert!(ed.find.is_none());
+        assert_eq!((ed.row, ed.col), (1, 4));
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn find_no_match_sets_not_found() {
+        let p = tmpfile("f.txt", "hello\nworld\n".as_bytes());
+        let mut ed = Editor::open(&p).unwrap();
+        ed.open_find();
+        ed.find.as_mut().unwrap().query = "zzz".to_string();
+        ed.find_jump(1);
+        assert!(ed.find.as_ref().unwrap().not_found);
+        assert_eq!(ed.find_bar_text(), "Find: zzz — not found");
+        // The cursor doesn't move when nothing matches.
+        assert_eq!((ed.row, ed.col), (0, 0));
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn find_match_range_tracks_and_clears() {
+        let p = tmpfile("f.txt", "foo bar\nbaz foo\n".as_bytes());
+        let mut ed = Editor::open(&p).unwrap();
+        assert!(ed.find_match.is_none());
+        ed.open_find();
+        assert!(ed.find_match.is_none(), "no match before typing");
+        ed.find.as_mut().unwrap().query = "foo".to_string();
+        ed.find_research();
+        assert_eq!(ed.find_match, Some((0, 0, 3)));
+        ed.find_jump(1);
+        assert_eq!(ed.find_match, Some((1, 4, 7)));
+        // No match: range cleared.
+        ed.find.as_mut().unwrap().query = "zzz".to_string();
+        ed.find_research();
+        assert!(ed.find_match.is_none());
+        // Closing the bar clears the range but keeps the text cursor.
+        ed.find.as_mut().unwrap().query = "foo".to_string();
+        ed.find_research();
+        assert!(ed.find_match.is_some());
+        let (r, c) = (ed.row, ed.col);
+        ed.close_find();
+        assert!(ed.find_match.is_none());
+        assert_eq!((ed.row, ed.col), (r, c));
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn find_input_edits_query_and_clears_selection() {
+        let p = tmpfile("f.txt", "hello\nworld hello\n".as_bytes());
+        let mut ed = Editor::open(&p).unwrap();
+        ed.open_find();
+        ed.sel_anchor = Some((0, 0)); // a mouse selection is cleared by a jump
+        for c in "hello".chars() {
+            ed.find_input(find_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(ed.find.as_ref().unwrap().query, "hello");
+        assert_eq!((ed.row, ed.col), (0, 0));
+        assert!(ed.sel_anchor.is_none(), "jumping clears the selection");
+        // Backspace edits the query (cursor moves with it); Left/Right,
+        // Home, End move the query cursor.
+        ed.find_input(find_key(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(ed.find.as_ref().unwrap().query, "hell");
+        assert_eq!(ed.find.as_ref().unwrap().cursor, 4);
+        ed.find_input(find_key(KeyCode::Left, KeyModifiers::NONE));
+        ed.find_input(find_key(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert_eq!(ed.find.as_ref().unwrap().query, "helpl");
+        ed.find_input(find_key(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(ed.find.as_ref().unwrap().cursor, 0);
+        ed.find_input(find_key(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(ed.find.as_ref().unwrap().cursor, 5);
+        // Ctrl+chars are eaten (they never reach the document).
+        assert!(ed.find_input(find_key(KeyCode::Char('s'), KeyModifiers::CONTROL)));
+        assert_eq!(ed.find.as_ref().unwrap().query, "helpl");
+        // With no bar open the key is not consumed.
+        ed.close_find();
+        assert!(!ed.find_input(find_key(KeyCode::Char('x'), KeyModifiers::NONE)));
+        assert_eq!(
+            ed.lines,
+            vec!["hello".to_string(), "world hello".to_string()]
+        );
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    // -- replace --------------------------------------------------------------
+
+    #[test]
+    fn open_replace_keeps_query_from_find_bar() {
+        let p = tmpfile("rk.txt", "foo bar\n".as_bytes());
+        let mut ed = Editor::open(&p).unwrap();
+        ed.open_find();
+        for c in "foo".chars() {
+            ed.find_input(find_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(ed.find_bar_text(), "Find: foo [1/1]");
+        // Ctrl+R switches the open bar into replace mode, keeping the query.
+        ed.open_replace();
+        let f = ed.find.as_ref().unwrap();
+        assert!(f.replace_mode);
+        assert_eq!(f.query, "foo");
+        assert_eq!(f.replace, "");
+        assert!(!f.replace_active, "Find field stays focused");
+        assert_eq!(ed.find_match, Some((0, 0, 3)), "highlight survives");
+        assert_eq!(ed.find_bar_text(), "Find: foo█ → Replace:  [1/1]");
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn replace_tab_toggles_active_field() {
+        let p = tmpfile("rt.txt", "hello\n".as_bytes());
+        let mut ed = Editor::open(&p).unwrap();
+        ed.open_replace();
+        assert!(!ed.find.as_ref().unwrap().replace_active);
+        // Tab switches to the Replace field; typing lands there and does
+        // not re-search.
+        ed.find_input(find_key(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(ed.find.as_ref().unwrap().replace_active);
+        for c in "ab".chars() {
+            ed.find_input(find_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(ed.find.as_ref().unwrap().replace, "ab");
+        assert_eq!(ed.find.as_ref().unwrap().query, "");
+        assert!(ed.find_match.is_none(), "replace edits don't search");
+        // Tab switches back; typing lands in the query and jumps live.
+        ed.find_input(find_key(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(!ed.find.as_ref().unwrap().replace_active);
+        for c in "hell".chars() {
+            ed.find_input(find_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(ed.find.as_ref().unwrap().query, "hell");
+        assert_eq!((ed.row, ed.col), (0, 0));
+        assert_eq!(ed.find_match, Some((0, 0, 4)));
+        // Backspace in the Replace field edits the replacement only.
+        ed.find_input(find_key(KeyCode::Tab, KeyModifiers::NONE));
+        ed.find_input(find_key(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(ed.find.as_ref().unwrap().replace, "a");
+        assert_eq!(ed.find.as_ref().unwrap().query, "hell");
+        // In plain find mode Tab is eaten (no field switching).
+        ed.close_find();
+        ed.open_find();
+        ed.find_input(find_key(KeyCode::Tab, KeyModifiers::NONE));
+        let f = ed.find.as_ref().unwrap();
+        assert!(!f.replace_mode && !f.replace_active && f.query.is_empty());
+        // Esc closes the bar (routed by the input layer to close_find).
+        ed.close_find();
+        assert!(ed.find.is_none());
+        assert!(ed.find_match.is_none());
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn replace_current_replaces_highlighted_match_and_advances() {
+        let p = tmpfile("r.txt", "foo bar\nfoo baz\n".as_bytes());
+        let mut ed = Editor::open(&p).unwrap();
+        ed.open_replace();
+        for c in "foo".chars() {
+            ed.find_input(find_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        ed.find_input(find_key(KeyCode::Tab, KeyModifiers::NONE));
+        for c in "qux".chars() {
+            ed.find_input(find_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(ed.find_match, Some((0, 0, 3)));
+        assert_eq!(ed.find_bar_text(), "Find: foo → Replace: qux█ [1/2]");
+        ed.replace_current();
+        assert_eq!(ed.lines, vec!["qux bar".to_string(), "foo baz".to_string()]);
+        assert!(ed.dirty, "replace marks the buffer modified");
+        // The cursor lands after the inserted text, on the next match —
+        // the replacement itself is never re-matched.
+        assert_eq!((ed.row, ed.col), (1, 0));
+        assert_eq!(ed.find_match, Some((1, 0, 3)));
+        assert_eq!(ed.find_bar_text(), "Find: foo → Replace: qux█ [1/1]");
+        // One undo entry covers the replacement.
+        assert_eq!(ed.undo.len(), 1);
+        ed.undo();
+        assert_eq!(ed.lines, vec!["foo bar".to_string(), "foo baz".to_string()]);
+        ed.undo();
+        assert_eq!(ed.message, "Nothing to undo");
+        assert_eq!(ed.lines, vec!["foo bar".to_string(), "foo baz".to_string()]);
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn replace_all_counts_and_is_single_undo() {
+        let p = tmpfile("ra.txt", "Foo bar\nfoo FOO\nnothing\n".as_bytes());
+        let mut ed = Editor::open(&p).unwrap();
+        ed.open_replace();
+        ed.find.as_mut().unwrap().query = "foo".to_string();
+        ed.find.as_mut().unwrap().replace = "x".to_string();
+        let n = ed.replace_all();
+        assert_eq!(n, 3, "case-insensitive across lines");
+        assert_eq!(
+            ed.lines,
+            vec![
+                "x bar".to_string(),
+                "x x".to_string(),
+                "nothing".to_string()
+            ]
+        );
+        assert!(ed.dirty);
+        let text = ed.find_bar_text();
+        assert!(text.contains("— not found"), "matches are gone: {text}");
+        assert!(text.contains("— replaced 3"), "count is shown: {text}");
+        // The whole batch is a single undo entry.
+        assert_eq!(ed.undo.len(), 1);
+        ed.undo();
+        assert_eq!(
+            ed.lines,
+            vec![
+                "Foo bar".to_string(),
+                "foo FOO".to_string(),
+                "nothing".to_string()
+            ]
+        );
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn replace_all_is_non_overlapping() {
+        let p = tmpfile("ro.txt", "aaaa\n".as_bytes());
+        let mut ed = Editor::open(&p).unwrap();
+        ed.open_replace();
+        ed.find.as_mut().unwrap().query = "aa".to_string();
+        ed.find.as_mut().unwrap().replace = "b".to_string();
+        assert_eq!(ed.replace_all(), 2);
+        assert_eq!(ed.lines, vec!["bb".to_string()]);
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn replace_done_clears_on_next_edit() {
+        let p = tmpfile("rd.txt", "foo foo\n".as_bytes());
+        let mut ed = Editor::open(&p).unwrap();
+        ed.open_replace();
+        ed.find.as_mut().unwrap().query = "foo".to_string();
+        ed.find.as_mut().unwrap().replace = "bar".to_string();
+        assert_eq!(ed.replace_all(), 2);
+        assert_eq!(ed.find.as_ref().unwrap().replace_done, Some(2));
+        // Editing the replacement clears the count.
+        ed.find_input(find_key(KeyCode::Tab, KeyModifiers::NONE));
+        ed.find_input(find_key(KeyCode::Char('z'), KeyModifiers::NONE));
+        assert_eq!(ed.find.as_ref().unwrap().replace, "zbar");
+        assert_eq!(ed.find.as_ref().unwrap().replace_done, None);
+        assert_eq!(ed.replace_all(), 0, "no matches left");
+        assert_eq!(ed.find.as_ref().unwrap().replace_done, Some(0));
+        // Editing the query clears it too.
+        ed.find_input(find_key(KeyCode::Tab, KeyModifiers::NONE));
+        ed.find_input(find_key(KeyCode::Char('f'), KeyModifiers::NONE));
+        assert_eq!(ed.find.as_ref().unwrap().replace_done, None);
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn replace_with_empty_query_is_noop() {
+        let p = tmpfile("re.txt", "foo\n".as_bytes());
+        let mut ed = Editor::open(&p).unwrap();
+        ed.open_replace();
+        ed.replace_current();
+        assert_eq!(ed.lines, vec!["foo".to_string()]);
+        assert!(!ed.dirty);
+        assert_eq!(ed.undo.len(), 0);
+        assert_eq!(ed.replace_all(), 0);
+        assert_eq!(ed.lines, vec!["foo".to_string()]);
+        assert!(!ed.dirty);
+        assert_eq!(ed.undo.len(), 0, "no undo entry for a no-op batch");
         std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
     }
 }

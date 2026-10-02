@@ -72,6 +72,10 @@ fn run(
         let mut dirty = ws.poll_shell();
         // Drain network discovery and worker messages too.
         dirty |= ws.poll_network();
+        // Drain finished background find-in-files (Ctrl+F) searches.
+        dirty |= ws.poll_grep();
+        // Drain finished background `git status` badge workers.
+        dirty |= ws.poll_git();
         if event::poll(Duration::from_millis(100))? {
             // Drain the whole pending burst before redrawing: a paste that
             // arrives as individual key events (no bracketed paste, e.g.

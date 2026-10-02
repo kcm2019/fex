@@ -13,16 +13,34 @@ Core requirements:
 - On exit, fully restore the terminal to its original state
 
 Additional features:
-- File operations: new file, new directory, rename, delete (with
-  confirmation), copy/cut/paste (with name-collision handling) on `Ctrl+C` /
-  `Ctrl+X` / `Ctrl+V` like any OS (`y` / `x` / `p` still work as aliases),
-  and `Y` copies the selected entry's absolute path to the system clipboard
+- File operations: new file, new directory, rename, move (a popup dialog
+  starting in the current directory), move to the system trash (`d`) or
+  permanent delete (`D`, both with confirmation),
+  copy/cut/paste (with name-collision handling) on `Ctrl+C` / `Ctrl+X` /
+  `Ctrl+V` like any OS (`y` / `x` / `p` still work as aliases), and `Y`
+  copies the selected entry's absolute path to the system clipboard
   (via `pbcopy`; `Ctrl+Shift+C` also works where the terminal reports it)
+- Multi-select: `Shift+↑` / `Shift+↓` extends a selection like a visual
+  editor (Esc clears); `y` / `x` / `m` / `d` then act on every selected
+  file, and pasting pastes all of them
 - Preview pane (off by default, `P` toggles): extracted text for PDFs, rendered markdown, text preview for
   other files, item count for directories, "[binary file]" for non-text
   (including images — thumbnails were removed as too laggy for a text
   terminal)
 - Search/filter: `/` filters the list live as you type, Esc clears
+- Find in files: `Ctrl+F` in the browser prompts for text, then searches
+  file contents under the current directory on a background thread
+  (case-insensitive, skips hidden folders like `.git`, binary files, and
+  files over 2 MB, up to 2000 hits); `Enter` re-runs with the current
+  query, or opens the selected hit in the editor at the matching line
+  once results are fresh (CSV hits open the table viewer), `Esc` exits
+- Git status badges: inside a git repository, every file and folder name
+  is prefixed with a dim letter from `git status` — `M` modified, `A`
+  staged/added, `D` deleted, `?` untracked, `R` renamed; folders show the
+  highest-priority badge among the files under them; fetched with the
+  `git` command line on a background thread (no new dependencies), so on
+  large repos badges may take a moment to appear — outside a repository
+  there are no badges
 - Sorting: cycle Name → Size → Modified → Type (Type groups folders, then
   files by extension), toggle ascending/descending; default is Modified,
   newest first
@@ -34,7 +52,10 @@ Additional features:
   `Ctrl+S` saves (`Ctrl+O` too, for terminals that grab Ctrl+S), `Esc` closes and
   asks about unsaved changes; `Ctrl+C` / `Ctrl+X` / `Ctrl+V` copy, cut, and paste
   the current line (also synced with the system clipboard via pbcopy/pbpaste);
-  syntax highlighting for Rust, Python, JS/TS, Go, C/C++, Java, C#, Ruby,
+  `Ctrl+F` finds text in the buffer (case-insensitive, live jump, Enter next,
+  Shift+Enter previous, Esc closes); `Ctrl+R` finds & replaces (Tab switches
+  the Find/Replace fields, Enter replaces the current match, Ctrl+A replaces
+  every match in one undo step, Esc closes); syntax highlighting for Rust, Python, JS/TS, Go, C/C++, Java, C#, Ruby,
   HTML, CSS, SQL, YAML, TOML, JSON, Markdown, shell (keywords, strings,
   comments, numbers, types, function calls); refuses binary
   files and files over 512 KB
@@ -83,6 +104,14 @@ Deliverable: a working binary I can run with `cargo run`
   `Ctrl+S` (or `Ctrl+O`) saves, `Esc` closes (asks if unsaved); mouse click selects cells,
   wheel scrolls. CSVs also preview as an aligned table; `C` copies preview
   CSV text.
+- **Excel viewer** (`e` on an `.xlsx`): the same table viewer on a workbook —
+  letter column headers, every row shown, sheet tab strip in the footer,
+  `[`/`]` switch sheets, formula cells pre-fill as `=formula` (keep `=` to
+  edit the formula, drop it for a plain value), date-formatted cells display
+  and accept `YYYY-MM-DD`, typed values auto-convert (number/bool/text),
+  untouched cells and formatting are preserved on save. No formula engine:
+  edited formulas show as text until Excel recalculates. `.xlsx` files are
+  NOT in the preview pane.
 - **No image thumbnails**: removed — too laggy and useless in a plain text
   terminal. Images get the generic binary preview.
 - **Themes**: Dark (purple accent, white text, no solid selection
@@ -118,10 +147,9 @@ Deliverable: a working binary I can run with `cargo run`
 - **Mouse**: click a file/folder to select it, double-click to open it
   (both views — clicking a row in an earlier Miller column jumps there);
   two clicks within 500 ms on the same cell count as a double-click.
-- **Reveal in the OS file explorer** (`o`): shows the selected file/folder
-  in Finder (`open -R` selects a file, `open` opens a folder), Explorer
-  (`/select,` highlights a file), or the default Linux file manager
-  (`xdg-open` on the folder — or the parent folder for a file).
+- **Open in the OS file explorer** (`o`): opens the selected folder — or the
+  selected file's parent folder — in Finder, Explorer, or the default
+  Linux file manager.
 - **Drives & network** (`G`): one combined page — local drives/volumes
   with free space (via `sysinfo`, tagged `removable` for USB sticks;
   `Enter` opens one as a regular browser tab), then mDNS/Bonjour
@@ -145,3 +173,35 @@ Deliverable: a working binary I can run with `cargo run`
   saves as an alternative to `Ctrl+S` (editor + CSV viewer) for terminals
   that intercept `Ctrl+S`; unbound `Ctrl`+letter combos no longer insert
   their letter into the document.
+- **Archive extraction** (`X`): extracts the selected archives (`.zip`,
+  `.7z`, `.tar`, `.tar.gz`/`.tgz`) into a new folder named after each
+  archive (unique-named if the folder exists); zip-slip protection, never
+  overwrites, refuses password-protected archives with a clear error.
+- **Browse inside archives** (`Enter` on an archive): opens a read-only
+  tab listing the archive's contents without extracting (folder rows
+  synthesized from path prefixes; tab titled `name.zip/`). `Enter`
+  descends, `←` climbs a level, `Esc` at the root closes the tab (last
+  tab reverts to a normal browser). All mutating ops refuse with
+  `Archives are read-only`; `X` extracts the selected file or folder
+  subtree next to the archive, keeping internal paths, never
+  overwriting. Read errors land on the status line instead of opening.
+- **Find match highlighting in the editor**: the current Ctrl+F match
+  renders in accent + bold (distinct from the mouse selection's reversed
+  style) while the find bar is open; no solid background.
+- **Find & replace in the editor**: `Ctrl+R` opens the find bar in replace
+  mode (`Find: <q> → Replace: <r> [i/N]`), keeping the query when switching
+  from an open Ctrl+F bar; `Tab` switches the edited field (a `█` block
+  marks the active field's cursor, and the terminal cursor sits on it),
+  `Enter` replaces the highlighted match and advances to the next one,
+  `Ctrl+A` replaces every non-overlapping case-insensitive match in a
+  single undo step and reports `— replaced {n}` (cleared on the next bar
+  edit); `Esc` closes; empty query is a no-op; the match highlight keeps
+  working untouched via the existing re-search.
+- **CSS highlighting inside HTML**: `<style>...</style>` blocks (case-
+  insensitive, multi-line) and inline `style="..."` attribute values
+  highlight as CSS; the style state is tracked per line like block
+  comments so it survives edits and scrolling.
+- **CSV/Excel viewer**: rows show 1-based numbers in a dim gutter (mouse
+  click mapping adjusted); `Ctrl+F` finds cells — case-insensitive
+  substring over cell text, live jump, `Enter` next / `Shift+Enter`
+  previous (wraps), `Esc` closes, `Find: <q> [i/N]` in the message line.

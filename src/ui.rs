@@ -2,7 +2,7 @@
 
 use crate::app::{App, InputKind, Mode, NetRow, NetState, Tab, ViewMode, Workspace};
 use crate::editor::Editor;
-use crate::fs::Preview;
+use crate::fs::{self, Entry, Preview};
 use crate::net;
 use crate::theme::Theme;
 use chrono::{DateTime, Local};
@@ -17,21 +17,6 @@ use ratatui::{
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-    let mut size = bytes as f64;
-    let mut unit = 0;
-    while size >= 1024.0 && unit < UNITS.len() - 1 {
-        size /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{size:.1} {}", UNITS[unit])
-    }
-}
-
 fn human_time(modified: Option<SystemTime>) -> String {
     match modified {
         Some(t) => {
@@ -39,6 +24,18 @@ fn human_time(modified: Option<SystemTime>) -> String {
             dt.format("%Y-%m-%d %H:%M").to_string()
         }
         None => String::from("--"),
+    }
+}
+
+/// Git status badge prefix for an entry row: a dim letter (`M` modified,
+/// `A` staged/added, `D` deleted, `?` untracked, `R` renamed), or two
+/// spaces so names stay aligned when there is no badge. A plain dim
+/// foreground — never a background, per the no-solid-backgrounds rule.
+fn git_badge_span(app: &App, entry: &Entry) -> Span<'static> {
+    let th = app.theme();
+    match app.git_badge_for(entry) {
+        Some(b) => Span::styled(format!("{b} "), Style::default().fg(th.dim)),
+        None => Span::raw("  "),
     }
 }
 
@@ -135,7 +132,11 @@ pub fn render(frame: &mut Frame, ws: &mut Workspace) {
     }
 
     render_status(frame, app, layout[2]);
-    render_footer(frame, &app.theme(), layout[3]);
+    render_footer(frame, app, layout[3]);
+
+    if app.move_dialog.is_some() {
+        render_move_dialog(frame, app, content);
+    }
 
     match app.mode {
         Mode::Input(kind) => render_input_popup(frame, app, kind, content),
@@ -220,11 +221,21 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     if app.show_hidden {
         meta.push_str("  ·  hidden: shown");
     }
+    // Archive tabs show the virtual path inside the archive, e.g.
+    // `backup.zip/docs/`, instead of the folder holding the archive.
+    let path_show = match &app.archive {
+        Some(arch) => {
+            let name = arch
+                .source
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| String::from("archive"));
+            format!("{name}/{}", arch.prefix)
+        }
+        None => app.cwd.to_string_lossy().into_owned(),
+    };
     let line = Line::from(vec![
-        Span::styled(
-            app.cwd.to_string_lossy().into_owned(),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(path_show, Style::default().add_modifier(Modifier::BOLD)),
         Span::styled(meta, Style::default().fg(th.dim)),
     ]);
     let header = Paragraph::new(line).block(Block::default().borders(Borders::ALL).title(" fex "));
@@ -248,12 +259,19 @@ fn render_list(frame: &mut Frame, app: &mut App, favs: &[PathBuf], area: Rect) {
             let size = if e.is_dir {
                 String::from("<DIR>")
             } else {
-                human_size(e.size)
+                fs::human_size(e.size)
             };
             let mut spans = Vec::new();
+            spans.push(git_badge_span(app, e));
             if favs.contains(&e.path) {
                 spans.push(Span::styled(
                     "★ ",
+                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+                ));
+            }
+            if app.multi.contains(&e.path) {
+                spans.push(Span::styled(
+                    "● ",
                     Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
                 ));
             }
@@ -490,9 +508,16 @@ fn render_column(
                 (Style::default(), e.name.clone())
             };
             let mut spans = Vec::new();
+            spans.push(git_badge_span(app, e));
             if favs.contains(&e.path) {
                 spans.push(Span::styled(
                     "★ ",
+                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+                ));
+            }
+            if app.multi.contains(&e.path) {
+                spans.push(Span::styled(
+                    "● ",
                     Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
                 ));
             }
@@ -530,6 +555,11 @@ fn render_search(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         "names"
     };
+    let hint = if app.grep_mode {
+        "   (Enter: search/jump · Esc: exit)"
+    } else {
+        "   (Tab: toggle deep · Enter: jump · Esc: exit)"
+    };
     let bar = Line::from(vec![
         Span::styled(
             format!(" Search [{mode_label}]: "),
@@ -538,10 +568,7 @@ fn render_search(frame: &mut Frame, app: &mut App, area: Rect) {
         Span::raw(left),
         Span::styled("█", Style::default().fg(th.accent)),
         Span::styled(right, Style::default().fg(th.dim)),
-        Span::styled(
-            "   (Tab: toggle deep · Enter: jump · Esc: exit)",
-            Style::default().fg(th.dim),
-        ),
+        Span::styled(hint, Style::default().fg(th.dim)),
     ]);
     frame.render_widget(
         Paragraph::new(bar).block(Block::default().borders(Borders::ALL).title(" Find ")),
@@ -650,9 +677,23 @@ fn csv_row_line(
     off_col: usize,
     selected_col: Option<usize>,
     is_header: bool,
+    gutter: usize,          // row-number gutter width (0 = no gutter)
+    row_num: Option<usize>, // 1-based row number; None = blank corner
 ) -> Line<'static> {
     let grid = grid_style(theme);
-    let mut spans = vec![Span::styled("│", grid)];
+    let mut spans = Vec::new();
+    // Row-number gutter, right-aligned in dim, mirroring the editor's
+    // line numbers. The header and separator rows get a blank corner.
+    if gutter > 0 {
+        match row_num {
+            Some(n) => spans.push(Span::styled(
+                format!("{:>width$} ", n, width = gutter),
+                Style::default().fg(theme.dim),
+            )),
+            None => spans.push(Span::raw(" ".repeat(gutter + 1))),
+        }
+    }
+    spans.push(Span::styled("│", grid));
     for (i, w) in widths.iter().enumerate().skip(off_col) {
         let cell = cells.get(i).map(|s| s.as_str()).unwrap_or("");
         let shown: String = cell.chars().take(*w).collect();
@@ -672,8 +713,14 @@ fn csv_row_line(
     Line::from(spans)
 }
 
-/// Horizontal grid separator between the header and the body (`├─┼─┤`).
-fn csv_sep_line(theme: &Theme, widths: &[usize], off_col: usize) -> Line<'static> {
+/// Horizontal grid separator between the header and the body (`├─┼─┤`),
+/// with a blank row-number gutter corner when the table shows one.
+fn csv_sep_line(theme: &Theme, widths: &[usize], off_col: usize, gutter: usize) -> Line<'static> {
+    let grid = grid_style(theme);
+    let mut spans = Vec::new();
+    if gutter > 0 {
+        spans.push(Span::raw(" ".repeat(gutter + 1)));
+    }
     let mut text = String::from("├");
     for (k, w) in widths.iter().enumerate().skip(off_col) {
         if k > off_col {
@@ -682,7 +729,8 @@ fn csv_sep_line(theme: &Theme, widths: &[usize], off_col: usize) -> Line<'static
         text.push_str(&"─".repeat(w + 2));
     }
     text.push('┤');
-    Line::from(Span::styled(text, grid_style(theme)))
+    spans.push(Span::styled(text, grid));
+    Line::from(spans)
 }
 
 fn render_sheet(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -710,6 +758,8 @@ fn render_sheet(frame: &mut Frame, app: &mut App, area: Rect) {
 
         let widths = sh.col_widths();
         let mut lines: Vec<Line> = Vec::with_capacity(sh.view_h + 1);
+        // 1-based row numbers in a dim gutter, mirroring the editor.
+        let gutter = sh.rows.len().to_string().len().max(1);
         lines.push(csv_row_line(
             &th,
             &sh.headers,
@@ -717,8 +767,10 @@ fn render_sheet(frame: &mut Frame, app: &mut App, area: Rect) {
             sh.off_col,
             None,
             true,
+            gutter,
+            None,
         ));
-        lines.push(csv_sep_line(&th, &widths, sh.off_col));
+        lines.push(csv_sep_line(&th, &widths, sh.off_col, gutter));
         for j in sh.off_row..(sh.off_row + sh.view_h).min(sh.rows.len()) {
             let sel = if j == sh.row { Some(sh.col) } else { None };
             lines.push(csv_row_line(
@@ -728,46 +780,82 @@ fn render_sheet(frame: &mut Frame, app: &mut App, area: Rect) {
                 sh.off_col,
                 sel,
                 false,
+                gutter,
+                Some(j + 1),
             ));
         }
 
+        let sheet_suffix = match sh.sheet_tabs() {
+            Some((names, active)) => format!(" › {}", names[active]),
+            None => String::new(),
+        };
         let title = format!(
-            " {} {} ",
+            " {}{} {} ",
             sh.path.display(),
+            sheet_suffix,
             if sh.dirty { "[modified]" } else { "[saved]" }
         );
         let para = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
         frame.render_widget(para, layout[0]);
 
-        let status = format!(
-            "Row {}/{} · Col {}/{} · Enter edit · Tab next · a row · A column · Ctrl+S/O save · Esc close",
+        let mut status = format!(
+            "Row {}/{} · Col {}/{} · Enter edit · Tab next · a row · A column · Ctrl+S/O save · Ctrl+F find · Esc close",
             sh.row + 1,
             sh.rows.len(),
             sh.col + 1,
             sh.ncols(),
         );
+        // xlsx: sheet tabs up front, `[`/`]` to switch.
+        if let Some((names, active)) = sh.sheet_tabs() {
+            let tabs: Vec<String> = names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| {
+                    if i == active {
+                        format!("[{n}]")
+                    } else {
+                        n.clone()
+                    }
+                })
+                .collect();
+            status = format!("{} · [ ] sheets · {status}", tabs.join(" "));
+        }
         frame.render_widget(
             Paragraph::new(status).style(Style::default().fg(th.dim)),
             layout[1],
         );
-        frame.render_widget(
-            Paragraph::new(sh.message.clone()).style(Style::default().fg(th.accent)),
-            layout[2],
-        );
-
-        // Put the real terminal cursor on the selected cell.
-        let mut cx = layout[0].x + 3; // border + │ + space
-        for (i, w) in widths.iter().enumerate() {
-            if i < sh.off_col {
-                continue;
-            }
-            if i >= sh.col {
-                break;
-            }
-            cx += *w as u16 + 3; // │ + space + content + space
+        // The find bar (Ctrl+F) takes over the message line while open.
+        if sh.find.is_some() {
+            frame.render_widget(
+                Paragraph::new(sh.find_bar_text()).style(Style::default().fg(th.accent)),
+                layout[2],
+            );
+        } else {
+            frame.render_widget(
+                Paragraph::new(sh.message.clone()).style(Style::default().fg(th.accent)),
+                layout[2],
+            );
         }
-        let cy = layout[0].y + 3 + sh.row.saturating_sub(sh.off_row) as u16; // header + separator
-        frame.set_cursor_position(Position::new(cx, cy));
+
+        // Put the real terminal cursor on the selected cell — or, while
+        // the find bar is open, in its query field.
+        if let Some(find) = &sh.find {
+            let cx = layout[2].x + "Find: ".len() as u16 + find.cursor.min(10_000) as u16;
+            frame.set_cursor_position(Position::new(cx, layout[2].y));
+        } else {
+            let mut cx = layout[0].x + 3 + (gutter + 1) as u16; // border + gutter + │ + space
+            for (i, w) in widths.iter().enumerate() {
+                if i < sh.off_col {
+                    continue;
+                }
+                if i >= sh.col {
+                    break;
+                }
+                cx += *w as u16 + 3; // │ + space + content + space
+            }
+            let cy = layout[0].y + 3 + sh.row.saturating_sub(sh.off_row) as u16; // header + separator
+            frame.set_cursor_position(Position::new(cx, cy));
+        }
     }
 
     if discard {
@@ -884,6 +972,110 @@ fn render_save_dialog(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(th.dim),
         ))),
         chunks[4],
+    );
+}
+
+/// Move-to-folder dialog: like the save dialog but with no name field —
+/// Enter moves the files into the highlighted folder.
+fn render_move_dialog(frame: &mut Frame, app: &App, area: Rect) {
+    let th = app.theme();
+    let Some(dlg) = app.move_dialog.as_ref() else {
+        return;
+    };
+    let popup = centered_rect(62, 70, area);
+    frame.render_widget(Clear, popup);
+    let title = if dlg.count == 1 {
+        String::from(" Move file ")
+    } else {
+        format!(" Move {} files ", dlg.count)
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .style(Style::default().fg(th.accent));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    // Current directory, truncated from the left when too long.
+    let cwd_s = dlg.cwd.display().to_string();
+    let w = chunks[0].width as usize;
+    let cwd_show = if cwd_s.len() > w {
+        format!("…{}", &cwd_s[cwd_s.len() - w + 1..])
+    } else {
+        cwd_s
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            cwd_show,
+            Style::default().fg(th.dim),
+        ))),
+        chunks[0],
+    );
+
+    // Directory list, kept scrolled so the selection stays visible.
+    let list_h = chunks[1].height as usize;
+    let start = if dlg.selected + 1 > list_h.max(1) {
+        dlg.selected + 1 - list_h.max(1)
+    } else {
+        0
+    };
+    let rows: Vec<Line> = dlg
+        .dirs
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(list_h)
+        .map(|(i, d)| {
+            let name = d
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| d.display().to_string());
+            let label = format!("{}/", name);
+            if i == dlg.selected {
+                Line::from(vec![
+                    Span::styled(
+                        "▸ ",
+                        Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        label,
+                        Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+                    ),
+                ])
+            } else {
+                Line::from(format!("  {}", label))
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(rows), chunks[1]);
+
+    // Message line (prompts and errors).
+    let msg_style = if dlg.message.starts_with("Cannot") {
+        Style::default().fg(th.danger)
+    } else {
+        Style::default().fg(th.accent)
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(dlg.message.clone(), msg_style))),
+        chunks[2],
+    );
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "↑↓ select · → open dir · ← up · Enter move here · Esc cancel",
+            Style::default().fg(th.dim),
+        ))),
+        chunks[3],
     );
 }
 
@@ -1037,9 +1229,25 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(app.status.as_str()).style(style), area);
 }
 
-fn render_footer(frame: &mut Frame, theme: &Theme, area: Rect) {
-    let hints = "↑↓ move · →/Enter open · ← back · / filter · f find · 1/2 list/columns · P preview · e edit · o explorer · n new · r rename · d delete · y/x/p copy/cut/paste · Y path · C preview text · s sort · . hidden · * fav · F favorites · G network · ? help · q quit";
-    let footer = Paragraph::new(hints).style(Style::default().fg(theme.dim));
+fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme();
+    // Archive tabs get their own hint line: the tab is read-only, so the
+    // mutating keys are listed as unavailable.
+    let hints = if app.archive.is_some() {
+        "↑↓ move · Enter open folder · ← back · X extract selection · Esc close tab · archives are read-only · ? help"
+    } else {
+        "↑↓ move · →/Enter open · ← back · / filter · f find · Ctrl+F find in files · 1/2 list/columns · P preview · e edit · o explorer · n new · r rename · m move · X extract · d trash · D delete · y/x/p copy/cut/paste · Y path · C preview text · s sort · . hidden · * fav · F favorites · G network · ? help · q quit"
+    };
+    let mut spans = vec![Span::styled(hints, Style::default().fg(theme.dim))];
+    if !app.multi.is_empty() {
+        spans.push(Span::styled(
+            format!(" · {} selected", app.multi.len()),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    let footer = Paragraph::new(Line::from(spans));
     frame.render_widget(footer, area);
 }
 
@@ -1092,19 +1300,37 @@ fn render_confirm_popup(frame: &mut Frame, app: &App, area: Rect) {
     let th = app.theme();
     let popup = centered_rect(50, 22, area);
     frame.render_widget(Clear, popup);
-    let name = app
-        .selected_entry()
-        .map(|e| e.name.clone())
-        .unwrap_or_default();
+    let question = if app.multi.is_empty() {
+        let name = app
+            .selected_entry()
+            .map(|e| e.name.clone())
+            .unwrap_or_default();
+        if app.confirm_is_trash {
+            format!("Move \"{name}\" to the trash?")
+        } else {
+            format!("Permanently delete \"{name}\"? This cannot be undone.")
+        }
+    } else if app.confirm_is_trash {
+        format!("Move {} selected items to the trash?", app.multi.len())
+    } else {
+        format!(
+            "Permanently delete {} selected items? This cannot be undone.",
+            app.multi.len()
+        )
+    };
     let text = vec![
-        Line::from(format!("Delete \"{name}\"?")),
+        Line::from(question),
         Line::from(""),
         Line::from(Span::styled("y: yes    n: no", Style::default().fg(th.dim))),
     ];
     let confirm = Paragraph::new(text).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Confirm delete ")
+            .title(if app.confirm_is_trash {
+                " Confirm trash "
+            } else {
+                " Confirm delete "
+            })
             .style(Style::default().fg(th.danger)),
     );
     frame.render_widget(confirm, popup);
@@ -1176,6 +1402,22 @@ fn render_editor(frame: &mut Frame, app: &mut App, area: Rect) {
                     }
                     None => w.spans,
                 };
+                // The Ctrl+F match paints in accent + bold while the find
+                // bar is open (it eats every key, so the buffer can't change
+                // underneath). Intersected with the segment like selections.
+                let spans = match ed.find_match {
+                    Some((r, s, e)) if r == w.buf_row && ed.find.is_some() => {
+                        let (ss, se) = w.seg;
+                        let a = s.clamp(ss, se);
+                        let b = e.clamp(ss, se);
+                        if a < b {
+                            apply_match(spans, a - ss, b - ss, &th)
+                        } else {
+                            spans
+                        }
+                    }
+                    _ => spans,
+                };
                 v.extend(spans);
                 Line::from(v)
             })
@@ -1194,7 +1436,7 @@ fn render_editor(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_widget(para, layout[0]);
 
         let status = format!(
-            "Ln {}, Col {} · {} lines · Ctrl+S/O save · Ctrl+Z/Y undo/redo · Shift+arrows select · Esc close",
+            "Ln {}, Col {} · {} lines · Ctrl+S/O save · Ctrl+Z/Y undo/redo · Shift+arrows select · Ctrl+F find · Ctrl+R replace · Esc close",
             ed.row + 1,
             ed.col + 1,
             ed.lines.len()
@@ -1203,17 +1445,36 @@ fn render_editor(frame: &mut Frame, app: &mut App, area: Rect) {
             Paragraph::new(status).style(Style::default().fg(th.dim)),
             layout[1],
         );
-        frame.render_widget(
-            Paragraph::new(ed.message.clone()).style(Style::default().fg(th.accent)),
-            layout[2],
-        );
+        // The find bar (Ctrl+F) takes over the message line while open.
+        if ed.find.is_some() {
+            frame.render_widget(
+                Paragraph::new(ed.find_bar_text()).style(Style::default().fg(th.accent)),
+                layout[2],
+            );
+        } else {
+            frame.render_widget(
+                Paragraph::new(ed.message.clone()).style(Style::default().fg(th.accent)),
+                layout[2],
+            );
+        }
 
         // Put the real terminal cursor on the editor cursor's visual position
-        // (a wrapped line's later segments sit on later screen rows).
-        let (vrow, vcol) = ed.cursor_visual();
-        let cx = layout[0].x + 1 + gutter_w + vcol.min(10_000) as u16;
-        let cy = layout[0].y + 1 + vrow.saturating_sub(ed.offset) as u16;
-        frame.set_cursor_position(Position::new(cx, cy));
+        // (a wrapped line's later segments sit on later screen rows) — or,
+        // while the find bar is open, on the bar's cursor glyph (the query
+        // field, or the active Find/Replace field in replace mode).
+        if let Some(find) = &ed.find {
+            let cx = if find.replace_mode {
+                layout[2].x + find.replace_cursor_offset().min(10_000) as u16
+            } else {
+                layout[2].x + "Find: ".len() as u16 + find.cursor.min(10_000) as u16
+            };
+            frame.set_cursor_position(Position::new(cx, layout[2].y));
+        } else {
+            let (vrow, vcol) = ed.cursor_visual();
+            let cx = layout[0].x + 1 + gutter_w + vcol.min(10_000) as u16;
+            let cy = layout[0].y + 1 + vrow.saturating_sub(ed.offset) as u16;
+            frame.set_cursor_position(Position::new(cx, cy));
+        }
     }
 
     if discard {
@@ -1265,6 +1526,44 @@ fn apply_selection(spans: Vec<Span<'static>>, start: usize, end: usize) -> Vec<S
             chars[a..b].iter().collect::<String>(),
             style.add_modifier(Modifier::REVERSED),
         ));
+        if b < slen {
+            out.push(Span::styled(chars[b..].iter().collect::<String>(), style));
+        }
+    }
+    out
+}
+
+/// Paint the find match over the spans overlapping [start, end): accent
+/// foreground + bold — deliberately distinct from the mouse selection's
+/// REVERSED style. Never a solid background (project rule).
+fn apply_match(
+    spans: Vec<Span<'static>>,
+    start: usize,
+    end: usize,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    let hl = Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD);
+    let mut out = Vec::with_capacity(spans.len());
+    let mut pos = 0usize;
+    for span in spans {
+        let text = span.content.clone().into_owned();
+        let slen = text.chars().count();
+        let (s0, s1) = (pos, pos + slen);
+        pos = s1;
+        if s1 <= start || s0 >= end {
+            out.push(span);
+            continue;
+        }
+        let chars: Vec<char> = text.chars().collect();
+        let a = start.max(s0) - s0;
+        let b = end.min(s1) - s0;
+        let style = span.style;
+        if a > 0 {
+            out.push(Span::styled(chars[..a].iter().collect::<String>(), style));
+        }
+        out.push(Span::styled(chars[a..b].iter().collect::<String>(), hl));
         if b < slen {
             out.push(Span::styled(chars[b..].iter().collect::<String>(), style));
         }
@@ -1359,22 +1658,47 @@ fn render_help_popup(frame: &mut Frame, ws: &Workspace, area: Rect) {
     let rows = [
         ("↑ / ↓", "move selection"),
         ("→ / Enter", "enter directory · open file in default app"),
+        (
+            "Enter on an archive",
+            "browse inside it in a new read-only tab (Enter opens folders, X extracts the selection, ← goes back, Esc closes the tab)",
+        ),
         ("← / Backspace", "parent directory"),
         ("PgUp / PgDn", "jump 10 entries"),
         ("Home / End", "first / last entry"),
+        (
+            "Shift+↑ / ↓",
+            "multi-select files (y / x / m / d act on all, Esc clears)",
+        ),
         ("/", "filter list (live, Esc clears)"),
         (
             "f",
             "search file names (Tab: deep content search, Enter: jump)",
         ),
+        (
+            "Ctrl+F",
+            "find in files: contents search on a background thread (Enter: search again / jump to the hit in the editor, Esc: exit)",
+        ),
         ("1 / 2", "list view / Miller-column view"),
         ("P", "toggle the preview pane (off by default)"),
         ("s / S", "cycle sort key · toggle direction"),
         (".", "show / hide hidden files"),
+        (
+            "git badges",
+            "inside a git repository, each entry's name shows a dim status letter — M modified · A staged/added · D deleted · ? untracked · R renamed; folders show the highest-priority badge among the files under them",
+        ),
         ("n / N", "new file / new directory"),
         ("r", "rename"),
-        ("d", "delete (asks first)"),
-        ("Ctrl+C / X / V", "copy / cut / paste (y / x / p work too)"),
+        ("m", "move the selected file(s) to another folder (popup)"),
+        (
+            "X",
+            "extract the selected archive(s) into a new folder named after each archive (inside an archive tab: extract the selected file or folder next to the archive)",
+        ),
+        ("d", "move the selection to the trash (asks first)"),
+        ("D", "permanently delete the selection (asks first)"),
+        (
+            "Ctrl+C / X / V",
+            "copy / cut / paste — act on the multi-selection too (y / x / p work too)",
+        ),
         ("Y", "copy selected path to the system clipboard"),
         ("C", "copy preview pane text to the system clipboard"),
         (
@@ -1388,7 +1712,11 @@ fn render_help_popup(frame: &mut Frame, ws: &Workspace, area: Rect) {
         ),
         (
             "e",
-            "edit file (text editor) · CSV files open the table viewer",
+            "edit file (text editor) · CSV and xlsx files open the table viewer",
+        ),
+        (
+            "Ctrl+R",
+            "find & replace in the editor: Tab switches the Find/Replace fields · Enter replaces the current match · Ctrl+A replaces every match (one undo step) · Esc closes",
         ),
         ("`", "open a terminal tab (a real shell in this folder)"),
         ("Ctrl+T", "new file-browser tab"),
@@ -1402,7 +1730,7 @@ fn render_help_popup(frame: &mut Frame, ws: &Workspace, area: Rect) {
         ),
         ("Ctrl+G then n / p", "next / previous tab"),
         ("click tab", "switch tabs with the mouse"),
-        ("o", "reveal the selected file/folder in the OS file explorer"),
+        ("o", "open the selected folder (or a file's parent folder) in the OS file explorer"),
         ("?", "this help"),
         ("q / Esc", "quit"),
         ("Ctrl+C", "quit (from dialogs)"),
@@ -1449,7 +1777,7 @@ fn render_help_popup(frame: &mut Frame, ws: &Workspace, area: Rect) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "Enter on a file opens it with the system default app. Terminal tabs run your $SHELL (PowerShell on Windows) — almost every key goes straight to it (Ctrl+C is SIGINT there); Ctrl+T / Ctrl+N / Ctrl+W / Ctrl+PgUp/PgDn / Alt+1-9 / Ctrl+G still manage tabs. Ctrl+N opens a new blank text document in its own tab; Ctrl+S on it opens a save dialog where you browse to a folder, type a name, and Enter saves (existing files ask to overwrite). In the editor: arrows/Home/End/PgUp/PgDn move · Shift+arrows (or Shift+Home/End) selects text, plain arrows collapse the selection · Ctrl+Left/Right jump by word (Ctrl+Shift+Left/Right selects by word) · type to edit · paste is instant and undoes as one step (Ctrl+Z removes the whole paste, even when the terminal delivers it character by character) · Ctrl+S/O save · Ctrl+Z/Y undo/redo (fast typing undoes as one burst) · Ctrl+A select all (Ctrl+E works too, for terminals that grab Ctrl+A) · Ctrl+C/X/V copy/cut/paste (selection, never line numbers; copies also land on the system clipboard, so Cmd+V works anywhere — the terminal itself intercepts Cmd+C, it never reaches fex) · Esc clears selection, then closes (asks if unsaved). In the CSV viewer: arrows move · Enter edits a cell · Tab next cell · a adds a row · A adds a column · Ctrl+S (or Ctrl+O) saves ·  Tabs are saved between launches: quitting brings back your browser tabs, editors (including unsaved changes), and terminal tabs (a fresh shell in the same folder). Closing a tab with Ctrl+W discards its saved state for good.Esc closes.",
+        "Enter on a file opens it with the system default app. Terminal tabs run your $SHELL (PowerShell on Windows) — almost every key goes straight to it (Ctrl+C is SIGINT there); Ctrl+T / Ctrl+N / Ctrl+W / Ctrl+PgUp/PgDn / Alt+1-9 / Ctrl+G still manage tabs. Ctrl+N opens a new blank text document in its own tab; Ctrl+S on it opens a save dialog where you browse to a folder, type a name, and Enter saves (existing files ask to overwrite). In the editor: arrows/Home/End/PgUp/PgDn move · Shift+arrows (or Shift+Home/End) selects text, plain arrows collapse the selection · Ctrl+Left/Right jump by word (Ctrl+Shift+Left/Right selects by word) · type to edit · paste is instant and undoes as one step (Ctrl+Z removes the whole paste, even when the terminal delivers it character by character) · Ctrl+S/O save · Ctrl+F find text in the buffer (live search: the current match is highlighted in the accent color, Enter next match, Shift+Enter previous, Esc close) · Ctrl+R find & replace (Tab switches the Find/Replace fields, Enter replaces the current match, Ctrl+A replaces every match in one undo step, Esc closes) · Ctrl+Z/Y undo/redo (fast typing undoes as one burst) · Ctrl+A select all (Ctrl+E works too, for terminals that grab Ctrl+A) · Ctrl+C/X/V copy/cut/paste (selection, never line numbers; copies also land on the system clipboard, so Cmd+V works anywhere — the terminal itself intercepts Cmd+C, it never reaches fex) · Esc clears selection, then closes (asks if unsaved). In the CSV viewer: rows are numbered · arrows move · Enter edits a cell · Tab next cell · a adds a row · A adds a column · Ctrl+F find a cell (live search: Enter next match, Shift+Enter previous, Esc close) · Ctrl+S (or Ctrl+O) saves · Esc closes. The Excel viewer (e on an .xlsx file) works the same, plus: [ and ] switch sheets · headers are column letters (A, B, C…) · dates show as dates · formula cells edit as =formula (keep the = to edit the formula, delete it to replace with a plain value; fex never recalculates — Excel refreshes formulas when you open the file there) ·  Tabs are saved between launches: quitting brings back your browser tabs, editors (including unsaved changes), and terminal tabs (a fresh shell in the same folder). Closing a tab with Ctrl+W discards its saved state for good.Esc closes.",
         Style::default().fg(Color::DarkGray),
     )));
     let help = Paragraph::new(lines).block(
@@ -1496,19 +1824,21 @@ mod tests {
     #[test]
     fn csv_grid_lines_render() {
         let cells = vec![String::from("a"), String::from("bb")];
-        let line = csv_row_line(&THEMES[0], &cells, &[3, 3], 0, Some(1), false);
+        let line = csv_row_line(&THEMES[0], &cells, &[3, 3], 0, Some(1), false, 2, Some(1));
         let text: String = line.spans.iter().map(|sp| sp.content.as_ref()).collect();
-        assert_eq!(text, "│ a   │ bb  │");
-        // selected cell is reversed
-        assert!(line.spans[3]
+        assert_eq!(text, " 1 │ a   │ bb  │");
+        // selected cell is reversed (spans: gutter, │, cell, │, cell, │)
+        assert!(line.spans[4]
             .style
             .add_modifier
             .contains(Modifier::REVERSED));
-        let sep = csv_sep_line(&THEMES[0], &[3, 3], 0);
+        let sep = csv_sep_line(&THEMES[0], &[3, 3], 0, 2);
         let sep_text: String = sep.spans.iter().map(|sp| sp.content.as_ref()).collect();
-        assert_eq!(sep_text, "├─────┼─────┤");
-        // header row is bold
-        let head = csv_row_line(&THEMES[0], &cells, &[3, 3], 0, None, true);
-        assert!(head.spans[1].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(sep_text, "   ├─────┼─────┤");
+        // header row is bold, with a blank gutter corner
+        let head = csv_row_line(&THEMES[0], &cells, &[3, 3], 0, None, true, 2, None);
+        let head_text: String = head.spans.iter().map(|sp| sp.content.as_ref()).collect();
+        assert_eq!(head_text, "   │ a   │ bb  │");
+        assert!(head.spans[2].style.add_modifier.contains(Modifier::BOLD));
     }
 }

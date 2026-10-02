@@ -1,8 +1,9 @@
 //! Filesystem operations: directory listing, previews, and file management.
 
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Read};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
@@ -245,20 +246,35 @@ pub fn search_names(root: &Path, query: &str) -> Vec<SearchResult> {
         .collect()
 }
 
+/// True when `path` sits inside a hidden directory (any ancestor directory
+/// under `root` whose name starts with `.`, e.g. `.git`). `root` itself is
+/// allowed to be hidden; only what lies below it is checked.
+fn in_hidden_dir(root: &Path, path: &Path) -> bool {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    let parent = rel.parent().unwrap_or_else(|| Path::new(""));
+    parent.components().any(
+        |c| matches!(c, std::path::Component::Normal(os) if os.to_string_lossy().starts_with('.')),
+    )
+}
+
 /// Case-insensitive substring search over file *contents* under `root`.
-/// Skips directories, binaries (NUL byte in the head), and oversized files.
-/// Returns at most MAX_SEARCH_RESULTS hits as path:line with a snippet.
-pub fn search_contents(root: &Path, query: &str) -> Vec<SearchResult> {
+/// Skips directories, binaries (NUL byte in the head), oversized files, and
+/// anything inside a hidden directory (`.git` and friends). Returns at most
+/// `limit` hits as path:line with a snippet.
+pub fn search_contents_limit(root: &Path, query: &str, limit: usize) -> Vec<SearchResult> {
     let needle = query.to_lowercase();
     if needle.is_empty() {
         return Vec::new();
     }
     let mut hits = Vec::new();
     'files: for entry in walk(root) {
-        if hits.len() >= MAX_SEARCH_RESULTS {
+        if hits.len() >= limit {
             break;
         }
         if entry.is_dir || entry.size > MAX_FILE_READ {
+            continue;
+        }
+        if in_hidden_dir(root, &entry.path) {
             continue;
         }
         let Ok(file) = File::open(&entry.path) else {
@@ -282,13 +298,19 @@ pub fn search_contents(root: &Path, query: &str) -> Vec<SearchResult> {
                     line_no: Some(i + 1),
                     snippet: Some(snippet),
                 });
-                if hits.len() >= MAX_SEARCH_RESULTS {
+                if hits.len() >= limit {
                     break 'files;
                 }
             }
         }
     }
     hits
+}
+
+/// Case-insensitive content search with the default 300-hit cap.
+/// See `search_contents_limit`.
+pub fn search_contents(root: &Path, query: &str) -> Vec<SearchResult> {
+    search_contents_limit(root, query, MAX_SEARCH_RESULTS)
 }
 
 /// Create an empty file inside `dir`. Errors if the name is taken.
@@ -527,42 +549,551 @@ pub fn open_with_default(path: &Path) -> io::Result<()> {
 /// (`xdg-open` opens the folder itself — or the parent folder for a file,
 /// since `xdg-open` on a file would launch its default app instead).
 pub fn reveal_in_explorer(path: &Path) -> io::Result<()> {
+    // Always open a folder: the selected directory itself, or the parent
+    // directory when a file is selected. The per-file reveal/select flags
+    // (`open -R`, `explorer /select,`) proved unreliable — on some machines
+    // they landed in the Documents folder instead of on the file.
+    let dir = if path.is_dir() {
+        path
+    } else {
+        path.parent().unwrap_or(path)
+    };
     #[cfg(target_os = "macos")]
     {
-        if path.is_dir() {
-            Command::new("open").arg(path).spawn().map(|_| ())
-        } else {
-            Command::new("open").arg("-R").arg(path).spawn().map(|_| ())
-        }
+        Command::new("open").arg(dir).spawn().map(|_| ())
     }
     #[cfg(target_os = "windows")]
     {
-        if path.is_dir() {
-            Command::new("explorer").arg(path).spawn().map(|_| ())
-        } else {
-            Command::new("explorer")
-                .arg(format!("/select,{}", path.to_string_lossy()))
-                .spawn()
-                .map(|_| ())
-        }
+        Command::new("explorer").arg(dir).spawn().map(|_| ())
     }
     #[cfg(target_os = "linux")]
     {
-        let dir = if path.is_dir() {
-            path
-        } else {
-            path.parent().unwrap_or(path)
-        };
         Command::new("xdg-open").arg(dir).spawn().map(|_| ())
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
-        let _ = path;
+        let _ = dir;
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "unsupported platform",
         ))
     }
+}
+
+// -- archive extraction -----------------------------------------------------
+
+/// Archive formats fex can extract, detected by file-name suffix.
+fn archive_kind(path: &Path) -> Option<&'static str> {
+    let name = path.file_name()?.to_str()?.to_lowercase();
+    if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+        Some("targz")
+    } else if name.ends_with(".zip") {
+        Some("zip")
+    } else if name.ends_with(".7z") {
+        Some("7z")
+    } else if name.ends_with(".tar") {
+        Some("tar")
+    } else {
+        None
+    }
+}
+
+/// True when the path names a supported archive.
+pub fn is_archive(path: &Path) -> bool {
+    archive_kind(path).is_some()
+}
+
+/// File stem without the archive suffix: "photos.tar.gz" -> "photos".
+pub fn archive_stem(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let lower = name.to_lowercase();
+    for suffix in [".tar.gz", ".tgz", ".zip", ".7z", ".tar"] {
+        if lower.ends_with(suffix) {
+            return Some(name[..name.len() - suffix.len()].to_string());
+        }
+    }
+    None
+}
+
+/// Join an archive entry path onto `dest`, rejecting absolute paths and
+/// `..` escapes (zip-slip). Returns None for unsafe entries.
+fn safe_join(dest: &Path, entry: &Path) -> Option<PathBuf> {
+    let mut out = dest.to_path_buf();
+    for comp in entry.components() {
+        match comp {
+            Component::Normal(c) => out.push(c),
+            Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Write one archive entry's bytes, never overwriting: existing files are
+/// skipped and counted.
+fn write_entry(
+    dest: &Path,
+    data: &mut dyn io::Read,
+    counts: &mut (usize, usize),
+) -> io::Result<()> {
+    if dest.exists() {
+        counts.1 += 1;
+        return Ok(());
+    }
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut f = File::create(dest)?;
+    io::copy(data, &mut f)?;
+    counts.0 += 1;
+    Ok(())
+}
+
+fn other_err(e: impl std::fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, e.to_string())
+}
+
+fn sevenz_err(e: sevenz_rust::Error) -> io::Error {
+    match &e {
+        sevenz_rust::Error::PasswordRequired | sevenz_rust::Error::MaybeBadPassword(_) => {
+            other_err("password-protected archives are not supported")
+        }
+        _ => other_err(e),
+    }
+}
+
+/// Extract an archive into `dest` (created when missing). Returns
+/// (files extracted, files skipped): existing files are never overwritten,
+/// and unsafe entries (absolute paths, `..`) are skipped rather than
+/// written. Password-protected archives fail with a readable error.
+pub fn extract_archive(src: &Path, dest: &Path) -> io::Result<(usize, usize)> {
+    extract_archive_filtered(src, dest, None)
+}
+
+/// Extract an archive into `dest` (created when missing). When `prefix`
+/// is `Some`, only entries whose normalized internal path equals it or
+/// starts with it are extracted — used to pull one file or folder out of
+/// an archive-browsing tab. Same never-overwrite / zip-slip / password
+/// rules as `extract_archive`; returns (files extracted, files skipped).
+pub fn extract_archive_filtered(
+    src: &Path,
+    dest: &Path,
+    prefix: Option<&str>,
+) -> io::Result<(usize, usize)> {
+    let kind = archive_kind(src).ok_or_else(|| {
+        other_err(format!(
+            "{} is not a supported archive",
+            src.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ))
+    })?;
+    fs::create_dir_all(dest)?;
+    let mut counts = (0usize, 0usize);
+    match kind {
+        "zip" => {
+            let mut archive = zip::ZipArchive::new(File::open(src)?).map_err(other_err)?;
+            for i in 0..archive.len() {
+                let mut entry = archive.by_index(i).map_err(other_err)?;
+                if entry.encrypted() {
+                    return Err(other_err("password-protected archives are not supported"));
+                }
+                let name = match entry.enclosed_name() {
+                    Some(n) => n,
+                    None => {
+                        counts.1 += 1;
+                        continue;
+                    }
+                };
+                if !match entry_wanted(&name.to_string_lossy(), prefix) {
+                    None => {
+                        counts.1 += 1;
+                        continue;
+                    }
+                    Some(wanted) => wanted,
+                } {
+                    continue;
+                }
+                let out = match safe_join(dest, &name) {
+                    Some(p) => p,
+                    None => {
+                        counts.1 += 1;
+                        continue;
+                    }
+                };
+                if entry.is_dir() {
+                    if !out.exists() {
+                        fs::create_dir_all(&out)?;
+                    }
+                    continue;
+                }
+                write_entry(&out, &mut entry, &mut counts)?;
+            }
+        }
+        "7z" => {
+            let mut reader = sevenz_rust::SevenZReader::open(src, sevenz_rust::Password::empty())
+                .map_err(sevenz_err)?;
+            reader
+                .for_each_entries(|entry, data| {
+                    if !match entry_wanted(entry.name(), prefix) {
+                        None => {
+                            counts.1 += 1;
+                            return Ok(true);
+                        }
+                        Some(wanted) => wanted,
+                    } {
+                        return Ok(true);
+                    }
+                    let out = match safe_join(dest, Path::new(entry.name())) {
+                        Some(p) => p,
+                        None => {
+                            counts.1 += 1;
+                            return Ok(true);
+                        }
+                    };
+                    if entry.is_directory() {
+                        if !out.exists() {
+                            fs::create_dir_all(&out).map_err(sevenz_rust::Error::from)?;
+                        }
+                        return Ok(true);
+                    }
+                    write_entry(&out, data, &mut counts).map_err(sevenz_rust::Error::from)?;
+                    Ok(true)
+                })
+                .map_err(sevenz_err)?;
+        }
+        _ => {
+            // "tar" and "targz"
+            let file = File::open(src)?;
+            if kind == "targz" {
+                extract_tar(
+                    tar::Archive::new(flate2::read::GzDecoder::new(file)),
+                    dest,
+                    &mut counts,
+                    prefix,
+                )?;
+            } else {
+                extract_tar(tar::Archive::new(file), dest, &mut counts, prefix)?;
+            }
+        }
+    }
+    Ok(counts)
+}
+
+/// Classify a raw archive entry name against the optional `prefix`
+/// filter. With no filter every entry is wanted (the existing
+/// safe_join/enclosed_name paths still reject unsafe entries exactly as
+/// before). With a filter, names are normalized the same way as
+/// `archive_entries`; None marks unsafe entries, which callers count as
+/// skipped.
+fn entry_wanted(raw_name: &str, prefix: Option<&str>) -> Option<bool> {
+    let Some(p) = prefix else {
+        return Some(true);
+    };
+    let name = normalize_entry_name(raw_name)?;
+    Some(name == p || name.starts_with(p))
+}
+
+fn extract_tar<R: io::Read>(
+    mut archive: tar::Archive<R>,
+    dest: &Path,
+    counts: &mut (usize, usize),
+    prefix: Option<&str>,
+) -> io::Result<()> {
+    for entry in archive.entries().map_err(other_err)? {
+        let mut entry = entry.map_err(other_err)?;
+        let path: PathBuf = entry.path().map_err(other_err)?.into_owned();
+        if !match entry_wanted(&path.to_string_lossy(), prefix) {
+            None => {
+                counts.1 += 1;
+                continue;
+            }
+            Some(wanted) => wanted,
+        } {
+            continue;
+        }
+        let out = match safe_join(dest, &path) {
+            Some(p) => p,
+            None => {
+                counts.1 += 1;
+                continue;
+            }
+        };
+        let ty = entry.header().entry_type();
+        if ty.is_dir() {
+            if !out.exists() {
+                fs::create_dir_all(&out)?;
+            }
+        } else if ty.is_file() {
+            write_entry(&out, &mut entry, counts)?;
+        } else {
+            // Symlinks, devices, etc.: skip rather than recreate.
+            counts.1 += 1;
+        }
+    }
+    Ok(())
+}
+
+// -- archive listing ---------------------------------------------------------
+
+/// One entry inside an archive. `path` is the internal path with `/`
+/// separators (no leading `./`, no `..`, never absolute).
+#[derive(Debug, Clone)]
+pub struct ArchEntry {
+    pub path: String,
+    pub is_dir: bool,
+    pub size: u64,
+}
+
+/// Normalize an archive entry name: backslashes become `/`, a leading
+/// `./` is stripped, a trailing `/` is dropped. Returns None for unsafe
+/// entries (absolute paths or `..` components) — the same zip-slip rule
+/// as `safe_join`.
+fn normalize_entry_name(raw: &str) -> Option<String> {
+    let mut s = raw.replace('\\', "/");
+    while let Some(rest) = s.strip_prefix("./") {
+        s = rest.to_string();
+    }
+    while s.ends_with('/') && s.len() > 1 {
+        s.pop();
+    }
+    if s.is_empty() {
+        return None;
+    }
+    let p = Path::new(&s);
+    if p.is_absolute()
+        || p.components()
+            .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
+    {
+        return None;
+    }
+    Some(s)
+}
+
+/// List the entries of an archive without extracting it. Unsafe entries
+/// (absolute paths, `..`) are skipped. Password-protected archives fail
+/// with a readable error.
+pub fn archive_entries(src: &Path) -> io::Result<Vec<ArchEntry>> {
+    let kind = archive_kind(src).ok_or_else(|| {
+        other_err(format!(
+            "{} is not a supported archive",
+            src.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ))
+    })?;
+    let mut out = Vec::new();
+    match kind {
+        "zip" => {
+            let mut archive = zip::ZipArchive::new(File::open(src)?).map_err(other_err)?;
+            for i in 0..archive.len() {
+                let entry = archive.by_index(i).map_err(other_err)?;
+                if entry.encrypted() {
+                    return Err(other_err("password-protected archives are not supported"));
+                }
+                let (name, is_dir, size) = (entry.name().to_owned(), entry.is_dir(), entry.size());
+                if let Some(path) = normalize_entry_name(&name) {
+                    out.push(ArchEntry { path, is_dir, size });
+                }
+            }
+        }
+        "7z" => {
+            let reader = sevenz_rust::SevenZReader::open(src, sevenz_rust::Password::empty())
+                .map_err(sevenz_err)?;
+            for entry in &reader.archive().files {
+                if let Some(path) = normalize_entry_name(entry.name()) {
+                    out.push(ArchEntry {
+                        path,
+                        is_dir: entry.is_directory(),
+                        size: entry.size(),
+                    });
+                }
+            }
+        }
+        _ => {
+            // "tar" and "targz"
+            let file = File::open(src)?;
+            if kind == "targz" {
+                list_tar(
+                    tar::Archive::new(flate2::read::GzDecoder::new(file)),
+                    &mut out,
+                )?;
+            } else {
+                list_tar(tar::Archive::new(file), &mut out)?;
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn list_tar<R: io::Read>(mut archive: tar::Archive<R>, out: &mut Vec<ArchEntry>) -> io::Result<()> {
+    for entry in archive.entries().map_err(other_err)? {
+        let entry = entry.map_err(other_err)?;
+        let raw = entry
+            .path()
+            .map_err(other_err)?
+            .to_string_lossy()
+            .into_owned();
+        let ty = entry.header().entry_type();
+        if !(ty.is_file() || ty.is_dir()) {
+            continue; // symlinks, devices, etc.
+        }
+        if let Some(path) = normalize_entry_name(&raw) {
+            out.push(ArchEntry {
+                path,
+                is_dir: ty.is_dir(),
+                size: entry.size(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Byte counts as "1.5 MB" etc., for the list and previews.
+pub fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
+}
+
+/// Priority of git status badges, highest first: renamed > deleted >
+/// staged > modified > untracked.
+fn git_badge_rank(b: char) -> u8 {
+    match b {
+        'R' => 4,
+        'D' => 3,
+        'A' => 2,
+        'M' => 1,
+        _ => 0, // '?'
+    }
+}
+
+/// Map one `git status --porcelain=v1` X/Y code pair to a badge letter.
+/// `R` renamed, `D` deleted, `A` staged/added, `M` modified (or unmerged),
+/// `?` untracked. Ignored files and clean entries get no badge.
+fn git_badge_for_codes(x: char, y: char) -> Option<char> {
+    if x == 'R' || y == 'R' {
+        Some('R')
+    } else if x == 'D' || y == 'D' {
+        Some('D')
+    } else if x == 'M' || x == 'A' || x == 'T' {
+        Some('A')
+    } else if y == 'M' || y == 'T' || x == 'U' || y == 'U' {
+        Some('M')
+    } else if x == '?' {
+        Some('?')
+    } else {
+        None
+    }
+}
+
+/// Parse `git status --porcelain=v1 -z --untracked-files=normal` output
+/// (NUL-separated records) into repo-relative path -> badge letter.
+///
+/// Each record starts with the X (index) and Y (worktree) status codes and
+/// the repo-relative path. Rename records carry a second path record (the
+/// old name); the badge is attributed to the new (first) path. Directory
+/// badges are aggregated: every ancestor directory of a badged path gets
+/// the highest-priority badge among its descendants, so folders show
+/// something in the list even when only files inside them changed.
+pub fn parse_git_porcelain(z: &str) -> HashMap<String, char> {
+    let mut badges = HashMap::new();
+    let records: Vec<&str> = z.split('\0').collect();
+    let mut i = 0;
+    while i < records.len() {
+        let rec = records[i];
+        i += 1;
+        let mut chars = rec.chars();
+        let (Some(x), Some(y)) = (chars.next(), chars.next()) else {
+            continue;
+        };
+        // Renames carry the old path as a second NUL-separated record;
+        // the new path is the one in this record. Consume it either way.
+        let is_rename = x == 'R' || y == 'R';
+        if is_rename && i < records.len() {
+            i += 1;
+        }
+        let Some(path) = rec.get(3..) else { continue };
+        if path.is_empty() {
+            continue;
+        }
+        let Some(badge) = git_badge_for_codes(x, y) else {
+            continue;
+        };
+        insert_badge(&mut badges, path, badge);
+    }
+    badges
+}
+
+/// Insert a file badge and propagate it to every ancestor directory,
+/// keeping the highest-priority badge per directory.
+fn insert_badge(map: &mut HashMap<String, char>, path: &str, badge: char) {
+    if let Some(prev) = map.get(path) {
+        if git_badge_rank(*prev) >= git_badge_rank(badge) {
+            return;
+        }
+    }
+    map.insert(path.to_string(), badge);
+    // Walk ancestor dirs ("src/foo/bar.txt" -> "src/foo", "src").
+    let mut rest = path;
+    while let Some(idx) = rest.rfind('/') {
+        rest = &rest[..idx];
+        if rest.is_empty() {
+            break;
+        }
+        match map.get(rest) {
+            Some(prev) if git_badge_rank(*prev) >= git_badge_rank(badge) => {}
+            _ => {
+                map.insert(rest.to_string(), badge);
+            }
+        }
+    }
+}
+
+/// Git status badges for the repository containing `dir`.
+///
+/// Runs `git status` on a background thread's behalf (the caller spawns
+/// it) so the UI never blocks. Returns `(repo_root, badges)` where badges
+/// maps repo-relative `/`-separated paths (files and aggregated
+/// directories) to one of `M` `A` `D` `?` `R`. Returns `None` when `git`
+/// is missing, fails, or `dir` isn't in a repository — callers show no
+/// badges, silently.
+pub fn git_badges(dir: &Path) -> Option<(PathBuf, HashMap<String, char>)> {
+    let top = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .arg("rev-parse")
+        .arg("--show-toplevel")
+        .output()
+        .ok()?;
+    if !top.status.success() {
+        return None;
+    }
+    let root = PathBuf::from(String::from_utf8(top.stdout).ok()?.trim());
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .arg("--no-optional-locks")
+        .arg("status")
+        .arg("--porcelain=v1")
+        .arg("-z")
+        .arg("--untracked-files=normal")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let z = String::from_utf8_lossy(&out.stdout);
+    Some((root, parse_git_porcelain(&z)))
 }
 
 #[cfg(test)]
@@ -742,6 +1273,44 @@ mod tests {
     }
 
     #[test]
+    fn search_contents_limit_filters_and_caps() {
+        let dir = tmpdir("gref");
+        fs::write(dir.join("a.txt"), "Alpha here\nsecond line\n").unwrap();
+        fs::write(dir.join("b.txt"), "ALPHA again\n").unwrap();
+        // Hidden dirs are skipped entirely.
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        fs::write(dir.join(".git").join("config"), "alpha secret\n").unwrap();
+        fs::create_dir_all(dir.join("sub").join(".hidden")).unwrap();
+        fs::write(
+            dir.join("sub").join(".hidden").join("x.txt"),
+            "alpha buried\n",
+        )
+        .unwrap();
+        // Binary (NUL byte) is skipped.
+        fs::write(dir.join("blob.bin"), [b'a', b'l', b'p', b'h', b'a', 0u8]).unwrap();
+
+        let hits = search_contents_limit(&dir, "alpha", 2000);
+        assert_eq!(hits.len(), 2, "only a.txt and b.txt hit");
+        for h in &hits {
+            let p = h.path.to_string_lossy();
+            assert!(!p.contains(".git"), "no hits from .git: {p}");
+            assert!(!p.contains(".hidden"), "no hits from .hidden: {p}");
+            assert!(!p.ends_with(".bin"), "no hits from binaries: {p}");
+            assert!(h.line_no.is_some() && h.snippet.is_some());
+        }
+
+        // Case-insensitive: same result for a differently-cased query.
+        assert_eq!(search_contents_limit(&dir, "ALPHA", 2000).len(), 2);
+
+        // The limit is respected.
+        assert_eq!(search_contents_limit(&dir, "alpha", 1).len(), 1);
+        assert_eq!(search_contents_limit(&dir, "alpha", 0).len(), 0);
+        assert!(search_contents_limit(&dir, "", 2000).is_empty());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn list_dir_marks_hidden_and_dirs() {
         let dir = tmpdir("list");
         fs::create_dir(dir.join("mydir")).unwrap();
@@ -752,5 +1321,357 @@ mod tests {
         let h = entries.iter().find(|e| e.name == ".hidden").unwrap();
         assert!(!h.is_dir && h.is_hidden);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // -- archive extraction -------------------------------------------------
+
+    fn write_zip(path: &Path, entries: &[(&str, &[u8])]) {
+        let f = File::create(path).unwrap();
+        let mut w = zip::ZipWriter::new(f);
+        let opts = zip::write::SimpleFileOptions::default();
+        for (name, data) in entries {
+            w.start_file(*name, opts).unwrap();
+            use std::io::Write as _;
+            w.write_all(data).unwrap();
+        }
+        w.finish().unwrap();
+    }
+
+    fn write_targz(path: &Path, entries: &[(&str, &[u8])]) {
+        let f = File::create(path).unwrap();
+        let enc = flate2::write::GzEncoder::new(f, flate2::Compression::fast());
+        let mut b = tar::Builder::new(enc);
+        for (name, data) in entries {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(data.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append_data(&mut h, name, *data).unwrap();
+        }
+        b.into_inner().unwrap().finish().unwrap();
+    }
+
+    #[test]
+    fn archive_kind_and_stem() {
+        assert!(is_archive(Path::new("a.zip")));
+        assert!(is_archive(Path::new("a.7z")));
+        assert!(is_archive(Path::new("a.tar")));
+        assert!(is_archive(Path::new("a.tar.gz")));
+        assert!(is_archive(Path::new("a.tgz")));
+        assert!(is_archive(Path::new("A.ZIP")));
+        assert!(!is_archive(Path::new("a.txt")));
+        assert!(!is_archive(Path::new("azip")));
+        assert_eq!(
+            archive_stem(Path::new("photos.zip")).as_deref(),
+            Some("photos")
+        );
+        assert_eq!(
+            archive_stem(Path::new("photos.tar.gz")).as_deref(),
+            Some("photos")
+        );
+        assert_eq!(archive_stem(Path::new("a.tgz")).as_deref(), Some("a"));
+        assert_eq!(archive_stem(Path::new("a.7z")).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn extract_zip_roundtrip() {
+        let dir = tmpdir("xzip");
+        let src = dir.join("bundle.zip");
+        write_zip(
+            &src,
+            &[
+                ("a.txt", b"hello"),
+                ("sub/b.txt", b"world"),
+                ("sub/deep/c.txt", b"!"),
+            ],
+        );
+        let dest = dir.join("out");
+        let (extracted, skipped) = extract_archive(&src, &dest).unwrap();
+        assert_eq!((extracted, skipped), (3, 0));
+        assert_eq!(fs::read_to_string(dest.join("a.txt")).unwrap(), "hello");
+        assert_eq!(fs::read_to_string(dest.join("sub/b.txt")).unwrap(), "world");
+        assert_eq!(
+            fs::read_to_string(dest.join("sub/deep/c.txt")).unwrap(),
+            "!"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn extract_targz_roundtrip() {
+        let dir = tmpdir("xtgz");
+        let src = dir.join("bundle.tar.gz");
+        write_targz(&src, &[("a.txt", b"hello"), ("sub/b.txt", b"world")]);
+        let dest = dir.join("out");
+        let (extracted, skipped) = extract_archive(&src, &dest).unwrap();
+        assert_eq!((extracted, skipped), (2, 0));
+        assert_eq!(fs::read_to_string(dest.join("a.txt")).unwrap(), "hello");
+        assert_eq!(fs::read_to_string(dest.join("sub/b.txt")).unwrap(), "world");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn extract_7z_roundtrip() {
+        let dir = tmpdir("x7z");
+        let srcdir = dir.join("srcdir");
+        fs::create_dir_all(srcdir.join("sub")).unwrap();
+        fs::write(srcdir.join("a.txt"), "hello").unwrap();
+        fs::write(srcdir.join("sub/b.txt"), "world").unwrap();
+        let src = dir.join("bundle.7z");
+        sevenz_rust::compress_to_path(&srcdir, &src).unwrap();
+        let dest = dir.join("out");
+        let (extracted, skipped) = extract_archive(&src, &dest).unwrap();
+        assert_eq!((extracted, skipped), (2, 0));
+        assert_eq!(fs::read_to_string(dest.join("a.txt")).unwrap(), "hello");
+        assert_eq!(fs::read_to_string(dest.join("sub/b.txt")).unwrap(), "world");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn extract_never_overwrites() {
+        let dir = tmpdir("xskip");
+        let src = dir.join("b.zip");
+        write_zip(&src, &[("a.txt", b"new"), ("c.txt", b"fresh")]);
+        let dest = dir.join("out");
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(dest.join("a.txt"), "original").unwrap();
+        let (extracted, skipped) = extract_archive(&src, &dest).unwrap();
+        assert_eq!((extracted, skipped), (1, 1));
+        assert_eq!(
+            fs::read_to_string(dest.join("a.txt")).unwrap(),
+            "original",
+            "existing file must not be overwritten"
+        );
+        assert_eq!(fs::read_to_string(dest.join("c.txt")).unwrap(), "fresh");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn extract_rejects_dotdot_entries() {
+        let dir = tmpdir("xslip");
+        let src = dir.join("evil.zip");
+        write_zip(&src, &[("../evil.txt", b"pwned"), ("ok.txt", b"fine")]);
+        let dest = dir.join("out");
+        let (extracted, skipped) = extract_archive(&src, &dest).unwrap();
+        assert_eq!((extracted, skipped), (1, 1));
+        assert!(!dir.join("evil.txt").exists(), "zip-slip must not escape");
+        assert_eq!(fs::read_to_string(dest.join("ok.txt")).unwrap(), "fine");
+
+        // Same for tar: poke the name field past the crate's own `..` guard
+        // so the fixture really is hostile.
+        let tsrc = dir.join("evil.tar");
+        let f = File::create(&tsrc).unwrap();
+        let mut b = tar::Builder::new(f);
+        let mut h = tar::Header::new_gnu();
+        let data = b"pwned";
+        h.set_size(data.len() as u64);
+        h.set_mode(0o644);
+        {
+            let raw = h.as_mut_bytes();
+            let name = b"../evil2.txt";
+            raw[..name.len()].copy_from_slice(name);
+        }
+        h.set_cksum();
+        b.append(&h, &data[..]).unwrap();
+        let mut h2 = tar::Header::new_gnu();
+        let data2 = b"fine";
+        h2.set_size(data2.len() as u64);
+        h2.set_mode(0o644);
+        h2.set_cksum();
+        b.append_data(&mut h2, "ok2.txt", &data2[..]).unwrap();
+        b.into_inner().unwrap();
+        let dest2 = dir.join("out2");
+        let (extracted, skipped) = extract_archive(&tsrc, &dest2).unwrap();
+        assert_eq!((extracted, skipped), (1, 1));
+        assert!(!dir.join("evil2.txt").exists(), "tar-slip must not escape");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn extract_password_protected_7z_fails_cleanly() {
+        let dir = tmpdir("xpass");
+        let srcdir = dir.join("srcdir");
+        fs::create_dir_all(&srcdir).unwrap();
+        fs::write(srcdir.join("a.txt"), "secret").unwrap();
+        let src = dir.join("locked.7z");
+        sevenz_rust::compress_to_path_encrypted(
+            &srcdir,
+            &src,
+            sevenz_rust::Password::from("hunter2"),
+        )
+        .unwrap();
+        let dest = dir.join("out");
+        match extract_archive(&src, &dest) {
+            Ok(_) => panic!("expected a password error"),
+            Err(e) => assert!(
+                e.to_string().contains("password-protected"),
+                "unexpected error: {e}"
+            ),
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn extract_unsupported_is_an_error() {
+        let dir = tmpdir("xbad");
+        let src = dir.join("a.txt");
+        fs::write(&src, "not an archive").unwrap();
+        assert!(extract_archive(&src, &dir.join("out")).is_err());
+        assert!(!is_archive(&src));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // -- archive listing ----------------------------------------------------
+
+    fn entry_paths(entries: &[ArchEntry]) -> Vec<String> {
+        let mut v: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn archive_entries_zip_lists_nested_and_skips_unsafe() {
+        let dir = tmpdir("xlist");
+        let src = dir.join("nested.zip");
+        write_zip(
+            &src,
+            &[
+                ("top.txt", b"top"),
+                ("docs/a.txt", b"a"),
+                ("docs/sub/b.txt", b"b"),
+                ("./dot.txt", b"dot"),
+                ("../evil.txt", b"pwned"),
+                ("/abs.txt", b"nope"),
+            ],
+        );
+        let entries = archive_entries(&src).unwrap();
+        assert_eq!(
+            entry_paths(&entries),
+            vec!["docs/a.txt", "docs/sub/b.txt", "dot.txt", "top.txt"],
+            "unsafe entries must be skipped, ./ stripped"
+        );
+        let a = entries.iter().find(|e| e.path == "docs/a.txt").unwrap();
+        assert!(!a.is_dir && a.size == 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn archive_entries_targz_lists_and_skips_unsafe() {
+        let dir = tmpdir("xtlist");
+        let src = dir.join("nested.tar.gz");
+        let f = File::create(&src).unwrap();
+        let enc = flate2::write::GzEncoder::new(f, flate2::Compression::default());
+        let mut b = tar::Builder::new(enc);
+        let mut h1 = tar::Header::new_gnu();
+        h1.set_size(1);
+        h1.set_mode(0o644);
+        h1.set_cksum();
+        b.append_data(&mut h1, "x/one.txt", &b"1"[..]).unwrap();
+        let mut h2 = tar::Header::new_gnu();
+        h2.set_size(2);
+        h2.set_mode(0o644);
+        h2.set_cksum();
+        b.append_data(&mut h2, "x/y/two.txt", &b"22"[..]).unwrap();
+        b.into_inner().unwrap().finish().unwrap();
+        let entries = archive_entries(&src).unwrap();
+        assert_eq!(entry_paths(&entries), vec!["x/one.txt", "x/y/two.txt"]);
+        let two = entries.iter().find(|e| e.path == "x/y/two.txt").unwrap();
+        assert_eq!(two.size, 2);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn archive_entries_7z_lists_nested() {
+        let dir = tmpdir("x7list");
+        let srcdir = dir.join("srcdir");
+        fs::create_dir_all(srcdir.join("sub")).unwrap();
+        fs::write(srcdir.join("a.txt"), "a").unwrap();
+        fs::write(srcdir.join("sub").join("b.txt"), "bb").unwrap();
+        let src = dir.join("nested.7z");
+        sevenz_rust::compress_to_path(&srcdir, &src).unwrap();
+        let entries = archive_entries(&src).unwrap();
+        let paths = entry_paths(&entries);
+        assert!(
+            paths.iter().any(|p| p.ends_with("a.txt")),
+            "missing a.txt in {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.ends_with("sub/b.txt")),
+            "missing sub/b.txt in {paths:?}"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn extract_filtered_extracts_only_the_prefix() {
+        let dir = tmpdir("xfilt");
+        let src = dir.join("sel.zip");
+        write_zip(
+            &src,
+            &[
+                ("keep.txt", b"keep"),
+                ("docs/a.txt", b"a"),
+                ("docs/sub/b.txt", b"b"),
+                ("other/c.txt", b"c"),
+            ],
+        );
+        // One file.
+        let d1 = dir.join("one");
+        let (e, s) = extract_archive_filtered(&src, &d1, Some("keep.txt")).unwrap();
+        assert_eq!((e, s), (1, 0));
+        assert_eq!(fs::read_to_string(d1.join("keep.txt")).unwrap(), "keep");
+        assert!(!d1.join("docs").exists());
+        // One folder subtree, paths kept relative to the archive root.
+        let d2 = dir.join("sub");
+        let (e, s) = extract_archive_filtered(&src, &d2, Some("docs/")).unwrap();
+        assert_eq!((e, s), (2, 0));
+        assert_eq!(fs::read_to_string(d2.join("docs/a.txt")).unwrap(), "a");
+        assert_eq!(fs::read_to_string(d2.join("docs/sub/b.txt")).unwrap(), "b");
+        assert!(!d2.join("other").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn parse_git_porcelain_maps_all_status_codes() {
+        let z = "?? untracked.txt\0M  staged_mod.txt\0 M worktree_mod.txt\0A  added.txt\0T  typechg.txt\0 D deleted_wt.txt\0D  deleted_idx.txt\0UU conflict.txt\0!! ignored.txt\0";
+        let b = parse_git_porcelain(z);
+        assert_eq!(b.get("untracked.txt"), Some(&'?'));
+        assert_eq!(b.get("staged_mod.txt"), Some(&'A'));
+        assert_eq!(b.get("worktree_mod.txt"), Some(&'M'));
+        assert_eq!(b.get("added.txt"), Some(&'A'));
+        assert_eq!(b.get("typechg.txt"), Some(&'A'));
+        assert_eq!(b.get("deleted_wt.txt"), Some(&'D'));
+        assert_eq!(b.get("deleted_idx.txt"), Some(&'D'));
+        assert_eq!(b.get("conflict.txt"), Some(&'M'));
+        assert!(!b.contains_key("ignored.txt"));
+    }
+
+    #[test]
+    fn parse_git_porcelain_rename_consumes_both_paths() {
+        // Real -z output puts the NEW path first, the old path second.
+        let z = "R  new.txt\0old.txt\0 M other.txt\0";
+        let b = parse_git_porcelain(z);
+        assert_eq!(b.get("new.txt"), Some(&'R'));
+        assert!(!b.contains_key("old.txt"));
+        assert_eq!(b.get("other.txt"), Some(&'M'));
+    }
+
+    #[test]
+    fn parse_git_porcelain_aggregates_directory_badges() {
+        let z = " M src/a.txt\0A  src/sub/b.txt\0?? other/c.txt\0";
+        let b = parse_git_porcelain(z);
+        assert_eq!(b.get("src/a.txt"), Some(&'M'));
+        assert_eq!(b.get("src/sub/b.txt"), Some(&'A'));
+        // Highest priority among descendants wins: A (staged) beats M.
+        assert_eq!(b.get("src"), Some(&'A'));
+        assert_eq!(b.get("src/sub"), Some(&'A'));
+        assert_eq!(b.get("other"), Some(&'?'));
+        assert_eq!(b.get("other/c.txt"), Some(&'?'));
+    }
+
+    #[test]
+    fn parse_git_porcelain_empty_and_garbage() {
+        assert!(parse_git_porcelain("").is_empty());
+        assert!(parse_git_porcelain("\0\0").is_empty());
     }
 }
