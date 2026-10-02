@@ -1,6 +1,8 @@
 //! Keyboard input handling, dispatched by UI mode.
 
-use crate::app::{App, InputKind, Mode, NetState, Tab, ViewMode, Workspace};
+use crate::app::{
+    App, InputKind, Mode, NetState, Tab, ViewMode, Workspace, HELP_TABS, HELP_TAB_ACCESSIBILITY,
+};
 use crate::fs;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use std::path::PathBuf;
@@ -8,6 +10,13 @@ use std::time::{Duration, Instant};
 
 /// Two left-clicks this close together (same cell) count as a double-click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(500);
+
+/// True when the active browser tab has the `?` help open on the
+/// Accessibility tab.
+fn on_accessibility_tab(ws: &Workspace) -> bool {
+    ws.active_browser()
+        .is_some_and(|a| a.mode == Mode::Help && a.help_tab == HELP_TAB_ACCESSIBILITY)
+}
 
 pub fn handle_key(ws: &mut Workspace, mut key: KeyEvent) {
     // The favorites popup is modal: it eats every key while open.
@@ -20,8 +29,41 @@ pub fn handle_key(ws: &mut Workspace, mut key: KeyEvent) {
     if ws.handle_tab_key(key) {
         return;
     }
-    // In a shell tab, everything else is terminal input.
+    // In a shell tab, everything else is terminal input — except
+    // Shift+PgUp/PgDn, which scroll the shell's scrollback history.
+    // Any other key returns a scrolled view to live.
     if ws.is_shell_active() {
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        // End returns a scrolled view to live; at live it goes to the shell.
+        let scrolled = ws
+            .tabs
+            .get(ws.active)
+            .is_some_and(|t| matches!(t, Tab::Shell(sh) if sh.state.scrollback_pos() > 0));
+        match key.code {
+            KeyCode::PageUp if shift => {
+                if let Some(Tab::Shell(sh)) = ws.tabs.get_mut(ws.active) {
+                    sh.state.scroll_up(sh.state.rows as usize);
+                }
+                return;
+            }
+            KeyCode::PageDown if shift => {
+                if let Some(Tab::Shell(sh)) = ws.tabs.get_mut(ws.active) {
+                    sh.state.scroll_down(sh.state.rows as usize);
+                }
+                return;
+            }
+            KeyCode::End if scrolled => {
+                if let Some(Tab::Shell(sh)) = ws.tabs.get_mut(ws.active) {
+                    sh.state.reset_scroll();
+                }
+                return;
+            }
+            _ => {
+                if let Some(Tab::Shell(sh)) = ws.tabs.get_mut(ws.active) {
+                    sh.state.reset_scroll();
+                }
+            }
+        }
         ws.handle_shell_key(key);
         return;
     }
@@ -30,18 +72,50 @@ pub fn handle_key(ws: &mut Workspace, mut key: KeyEvent) {
     };
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-    // Ctrl+C never quits the app. In the file list and the editor it copies
-    // (OS-style); with the editor's find/replace bar open it closes the bar
-    // like Esc. Everywhere else Ctrl+C acts exactly like Esc: it cancels
-    // inputs, dialogs and popups instead of killing the app. (A shell tab
-    // is unaffected — keys there go straight to the shell as SIGINT.)
+    // Ctrl+C never quits the app. In the file list, the editor, and the
+    // sheet viewer it copies (OS-style); with the editor's find/replace
+    // bar open it closes the bar like Esc. Everywhere else Ctrl+C acts
+    // exactly like Esc: it cancels inputs, dialogs and popups instead of
+    // killing the app. (A shell tab is unaffected — keys there go straight
+    // to the shell as SIGINT.)
     if ctrl && !shift && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')) {
         let bar_open = mode == Mode::Editor
             && ws
                 .active_browser()
                 .is_some_and(|a| a.editor.as_ref().is_some_and(|ed| ed.find.is_some()));
-        if !matches!(mode, Mode::Normal) && (bar_open || mode != Mode::Editor) {
+        if !matches!(mode, Mode::Normal | Mode::Sheet) && (bar_open || mode != Mode::Editor) {
             key = KeyEvent::new(KeyCode::Esc, KeyModifiers::empty());
+        }
+    }
+    // Accessibility, folder navigation only (off by default):
+    // 1. Key delay: ignore a keypress that arrives within `key_delay_ms`
+    //    of the last processed one, so accidental double-hits don't act.
+    // 2. Alt-required: navigation keys only work while Alt is held.
+    //    Ctrl combinations (already deliberate), `?` (help) and Esc always
+    //    work, so the feature can always be reached and turned off.
+    // Dropped keys return before the status line is cleared below, so an
+    // accidental hit leaves no visible trace.
+    if mode == Mode::Normal {
+        if ws.key_delay_ms > 0 {
+            let now = Instant::now();
+            let recent = ws
+                .active_browser()
+                .and_then(|a| a.last_key_at)
+                .map(|t| now.duration_since(t).as_millis() < ws.key_delay_ms as u128)
+                .unwrap_or(false);
+            if recent {
+                return;
+            }
+            if let Some(app) = ws.active_browser_mut() {
+                app.last_key_at = Some(now);
+            }
+        }
+        if ws.alt_nav {
+            let alt = key.modifiers.contains(KeyModifiers::ALT);
+            let exempt = ctrl || matches!(key.code, KeyCode::Esc | KeyCode::Char('?'));
+            if !alt && !exempt {
+                return;
+            }
         }
     }
     // Each new keypress in a non-input mode starts with a fresh status line;
@@ -97,9 +171,52 @@ pub fn handle_key(ws: &mut Workspace, mut key: KeyEvent) {
                     app.mode = Mode::Normal;
                 }
             }
+            // Help tabs: number keys jump, <-/-> steps between tabs.
+            KeyCode::Char(c @ '1'..='5') => {
+                if let Some(app) = ws.active_browser_mut() {
+                    app.help_tab = (c as u8 - b'1') as usize;
+                }
+            }
+            KeyCode::Left => {
+                if let Some(app) = ws.active_browser_mut() {
+                    app.help_tab = app.help_tab.saturating_sub(1);
+                }
+            }
+            KeyCode::Right => {
+                if let Some(app) = ws.active_browser_mut() {
+                    app.help_tab = (app.help_tab + 1).min(HELP_TABS.len() - 1);
+                }
+            }
             // Settings, also listed in the help popup itself.
             KeyCode::Char('t') | KeyCode::Char('T') => ws.cycle_theme(),
             KeyCode::Char('l') | KeyCode::Char('L') => ws.toggle_line_numbers(),
+            // Accessibility tab controls (only there, so the keys never
+            // surprise on another tab).
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                if on_accessibility_tab(ws) {
+                    ws.set_key_delay_ms(if ws.key_delay_ms == 0 { 200 } else { 0 });
+                }
+            }
+            KeyCode::Char('-') | KeyCode::Char('_') => {
+                if on_accessibility_tab(ws) {
+                    ws.set_key_delay_ms(ws.key_delay_ms.saturating_sub(50));
+                }
+            }
+            KeyCode::Char('=') | KeyCode::Char('+') => {
+                if on_accessibility_tab(ws) {
+                    let ms = if ws.key_delay_ms == 0 {
+                        100
+                    } else {
+                        (ws.key_delay_ms + 50).min(5000)
+                    };
+                    ws.set_key_delay_ms(ms);
+                }
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                if on_accessibility_tab(ws) {
+                    ws.toggle_alt_nav();
+                }
+            }
             _ => {}
         },
         Mode::Network => handle_network(ws, key),
@@ -473,6 +590,8 @@ fn handle_sheet(app: &mut App, key: KeyEvent) {
         if let Some(sh) = app.sheet.as_mut() {
             match key.code {
                 KeyCode::Esc => sh.close_find(),
+                // Ctrl+C closes the find bar like Esc (mirrors the editor).
+                KeyCode::Char('c') | KeyCode::Char('C') if ctrl => sh.close_find(),
                 KeyCode::Enter if !shift => sh.find_jump(1),
                 KeyCode::Enter => sh.find_jump(-1),
                 _ => {
@@ -501,6 +620,20 @@ fn handle_sheet(app: &mut App, key: KeyEvent) {
         }
         return;
     }
+    // Ctrl+C copies the selected block (or the cursor cell) as TSV for
+    // Excel/Sheets; Ctrl+V pastes TSV from the clipboard at the cursor.
+    if ctrl && !shift && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')) {
+        if let Some(sh) = app.sheet.as_mut() {
+            sh.copy_block();
+        }
+        return;
+    }
+    if ctrl && !shift && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V')) {
+        if let Some(sh) = app.sheet.as_mut() {
+            sh.paste_tsv();
+        }
+        return;
+    }
     if matches!(key.code, KeyCode::Esc) {
         let dirty = app.sheet.as_ref().is_some_and(|s| s.dirty);
         if dirty {
@@ -521,10 +654,36 @@ fn handle_sheet(app: &mut App, key: KeyEvent) {
         return;
     };
     match key.code {
-        KeyCode::Left => sh.move_cell(0, -1),
-        KeyCode::Right => sh.move_cell(0, 1),
-        KeyCode::Up => sh.move_cell(-1, 0),
-        KeyCode::Down => sh.move_cell(1, 0),
+        // Shift+arrows grow a block selection from an anchor; plain
+        // arrows move the cursor and clear it.
+        KeyCode::Left => {
+            if shift {
+                sh.extend_selection(0, -1);
+            } else {
+                sh.move_cell(0, -1);
+            }
+        }
+        KeyCode::Right => {
+            if shift {
+                sh.extend_selection(0, 1);
+            } else {
+                sh.move_cell(0, 1);
+            }
+        }
+        KeyCode::Up => {
+            if shift {
+                sh.extend_selection(-1, 0);
+            } else {
+                sh.move_cell(-1, 0);
+            }
+        }
+        KeyCode::Down => {
+            if shift {
+                sh.extend_selection(1, 0);
+            } else {
+                sh.move_cell(1, 0);
+            }
+        }
         KeyCode::Home => {
             sh.col = 0;
             sh.move_cell(0, 0);
@@ -603,6 +762,19 @@ pub fn handle_mouse(ws: &mut Workspace, m: MouseEvent) {
     let Some(app) = ws.active_browser_mut() else {
         return;
     };
+    // The `?` help popup's tab bar: a left click switches help tabs.
+    if app.mode == Mode::Help && matches!(m.kind, Kind::Down(MouseButton::Left)) {
+        let hits = ws.help_tab_hits.clone();
+        for (x0, x1, y, idx) in hits {
+            if m.row == y && m.column >= x0 && m.column < x1 {
+                if let Some(app) = ws.active_browser_mut() {
+                    app.help_tab = idx;
+                }
+                return;
+            }
+        }
+        return;
+    }
     // Note: the editor/sheet/list click handlers take absolute terminal
     // coordinates (their view origins come from the render layout, which
     // already sits below the tab bar), so no row translation is needed here.
@@ -1189,15 +1361,25 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_in_sheet_cancels_like_esc() {
+    fn ctrl_c_in_sheet_copies() {
         let (mut ws, dir) = test_app();
         std::fs::write(dir.join("s.csv"), "a,b\n1,2\n").unwrap();
         browser_mut(&mut ws).open_path_in_editor(&dir.join("s.csv"));
         assert!(matches!(browser(&ws).mode, Mode::Sheet));
-        // Ctrl+C with a clean sheet closes it (like Esc), never quits.
+        // Ctrl+C copies the cursor cell (never quits, never closes).
         handle_key(&mut ws, ctrl('c'));
         assert!(!ws.should_quit);
-        assert!(matches!(browser(&ws).mode, Mode::Normal));
+        assert!(matches!(browser(&ws).mode, Mode::Sheet));
+        let msg = browser(&ws).sheet.as_ref().unwrap().message.clone();
+        assert!(
+            msg == "Copied cell" || msg == "Clipboard unavailable",
+            "unexpected message: {msg}"
+        );
+        // With the find bar open, Ctrl+C closes it like Esc instead.
+        browser_mut(&mut ws).sheet.as_mut().unwrap().open_find();
+        handle_key(&mut ws, ctrl('c'));
+        assert!(matches!(browser(&ws).mode, Mode::Sheet));
+        assert!(browser(&ws).sheet.as_ref().unwrap().find.is_none());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1842,5 +2024,75 @@ mod tests {
         assert!(!browser(&ws).grep_mode);
         assert!(browser(&ws).grep_rx.is_none());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn two_file_ws() -> Workspace {
+        let (_ws, dir) = test_app();
+        std::fs::write(dir.join("b.txt"), "b\n").unwrap();
+        // Rebuild so both files are listed.
+        let mut ws = Workspace::new(dir);
+        ws.set_config_dir(None);
+        ws
+    }
+
+    fn selected_name(ws: &Workspace) -> String {
+        browser(ws).selected_entry().unwrap().name.clone()
+    }
+
+    #[test]
+    fn key_delay_swallows_rapid_repeats() {
+        let mut ws = two_file_ws();
+        ws.key_delay_ms = 60_000; // effectively "always within the window"
+        let first = selected_name(&ws);
+        handle_key(&mut ws, key(KeyCode::Down, KeyModifiers::NONE));
+        let second = selected_name(&ws);
+        assert_ne!(first, second, "first keypress moves");
+        // Immediate repeat is swallowed: selection doesn't move.
+        handle_key(&mut ws, key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(selected_name(&ws), second);
+        // After the window passes, keys work again.
+        browser_mut(&mut ws).last_key_at = Some(Instant::now() - Duration::from_secs(61));
+        handle_key(&mut ws, key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(selected_name(&ws), first);
+    }
+
+    #[test]
+    fn key_delay_off_by_default() {
+        let mut ws = two_file_ws();
+        assert_eq!(ws.key_delay_ms, 0);
+        let first = selected_name(&ws);
+        handle_key(&mut ws, key(KeyCode::Down, KeyModifiers::NONE));
+        handle_key(&mut ws, key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(selected_name(&ws), first, "no keys swallowed");
+    }
+
+    #[test]
+    fn alt_nav_requires_alt_for_navigation() {
+        let mut ws = two_file_ws();
+        ws.alt_nav = true;
+        let first = selected_name(&ws);
+        // Plain arrows and shortcuts are ignored...
+        handle_key(&mut ws, key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(selected_name(&ws), first);
+        handle_key(&mut ws, key(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert!(matches!(browser(&ws).mode, Mode::Normal));
+        // ...but work with Alt held.
+        handle_key(&mut ws, key(KeyCode::Down, KeyModifiers::ALT));
+        assert_ne!(selected_name(&ws), first);
+    }
+
+    #[test]
+    fn alt_nav_keeps_escape_hatches() {
+        let mut ws = two_file_ws();
+        ws.alt_nav = true;
+        // ? opens help without Alt...
+        handle_key(&mut ws, key(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert!(matches!(browser(&ws).mode, Mode::Help));
+        handle_key(&mut ws, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(browser(&ws).mode, Mode::Normal));
+        // ...and Ctrl combinations still work.
+        let tabs_before = ws.tabs.len();
+        handle_key(&mut ws, ctrl('t'));
+        assert_eq!(ws.tabs.len(), tabs_before + 1);
     }
 }

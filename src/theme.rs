@@ -106,17 +106,45 @@ fn settings_path() -> Option<PathBuf> {
     })
 }
 
-/// Load `(theme_index, show_line_numbers)`. Anything missing or malformed
-/// falls back to the defaults: theme 0, line numbers on.
-pub fn load_settings() -> (usize, bool) {
-    let mut theme_idx = 0;
-    let mut show_line_numbers = true;
+/// Persisted UI and accessibility settings (`~/.config/fex/settings`).
+#[derive(Debug, Clone)]
+pub struct Settings {
+    pub theme_idx: usize,
+    pub show_line_numbers: bool,
+    /// Debounce between keypresses in folder navigation, in milliseconds.
+    /// 0 (the default) means off.
+    pub key_delay_ms: u64,
+    /// When true, folder-navigation keys need Alt held (except `?` and Esc).
+    pub alt_nav: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            theme_idx: 0,
+            show_line_numbers: true,
+            key_delay_ms: 0,
+            alt_nav: false,
+        }
+    }
+}
+
+/// Load the settings. Anything missing or malformed falls back to the
+/// defaults: theme 0, line numbers on, no key delay, Alt mode off.
+pub fn load_settings() -> Settings {
     let Some(path) = settings_path() else {
-        return (theme_idx, show_line_numbers);
+        return Settings::default();
     };
     let Ok(text) = std::fs::read_to_string(&path) else {
-        return (theme_idx, show_line_numbers);
+        return Settings::default();
     };
+    parse_settings(&text)
+}
+
+/// Parse settings text (one `key=value` per line). Split out so tests can
+/// exercise the real loader logic without touching the home directory.
+fn parse_settings(text: &str) -> Settings {
+    let mut s = Settings::default();
     for line in text.lines() {
         let (k, v) = match line.split_once('=') {
             Some(p) => p,
@@ -125,20 +153,28 @@ pub fn load_settings() -> (usize, bool) {
         match k.trim() {
             "theme" => {
                 if let Some(i) = THEMES.iter().position(|t| t.name == v.trim()) {
-                    theme_idx = i;
+                    s.theme_idx = i;
                 }
             }
             "line_numbers" => {
-                show_line_numbers = v.trim() != "false";
+                s.show_line_numbers = v.trim() != "false";
+            }
+            "key_delay_ms" => {
+                if let Ok(ms) = v.trim().parse::<u64>() {
+                    s.key_delay_ms = ms.min(5000);
+                }
+            }
+            "alt_nav" => {
+                s.alt_nav = v.trim() == "true";
             }
             _ => {}
         }
     }
-    (theme_idx, show_line_numbers)
+    s
 }
 
 /// Persist the settings. Best effort: failures are silently ignored.
-pub fn save_settings(theme_idx: usize, show_line_numbers: bool) {
+pub fn save_settings(s: &Settings) {
     let Some(path) = settings_path() else {
         return;
     };
@@ -146,10 +182,13 @@ pub fn save_settings(theme_idx: usize, show_line_numbers: bool) {
         let _ = std::fs::create_dir_all(parent);
     }
     let name = THEMES
-        .get(theme_idx)
+        .get(s.theme_idx)
         .map(|t| t.name)
         .unwrap_or(THEMES[0].name);
-    let text = format!("theme={name}\nline_numbers={show_line_numbers}\n");
+    let text = format!(
+        "theme={name}\nline_numbers={}\nkey_delay_ms={}\nalt_nav={}\n",
+        s.show_line_numbers, s.key_delay_ms, s.alt_nav
+    );
     let _ = std::fs::write(&path, text);
 }
 
@@ -167,21 +206,31 @@ mod tests {
 
     #[test]
     fn settings_roundtrip_format() {
-        // The writer output must parse back through the loader's logic.
-        let text = format!("theme={}\nline_numbers=false\n", THEMES[2].name);
-        let mut theme_idx = 0;
-        let mut show_line_numbers = true;
-        for line in text.lines() {
-            let (k, v) = line.split_once('=').unwrap();
-            match k {
-                "theme" => {
-                    theme_idx = THEMES.iter().position(|t| t.name == v).unwrap();
-                }
-                "line_numbers" => show_line_numbers = v != "false",
-                _ => {}
-            }
-        }
-        assert_eq!(theme_idx, 2);
-        assert!(!show_line_numbers);
+        // The writer output must parse back through the real loader logic.
+        let text = format!(
+            "theme={}\nline_numbers=false\nkey_delay_ms=250\nalt_nav=true\n",
+            THEMES[2].name
+        );
+        let s = parse_settings(&text);
+        assert_eq!(s.theme_idx, 2);
+        assert!(!s.show_line_numbers);
+        assert_eq!(s.key_delay_ms, 250);
+        assert!(s.alt_nav);
+    }
+
+    #[test]
+    fn settings_defaults_and_bad_input() {
+        let s = parse_settings("");
+        assert_eq!(s.key_delay_ms, 0);
+        assert!(!s.alt_nav);
+        assert!(s.show_line_numbers);
+        // Malformed values fall back to defaults, not panics.
+        let s = parse_settings("key_delay_ms=many\nalt_nav=yes\ntheme=nope\n");
+        assert_eq!(s.key_delay_ms, 0);
+        assert!(!s.alt_nav);
+        assert_eq!(s.theme_idx, 0);
+        // Delay is clamped so a typo can't freeze the UI for minutes.
+        let s = parse_settings("key_delay_ms=999999\n");
+        assert_eq!(s.key_delay_ms, 5000);
     }
 }

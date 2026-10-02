@@ -222,6 +222,12 @@ pub enum GitState {
     },
 }
 
+/// Help popup (`?`) tabs, in order. Number keys 1-5 jump to them;
+/// clicking a tab header or <-/-> also switches.
+pub const HELP_TABS: [&str; 5] = ["Browser", "Editor", "Sheet", "Terminal", "Accessibility"];
+/// Index of the Accessibility tab in [`HELP_TABS`].
+pub const HELP_TAB_ACCESSIBILITY: usize = 4;
+
 pub struct App {
     pub cwd: PathBuf,
     entries: Vec<Entry>,
@@ -273,6 +279,11 @@ pub struct App {
     pub col_hits: Vec<(usize, Rect)>,
     /// Last mouse click (x, y, time), for double-click detection.
     pub last_click: Option<(u16, u16, Instant)>,
+    /// Time of the last processed keypress in folder navigation, for the
+    /// accessibility key-delay debounce (None = no key yet).
+    pub last_key_at: Option<Instant>,
+    /// Active `?` help tab (index into HELP_TABS).
+    pub help_tab: usize,
     /// Index into `theme::THEMES`.
     pub theme_idx: usize,
     /// Editor line-number gutter toggle (persisted).
@@ -355,6 +366,8 @@ impl App {
             list_origin: (0, 0),
             col_hits: Vec::new(),
             last_click: None,
+            last_key_at: None,
+            help_tab: 0,
             theme_idx: 0,
             show_line_numbers: true,
             show_preview: false,
@@ -2138,9 +2151,16 @@ pub struct Workspace {
     pub theme_idx: usize,
     /// Editor line-number gutter toggle (persisted); synced into every tab.
     pub show_line_numbers: bool,
+    /// Accessibility: debounce between keypresses in folder navigation, in
+    /// milliseconds (persisted). 0 = off.
+    pub key_delay_ms: u64,
+    /// Accessibility: folder-navigation keys need Alt held (persisted).
+    pub alt_nav: bool,
     pub should_quit: bool,
     /// Tab-bar hit ranges recorded during render: (x_start, x_end, tab).
     pub tab_hits: Vec<(u16, u16, usize)>,
+    /// Help-popup tab hit ranges: (x_start, x_end, y, tab).
+    pub help_tab_hits: Vec<(u16, u16, u16, usize)>,
     /// Ctrl+G was just pressed: the next key jumps tabs (macOS-friendly
     /// alternative to Alt+1-9, since macOS keyboards have no Alt key).
     pub goto_pending: bool,
@@ -2865,19 +2885,24 @@ impl NetView {
 
 impl Workspace {
     pub fn new(cwd: PathBuf) -> Self {
-        let (theme_idx, show_line_numbers) = theme::load_settings();
-        let theme_idx = theme_idx.min(theme::THEMES.len().saturating_sub(1));
+        let settings = theme::load_settings();
+        let theme_idx = settings
+            .theme_idx
+            .min(theme::THEMES.len().saturating_sub(1));
         let mut app = App::new(cwd);
         app.theme_idx = theme_idx;
-        app.show_line_numbers = show_line_numbers;
+        app.show_line_numbers = settings.show_line_numbers;
         let mut ws = Self {
             tabs: vec![Tab::Browser(app)],
             active: 0,
             clipboard: None,
             theme_idx,
-            show_line_numbers,
+            show_line_numbers: settings.show_line_numbers,
+            key_delay_ms: settings.key_delay_ms,
+            alt_nav: settings.alt_nav,
             should_quit: false,
             tab_hits: Vec::new(),
+            help_tab_hits: Vec::new(),
             goto_pending: false,
             favorites: Vec::new(),
             show_favorites: false,
@@ -2911,10 +2936,20 @@ impl Workspace {
         theme::THEMES[self.theme_idx % theme::THEMES.len()]
     }
 
+    /// Write the current theme + line-number + accessibility settings out.
+    fn persist_settings(&self) {
+        theme::save_settings(&theme::Settings {
+            theme_idx: self.theme_idx,
+            show_line_numbers: self.show_line_numbers,
+            key_delay_ms: self.key_delay_ms,
+            alt_nav: self.alt_nav,
+        });
+    }
+
     /// Cycle to the next theme, sync it into every tab, and persist it.
     pub fn cycle_theme(&mut self) {
         self.theme_idx = (self.theme_idx + 1) % theme::THEMES.len();
-        theme::save_settings(self.theme_idx, self.show_line_numbers);
+        self.persist_settings();
         for tab in &mut self.tabs {
             if let Tab::Browser(app) = tab {
                 app.theme_idx = self.theme_idx;
@@ -2929,7 +2964,7 @@ impl Workspace {
     /// Toggle the editor line-number gutter everywhere and persist it.
     pub fn toggle_line_numbers(&mut self) {
         self.show_line_numbers = !self.show_line_numbers;
-        theme::save_settings(self.theme_idx, self.show_line_numbers);
+        self.persist_settings();
         for tab in &mut self.tabs {
             if let Tab::Browser(app) = tab {
                 app.show_line_numbers = self.show_line_numbers;
@@ -2941,6 +2976,33 @@ impl Workspace {
         let on = self.show_line_numbers;
         if let Some(app) = self.active_browser_mut() {
             app.status = format!("Line numbers: {}", if on { "on" } else { "off" });
+        }
+    }
+    /// Set the folder-navigation key debounce (ms, 0 = off) and persist it.
+    pub fn set_key_delay_ms(&mut self, ms: u64) {
+        self.key_delay_ms = ms.min(5000);
+        self.persist_settings();
+        let msg = if self.key_delay_ms == 0 {
+            String::from("Key delay: off")
+        } else {
+            format!("Key delay: {} ms", self.key_delay_ms)
+        };
+        if let Some(app) = self.active_browser_mut() {
+            app.status = msg;
+        }
+    }
+
+    /// Toggle the Alt-required folder-navigation mode and persist it.
+    pub fn toggle_alt_nav(&mut self) {
+        self.alt_nav = !self.alt_nav;
+        self.persist_settings();
+        let msg = if self.alt_nav {
+            String::from("Alt navigation: on (hold Alt with nav keys)")
+        } else {
+            String::from("Alt navigation: off")
+        };
+        if let Some(app) = self.active_browser_mut() {
+            app.status = msg;
         }
     }
 

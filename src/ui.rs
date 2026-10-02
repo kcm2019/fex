@@ -1,6 +1,9 @@
 //! Rendering: layout, file list, preview pane, status bar, and popups.
 
-use crate::app::{App, InputKind, Mode, NetRow, NetState, Tab, ViewMode, Workspace};
+use crate::app::{
+    App, InputKind, Mode, NetRow, NetState, Tab, ViewMode, Workspace, HELP_TABS,
+    HELP_TAB_ACCESSIBILITY,
+};
 use crate::editor::Editor;
 use crate::fs::{self, Entry, Preview};
 use crate::net;
@@ -194,15 +197,27 @@ fn render_tab_bar(frame: &mut Frame, ws: &mut Workspace, th: &Theme, area: Rect)
 
 /// Draw the active shell tab's pty screen.
 fn render_shell(frame: &mut Frame, ws: &mut Workspace, area: Rect) {
-    let (exited, lines) = match ws.tabs.get_mut(ws.active) {
+    let (exited, lines, scrolled) = match ws.tabs.get_mut(ws.active) {
         Some(Tab::Shell(sh)) => {
             sh.resize(area.width, area.height);
-            (sh.state.exited, sh.state.render_lines())
+            (
+                sh.state.exited,
+                sh.state.render_lines(),
+                sh.state.scrollback_pos(),
+            )
         }
         _ => return,
     };
     let mut lines: Vec<Line> = lines.into_iter().take(area.height as usize).collect();
-    if exited {
+    // The notice takes the last row so it is always visible.
+    if scrolled > 0 {
+        lines.pop();
+        lines.push(Line::from(Span::styled(
+            " history — Shift+PgDn / End for live, Shift+PgUp further back",
+            Style::default().fg(ws.theme().dim),
+        )));
+    } else if exited {
+        lines.pop();
         lines.push(Line::from(Span::styled(
             " [process exited — Ctrl+W closes this tab]",
             Style::default().fg(ws.theme().dim),
@@ -679,6 +694,7 @@ fn csv_row_line(
     is_header: bool,
     gutter: usize,          // row-number gutter width (0 = no gutter)
     row_num: Option<usize>, // 1-based row number; None = blank corner
+    hl: &CellHighlights,
 ) -> Line<'static> {
     let grid = grid_style(theme);
     let mut spans = Vec::new();
@@ -694,6 +710,8 @@ fn csv_row_line(
         }
     }
     spans.push(Span::styled("│", grid));
+    // 0-based data row for highlight lookups (row_num is 1-based).
+    let data_row = row_num.map(|n| n.saturating_sub(1));
     for (i, w) in widths.iter().enumerate().skip(off_col) {
         let cell = cells.get(i).map(|s| s.as_str()).unwrap_or("");
         let shown: String = cell.chars().take(*w).collect();
@@ -704,6 +722,19 @@ fn csv_row_line(
         } else {
             Style::default()
         };
+        // Selection block and find matches paint in accent (no solid
+        // background); find matches add bold. The cursor cell keeps its
+        // reversed style on top.
+        if let (Some(dr), Some(((r0, c0), (r1, c1)))) = (data_row, hl.sel_rect) {
+            if dr >= r0 && dr <= r1 && i >= c0 && i <= c1 {
+                style = style.fg(theme.accent);
+            }
+        }
+        if let Some(dr) = data_row {
+            if hl.find_cells.contains(&(dr, i)) {
+                style = style.fg(theme.accent).add_modifier(Modifier::BOLD);
+            }
+        }
         if selected_col == Some(i) {
             style = style.add_modifier(Modifier::REVERSED);
         }
@@ -711,6 +742,22 @@ fn csv_row_line(
         spans.push(Span::styled("│", grid));
     }
     Line::from(spans)
+}
+
+/// Per-cell highlight info for one grid row: Ctrl+F match cells and the
+/// Shift+arrow selection block, as 0-based (row, col) data coordinates.
+struct CellHighlights {
+    find_cells: std::collections::HashSet<(usize, usize)>,
+    sel_rect: Option<((usize, usize), (usize, usize))>,
+}
+
+impl CellHighlights {
+    fn none() -> Self {
+        Self {
+            find_cells: std::collections::HashSet::new(),
+            sel_rect: None,
+        }
+    }
 }
 
 /// Horizontal grid separator between the header and the body (`├─┼─┤`),
@@ -760,6 +807,7 @@ fn render_sheet(frame: &mut Frame, app: &mut App, area: Rect) {
         let mut lines: Vec<Line> = Vec::with_capacity(sh.view_h + 1);
         // 1-based row numbers in a dim gutter, mirroring the editor.
         let gutter = sh.rows.len().to_string().len().max(1);
+        let hl_none = CellHighlights::none();
         lines.push(csv_row_line(
             &th,
             &sh.headers,
@@ -769,8 +817,19 @@ fn render_sheet(frame: &mut Frame, app: &mut App, area: Rect) {
             true,
             gutter,
             None,
+            &hl_none,
         ));
         lines.push(csv_sep_line(&th, &widths, sh.off_col, gutter));
+        // Ctrl+F match cells and the Shift+arrow selection block, painted
+        // in accent (never a solid background).
+        let hl = CellHighlights {
+            find_cells: if sh.find.is_some() {
+                sh.find_matches().into_iter().collect()
+            } else {
+                std::collections::HashSet::new()
+            },
+            sel_rect: sh.selection_rect(),
+        };
         for j in sh.off_row..(sh.off_row + sh.view_h).min(sh.rows.len()) {
             let sel = if j == sh.row { Some(sh.col) } else { None };
             lines.push(csv_row_line(
@@ -782,6 +841,7 @@ fn render_sheet(frame: &mut Frame, app: &mut App, area: Rect) {
                 false,
                 gutter,
                 Some(j + 1),
+                &hl,
             ));
         }
 
@@ -799,7 +859,7 @@ fn render_sheet(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_widget(para, layout[0]);
 
         let mut status = format!(
-            "Row {}/{} · Col {}/{} · Enter edit · Tab next · a row · A column · Ctrl+S/O save · Ctrl+F find · Esc close",
+            "Row {}/{} · Col {}/{} · Enter edit · Tab next · a row · A column · Shift+arrows select · Ctrl+C copy · Ctrl+V paste · Ctrl+S/O save · Ctrl+F find · Esc close",
             sh.row + 1,
             sh.rows.len(),
             sh.col + 1,
@@ -1368,6 +1428,29 @@ fn render_editor(frame: &mut Frame, app: &mut App, area: Rect) {
             .max(1);
 
         let visible = ed.highlight_visible_wrapped(&th, ed.offset, ed.view_h);
+        // Ctrl+F match ranges per buffer row: (start, end, is_current).
+        // Every match paints in accent while the find bar is open; the
+        // current match adds bold on top.
+        let mut find_hl: std::collections::HashMap<usize, Vec<(usize, usize, bool)>> =
+            std::collections::HashMap::new();
+        if ed.find.is_some() {
+            let qlen = ed
+                .find
+                .as_ref()
+                .map(|f| f.query.chars().count())
+                .unwrap_or(0);
+            let current = ed.find_match;
+            for (r, c) in ed.find_matches() {
+                let is_current = matches!(current, Some((cr, cs, _)) if cr == r && cs == c);
+                find_hl
+                    .entry(r)
+                    .or_default()
+                    .push((c, c + qlen, is_current));
+            }
+            for ranges in find_hl.values_mut() {
+                ranges.sort_by_key(|&(_, _, cur)| cur);
+            }
+        }
         let text: Vec<Line> = visible
             .into_iter()
             .map(|w| {
@@ -1402,21 +1485,24 @@ fn render_editor(frame: &mut Frame, app: &mut App, area: Rect) {
                     }
                     None => w.spans,
                 };
-                // The Ctrl+F match paints in accent + bold while the find
-                // bar is open (it eats every key, so the buffer can't change
-                // underneath). Intersected with the segment like selections.
-                let spans = match ed.find_match {
-                    Some((r, s, e)) if r == w.buf_row && ed.find.is_some() => {
+                // The Ctrl+F matches paint in accent while the find bar is
+                // open (it eats every key, so the buffer can't change
+                // underneath); the current match adds bold. Intersected
+                // with the segment like selections.
+                let spans = match find_hl.get(&w.buf_row) {
+                    Some(ranges) => {
                         let (ss, se) = w.seg;
-                        let a = s.clamp(ss, se);
-                        let b = e.clamp(ss, se);
-                        if a < b {
-                            apply_match(spans, a - ss, b - ss, &th)
-                        } else {
-                            spans
+                        let mut spans = spans;
+                        for &(s, e, current) in ranges {
+                            let a = s.clamp(ss, se);
+                            let b = e.clamp(ss, se);
+                            if a < b {
+                                spans = apply_match(spans, a - ss, b - ss, &th, current);
+                            }
                         }
+                        spans
                     }
-                    _ => spans,
+                    None => spans,
                 };
                 v.extend(spans);
                 Line::from(v)
@@ -1541,10 +1627,12 @@ fn apply_match(
     start: usize,
     end: usize,
     theme: &Theme,
+    bold: bool,
 ) -> Vec<Span<'static>> {
-    let hl = Style::default()
-        .fg(theme.accent)
-        .add_modifier(Modifier::BOLD);
+    let mut hl = Style::default().fg(theme.accent);
+    if bold {
+        hl = hl.add_modifier(Modifier::BOLD);
+    }
     let mut out = Vec::with_capacity(spans.len());
     let mut pos = 0usize;
     for span in spans {
@@ -1651,10 +1739,87 @@ fn render_favorites_popup(frame: &mut Frame, ws: &Workspace, area: Rect) {
     frame.render_widget(list, popup);
 }
 
-fn render_help_popup(frame: &mut Frame, ws: &Workspace, area: Rect) {
+fn render_help_popup(frame: &mut Frame, ws: &mut Workspace, area: Rect) {
     let th = ws.theme();
-    let popup = centered_rect(62, 80, area);
+    let popup = centered_rect(72, 86, area);
     frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Help (?/Esc closes · 1-5 or click switches tabs) ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let tab = ws
+        .active_browser()
+        .map(|a| a.help_tab)
+        .unwrap_or(0)
+        .min(HELP_TABS.len() - 1);
+    let key_delay_ms = ws.key_delay_ms;
+    let alt_nav = ws.alt_nav;
+    let show_line_numbers = ws.show_line_numbers;
+
+    // Tab bar: number keys, <-/->, or a mouse click switches tabs.
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+    let mut spans = vec![Span::raw(" ")];
+    let mut hits = Vec::new();
+    let mut x = chunks[0].x + 1;
+    for (i, name) in HELP_TABS.iter().enumerate() {
+        let label = format!(" {}:{} ", i + 1, name);
+        let w = label.chars().count() as u16;
+        let style = if i == tab {
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(th.dim)
+        };
+        spans.push(Span::styled(label, style));
+        spans.push(Span::raw(" "));
+        hits.push((x, x + w, chunks[0].y, i));
+        x += w + 1;
+    }
+    ws.help_tab_hits = hits;
+    frame.render_widget(Paragraph::new(Line::from(spans)), chunks[0]);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "─".repeat(chunks[1].width as usize),
+            Style::default().fg(th.dim),
+        ))),
+        chunks[1],
+    );
+
+    let lines: Vec<Line> = match tab {
+        1 => help_editor_lines(),
+        2 => help_sheet_lines(),
+        3 => help_terminal_lines(),
+        HELP_TAB_ACCESSIBILITY => help_accessibility_lines(&th, key_delay_ms, alt_nav),
+        _ => help_browser_lines(&th, show_line_numbers),
+    };
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), chunks[2]);
+}
+
+/// Turn key/description pairs into help lines (accented key column).
+fn help_key_lines(th: &Theme, rows: &[(&str, String)]) -> Vec<Line<'static>> {
+    rows.iter()
+        .map(|(keys, desc)| {
+            Line::from(vec![
+                Span::styled(
+                    format!("{keys:<16}"),
+                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(desc.clone()),
+            ])
+        })
+        .collect()
+}
+
+/// Tab 1: the file-list key reference plus the t/l settings.
+fn help_browser_lines(th: &Theme, show_line_numbers: bool) -> Vec<Line<'static>> {
     let rows = [
         ("↑ / ↓", "move selection"),
         ("→ / Enter", "enter directory · open file in default app"),
@@ -1740,52 +1905,141 @@ fn render_help_popup(frame: &mut Frame, ws: &Workspace, area: Rect) {
         ),
         ("wheel", "scroll list / editor / table"),
     ];
-    let mut lines: Vec<Line> = rows
-        .iter()
-        .map(|(keys, desc)| {
-            Line::from(vec![
-                Span::styled(
-                    format!("{keys:<16}"),
-                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(*desc),
-            ])
-        })
-        .collect();
+    let mut lines = help_key_lines(
+        th,
+        &rows
+            .iter()
+            .map(|(k, d)| (*k, (*d).to_string()))
+            .collect::<Vec<_>>(),
+    );
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "Settings (press t / l while help is open)",
+        "Settings (press t / l while help is open; accessibility lives on tab 5)",
         Style::default().add_modifier(Modifier::BOLD),
     )));
-    for (keys, desc) in [
-        ("t", format!("cycle color theme (now: {})", th.name)),
-        (
-            "l",
-            format!(
-                "editor line numbers: {}",
-                if ws.show_line_numbers { "on" } else { "off" }
+    lines.extend(help_key_lines(
+        th,
+        &[
+            ("t", format!("cycle color theme (now: {})", th.name)),
+            (
+                "l",
+                format!(
+                    "editor line numbers: {}",
+                    if show_line_numbers { "on" } else { "off" }
+                ),
             ),
-        ),
-    ] {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{keys:<16}"),
-                Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(desc),
-        ]));
-    }
+        ],
+    ));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "Enter on a file opens it with the system default app. Terminal tabs run your $SHELL (PowerShell on Windows) — almost every key goes straight to it (Ctrl+C is SIGINT there); Ctrl+T / Ctrl+N / Ctrl+W / Ctrl+PgUp/PgDn / Alt+1-9 / Ctrl+G still manage tabs. Ctrl+N opens a new blank text document in its own tab; Ctrl+S on it opens a save dialog where you browse to a folder, type a name, and Enter saves (existing files ask to overwrite). In the editor: arrows/Home/End/PgUp/PgDn move · Shift+arrows (or Shift+Home/End) selects text, plain arrows collapse the selection · Ctrl+Left/Right jump by word (Ctrl+Shift+Left/Right selects by word) · type to edit · paste is instant and undoes as one step (Ctrl+Z removes the whole paste, even when the terminal delivers it character by character) · Ctrl+S/O save · Ctrl+F find text in the buffer (live search: the current match is highlighted in the accent color, Enter next match, Shift+Enter previous, Esc close) · Ctrl+R find & replace (Tab switches the Find/Replace fields, Enter replaces the current match, Ctrl+A replaces every match in one undo step, Esc closes) · Ctrl+Z/Y undo/redo (fast typing undoes as one burst) · Ctrl+A select all (Ctrl+E works too, for terminals that grab Ctrl+A) · Ctrl+C/X/V copy/cut/paste (selection, never line numbers; copies also land on the system clipboard, so Cmd+V works anywhere — the terminal itself intercepts Cmd+C, it never reaches fex) · Ctrl+D duplicate line · Alt+↑/↓ move line up/down · Tab indents the selection (Shift+Tab dedents) · Ctrl+Backspace / Ctrl+Delete delete a word · Esc clears selection, then closes (asks if unsaved). Ctrl+C never quits the app: outside the editor and file list it cancels like Esc. In the CSV viewer: rows are numbered · arrows move · Enter edits a cell · Tab next cell · a adds a row · A adds a column · Ctrl+F find a cell (live search: Enter next match, Shift+Enter previous, Esc close) · Ctrl+S (or Ctrl+O) saves · Esc closes. The Excel viewer (e on an .xlsx file) works the same, plus: [ and ] switch sheets · headers are column letters (A, B, C…) · dates show as dates · formula cells edit as =formula (keep the = to edit the formula, delete it to replace with a plain value; fex never recalculates — Excel refreshes formulas when you open the file there) ·  Tabs are saved between launches: quitting brings back your browser tabs, editors (including unsaved changes), and terminal tabs (a fresh shell in the same folder). Launching as `fex [path]` skips the restore and starts fresh (a file path opens its parent with the file selected). Closing a tab with Ctrl+W discards its saved state for good.Esc closes.",
+        "Enter on a file opens it with the system default app.",
         Style::default().fg(Color::DarkGray),
     )));
-    let help = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" Help (?/Esc to close) "),
-    );
-    frame.render_widget(help, popup);
+    lines
+}
+
+/// Tab 2: the built-in text editor.
+fn help_editor_lines() -> Vec<Line<'static>> {
+    vec![Line::from(Span::styled(
+        "In the editor: arrows/Home/End/PgUp/PgDn move · Shift+arrows (or Shift+Home/End) selects text, plain arrows collapse the selection · Ctrl+Left/Right jump by word (Ctrl+Shift+Left/Right selects by word) · type to edit · paste is instant and undoes as one step (Ctrl+Z removes the whole paste, even when the terminal delivers it character by character) · Ctrl+S/O save · Ctrl+F find text in the buffer (live search: every match is highlighted in the accent color, the current match bold, Enter next match, Shift+Enter previous, Esc close) · Ctrl+R find & replace (Tab switches the Find/Replace fields, Enter replaces the current match, Ctrl+A replaces every match in one undo step, Esc closes) · Ctrl+Z/Y undo/redo (fast typing undoes as one burst) · Ctrl+A select all (Ctrl+E works too, for terminals that grab Ctrl+A) · Ctrl+C/X/V copy/cut/paste (selection, never line numbers; copies also land on the system clipboard, so Cmd+V works anywhere — the terminal itself intercepts Cmd+C, it never reaches fex) · Ctrl+D duplicate line · Alt+↑/↓ move line up/down · Tab indents the selection (Shift+Tab dedents) · Ctrl+Backspace / Ctrl+Delete delete a word · Esc clears selection, then closes (asks if unsaved).",
+        Style::default().fg(Color::DarkGray),
+    ))]
+}
+
+/// Tab 3: the CSV and Excel table viewers.
+fn help_sheet_lines() -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(
+            "In the CSV viewer: rows are numbered · arrows move · Enter edits a cell · Tab next cell · a adds a row · A adds a column · Shift+arrows select a block · Ctrl+C copies the block (or cell) as tab-separated text for Excel/Sheets · Ctrl+V pastes tab-separated clipboard text at the cursor · Ctrl+F find a cell (live search: every match is highlighted, Enter next match, Shift+Enter previous, Esc close) · Ctrl+S (or Ctrl+O) saves · Esc closes.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "The Excel viewer (e on an .xlsx file) works the same, plus: [ and ] switch sheets · headers are column letters (A, B, C…) · dates show as dates · formula cells edit as =formula (keep the = to edit the formula, delete it to replace with a plain value; fex never recalculates — Excel refreshes formulas when you open the file there)",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ]
+}
+
+/// Tab 4: terminal tabs, new documents, sessions.
+fn help_terminal_lines() -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(
+            "Terminal tabs run your $SHELL (PowerShell on Windows) — almost every key goes straight to it (Ctrl+C is SIGINT there); Ctrl+T / Ctrl+N / Ctrl+W / Ctrl+PgUp/PgDn / Alt+1-9 / Ctrl+G still manage tabs. Shift+PgUp / Shift+PgDn scrolls the shell's history (2000 lines, plain text); End — or any other key — returns to the live view.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Ctrl+N opens a new blank text document in its own tab; Ctrl+S on it opens a save dialog where you browse to a folder, type a name, and Enter saves (existing files ask to overwrite).",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Ctrl+C never quits the app: outside the editor and file list it cancels like Esc.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Tabs are saved between launches: quitting brings back your browser tabs, editors (including unsaved changes), and terminal tabs (a fresh shell in the same folder). Launching as `fex [path]` skips the restore and starts fresh (a file path opens its parent with the file selected). Closing a tab with Ctrl+W discards its saved state for good.",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ]
+}
+
+/// Tab 5: interactive accessibility settings for folder navigation.
+/// Off by default; changes apply immediately and persist.
+fn help_accessibility_lines(th: &Theme, key_delay_ms: u64, alt_nav: bool) -> Vec<Line<'static>> {
+    let delay_status = if key_delay_ms == 0 {
+        "off".to_string()
+    } else {
+        format!("{key_delay_ms} ms")
+    };
+    let alt_status = if alt_nav { "on" } else { "off" };
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Accessibility — Folder Navigation",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "These helpers are off by default. Changes apply immediately and are saved.",
+            Style::default().fg(th.dim),
+        )),
+        Line::from(""),
+    ];
+    lines.extend(help_key_lines(
+        th,
+        &[
+            (
+                "d",
+                format!(
+                    "toggle the key-press delay (now: {delay_status}; a shaky double-hit is ignored)"
+                ),
+            ),
+            (
+                "- / +",
+                "adjust the delay in 50 ms steps (0 = off, max 5000 ms)".to_string(),
+            ),
+            (
+                "a",
+                format!(
+                    "require Alt for navigation (now: {alt_status}; arrows and single-key shortcuts only work while Alt is held)"
+                ),
+            ),
+        ],
+    ));
+    lines.push(Line::from(""));
+    lines.extend([
+        Line::from(Span::styled(
+            "The delay ignores a keypress that lands within the delay of the previous one, so an accidental double-hit can't trash, delete, or jump somewhere. It only applies in folder navigation.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "With Alt-required on, ? and Esc still work without Alt, and Ctrl combinations are unaffected — so this panel (and the feature switch itself) is always reachable.",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ]);
+    lines
 }
 
 #[cfg(test)]
@@ -1824,7 +2078,17 @@ mod tests {
     #[test]
     fn csv_grid_lines_render() {
         let cells = vec![String::from("a"), String::from("bb")];
-        let line = csv_row_line(&THEMES[0], &cells, &[3, 3], 0, Some(1), false, 2, Some(1));
+        let line = csv_row_line(
+            &THEMES[0],
+            &cells,
+            &[3, 3],
+            0,
+            Some(1),
+            false,
+            2,
+            Some(1),
+            &CellHighlights::none(),
+        );
         let text: String = line.spans.iter().map(|sp| sp.content.as_ref()).collect();
         assert_eq!(text, " 1 │ a   │ bb  │");
         // selected cell is reversed (spans: gutter, │, cell, │, cell, │)
@@ -1836,9 +2100,58 @@ mod tests {
         let sep_text: String = sep.spans.iter().map(|sp| sp.content.as_ref()).collect();
         assert_eq!(sep_text, "   ├─────┼─────┤");
         // header row is bold, with a blank gutter corner
-        let head = csv_row_line(&THEMES[0], &cells, &[3, 3], 0, None, true, 2, None);
+        let head = csv_row_line(
+            &THEMES[0],
+            &cells,
+            &[3, 3],
+            0,
+            None,
+            true,
+            2,
+            None,
+            &CellHighlights::none(),
+        );
         let head_text: String = head.spans.iter().map(|sp| sp.content.as_ref()).collect();
         assert_eq!(head_text, "   │ a   │ bb  │");
         assert!(head.spans[2].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn help_tabs_all_render_content() {
+        let th = &THEMES[0];
+        let tabs = [
+            help_browser_lines(th, true),
+            help_editor_lines(),
+            help_sheet_lines(),
+            help_terminal_lines(),
+            help_accessibility_lines(th, 0, false),
+        ];
+        assert_eq!(tabs.len(), HELP_TABS.len());
+        for (i, lines) in tabs.iter().enumerate() {
+            assert!(!lines.is_empty(), "tab {i} ({}) is empty", HELP_TABS[i]);
+        }
+    }
+
+    #[test]
+    fn help_accessibility_reflects_settings() {
+        let th = &THEMES[0];
+        let text = |lines: &Vec<Line>| lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        let off = text(&help_accessibility_lines(th, 0, false));
+        assert!(off.contains("now: off"), "got:\n{off}");
+        let on = text(&help_accessibility_lines(th, 250, true));
+        assert!(on.contains("now: 250 ms"), "got:\n{on}");
+        assert!(on.contains("now: on"), "got:\n{on}");
+    }
+
+    #[test]
+    fn help_browser_shows_theme_and_line_numbers() {
+        let th = &THEMES[0];
+        let text: String = help_browser_lines(th, false)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains(th.name), "got:\n{text}");
+        assert!(text.contains("line numbers: off"), "got:\n{text}");
     }
 }

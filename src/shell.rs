@@ -23,30 +23,128 @@ enum ShellEvent {
 
 /// The terminal screen state: parser, size, and liveness. Kept separate
 /// from the pty handles so it can be unit-tested without spawning.
+///
+/// Scrollback history: the vt100 parser's own scrollback viewport isn't
+/// exposed publicly, so fex keeps a plain-text log of output lines. Any
+/// new output returns the view to live; Shift+PgUp/PgDn scrolls the log.
 pub struct ShellState {
     parser: vt100::Parser,
     pub rows: u16,
     pub cols: u16,
     pub exited: bool,
     pub title: String,
+    hist: std::collections::VecDeque<String>,
+    hist_buf: Vec<u8>,
+    scroll: usize,
 }
+
+/// Lines of plain-text history kept per shell tab.
+const MAX_HIST_LINES: usize = 2000;
 
 impl ShellState {
     pub fn new(cols: u16, rows: u16) -> Self {
         let (cols, rows) = (cols.max(1), rows.max(1));
         Self {
-            parser: vt100::Parser::new(rows, cols, 0),
+            parser: vt100::Parser::new(rows, cols, 2000),
             rows,
             cols,
             exited: false,
             title: String::from("shell"),
+            hist: std::collections::VecDeque::new(),
+            hist_buf: Vec::new(),
+            scroll: 0,
         }
     }
 
     pub fn process(&mut self, bytes: &[u8]) {
         self.parser.process(bytes);
+        if bytes.is_empty() {
+            return;
+        }
+        // New output returns the view to live.
+        self.scroll = 0;
+        self.hist_buf.extend_from_slice(bytes);
+        let mut start = 0;
+        let mut i = 0;
+        while i < self.hist_buf.len() {
+            if self.hist_buf[i] == b'\n' {
+                self.hist.push_back(clean_line(&self.hist_buf[start..i]));
+                start = i + 1;
+            }
+            i += 1;
+        }
+        self.hist_buf.drain(..start);
+        while self.hist.len() > MAX_HIST_LINES {
+            self.hist.pop_front();
+        }
     }
 
+    /// Lines currently held back from the live view (0 = live).
+    pub fn scrollback_pos(&self) -> usize {
+        self.scroll
+    }
+
+    pub fn scroll_up(&mut self, n: usize) {
+        if self.hist.is_empty() {
+            return;
+        }
+        let max = self.hist.len().saturating_sub(1);
+        self.scroll = (self.scroll + n.max(1)).min(max);
+    }
+
+    pub fn scroll_down(&mut self, n: usize) {
+        self.scroll = self.scroll.saturating_sub(n.max(1));
+    }
+
+    pub fn reset_scroll(&mut self) {
+        self.scroll = 0;
+    }
+}
+
+/// Strip a raw pty line down to readable text: take what follows the last
+/// carriage return (prompt redraws/progress bars), drop ANSI escapes and
+/// bells, trim trailing whitespace.
+fn clean_line(raw: &[u8]) -> String {
+    let s = String::from_utf8_lossy(raw);
+    // A trailing \r is just the \r\n line ending; an interior one is a
+    // redraw, so keep only what follows the last remaining \r.
+    let s = s.trim_end_matches('\r');
+    let s = s.rsplit('\r').next().unwrap_or("");
+    let mut out = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            match chars.next() {
+                Some('[') => {
+                    for c2 in chars.by_ref() {
+                        if ('@'..='~').contains(&c2) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    let mut prev_esc = false;
+                    for c2 in chars.by_ref() {
+                        if c2 == '\x07' {
+                            break;
+                        }
+                        if prev_esc && c2 == '\\' {
+                            break;
+                        }
+                        prev_esc = c2 == '\x1b';
+                    }
+                }
+                Some(_) => {}
+                None => {}
+            }
+        } else if c != '\x07' {
+            out.push(c);
+        }
+    }
+    out.trim_end().to_string()
+}
+
+impl ShellState {
     pub fn set_size(&mut self, cols: u16, rows: u16) {
         let (cols, rows) = (cols.max(1), rows.max(1));
         if cols != self.cols || rows != self.rows {
@@ -65,7 +163,24 @@ impl ShellState {
     }
 
     /// The current screen as ratatui lines, with the cursor drawn reversed.
+    /// When scrolled up, shows the plain-text history instead of the live
+    /// grid (dimmed; the footer names the way back).
     pub fn render_lines(&self) -> Vec<Line<'static>> {
+        if self.scroll > 0 && !self.hist.is_empty() {
+            let h = self.rows as usize;
+            let end = self.hist.len().saturating_sub(self.scroll);
+            let start = end.saturating_sub(h);
+            return self
+                .hist
+                .iter()
+                .skip(start)
+                .take(end.saturating_sub(start))
+                .map(|l| {
+                    let shown: String = l.chars().take(self.cols as usize).collect();
+                    Line::from(Span::styled(shown, Style::default().fg(RColor::DarkGray)))
+                })
+                .collect();
+        }
         let screen = self.parser.screen();
         let mut lines = Vec::with_capacity(self.rows as usize);
         for r in 0..self.rows {
@@ -359,5 +474,64 @@ mod tests {
         // Cursor sits after "ab"; that cell should be reversed.
         let cur = &lines[0].spans[2];
         assert!(cur.style.add_modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn history_accumulates_plain_text_lines() {
+        let mut st = ShellState::new(80, 24);
+        st.process(b"hello\r\n\x1b[32mgreen\x1b[0m\r\n");
+        st.process(b"partial");
+        st.process(b" line\r\n");
+        let hist: Vec<&str> = st.hist.iter().map(|s| s.as_str()).collect();
+        assert_eq!(hist, vec!["hello", "green", "partial line"]);
+        // No newlines yet: nothing finalized.
+        let mut st2 = ShellState::new(80, 24);
+        st2.process(b"no newline");
+        assert!(st2.hist.is_empty());
+    }
+
+    #[test]
+    fn history_carriage_return_keeps_final_text() {
+        let mut st = ShellState::new(80, 24);
+        // Prompt redraw: \r without \n, then the final line.
+        st.process(b"\r\x1b[K$ ec\r\x1b[K$ echo hi\r\n");
+        let hist: Vec<&str> = st.hist.iter().map(|s| s.as_str()).collect();
+        assert_eq!(hist, vec!["$ echo hi"]);
+    }
+
+    #[test]
+    fn scroll_clamps_and_resets_on_output() {
+        let mut st = ShellState::new(80, 24);
+        for i in 0..10 {
+            let mut b = format!("line{i}\n").into_bytes();
+            st.process(&b);
+        }
+        assert_eq!(st.scrollback_pos(), 0);
+        st.scroll_up(100);
+        assert_eq!(st.scrollback_pos(), 9);
+        st.scroll_down(4);
+        assert_eq!(st.scrollback_pos(), 5);
+        st.scroll_down(100);
+        assert_eq!(st.scrollback_pos(), 0);
+        st.scroll_up(3);
+        st.process(b"more\n");
+        assert_eq!(st.scrollback_pos(), 0, "new output returns to live");
+    }
+
+    #[test]
+    fn render_history_shows_dimmed_lines() {
+        let mut st = ShellState::new(80, 4);
+        for i in 0..10 {
+            let b = format!("line{i}\n").into_bytes();
+            st.process(&b);
+        }
+        st.scroll_up(4);
+        let lines = st.render_lines();
+        assert_eq!(lines.len(), 4);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(text, vec!["line2", "line3", "line4", "line5"]);
     }
 }

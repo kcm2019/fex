@@ -66,6 +66,7 @@ pub fn open_sheet(path: &Path) -> io::Result<Sheet> {
         view_y: 0,
         kind: SheetKind::Csv,
         find: None,
+        sel_anchor: None,
     })
 }
 
@@ -122,6 +123,7 @@ fn open_xlsx(path: &Path) -> io::Result<Sheet> {
             formulas: Vec::new(),
         }),
         find: None,
+        sel_anchor: None,
     };
     sh.load_xlsx_sheet(0);
     Ok(sh)
@@ -238,6 +240,10 @@ pub struct Sheet {
     pub kind: SheetKind,
     /// Find bar opened with Ctrl+F (`None` when closed).
     pub find: Option<FindBar>,
+    /// Block-selection anchor for Shift+arrow selection (`None` when the
+    /// cursor alone is selected). The block spans the anchor and the
+    /// cursor; any plain cursor move clears it.
+    pub sel_anchor: Option<(usize, usize)>,
 }
 
 impl Sheet {
@@ -272,47 +278,99 @@ impl Sheet {
     }
 
     pub fn set_cell(&mut self, value: String) {
-        if self.rows.is_empty() || self.headers.is_empty() {
+        let (row, col) = (self.row, self.col);
+        self.set_cell_at(row, col, value);
+    }
+
+    /// Write one cell by coordinates, for paste. Grows the grid when the
+    /// coordinates fall outside it (CSV extends headers/rows; xlsx grows
+    /// through the workbook and reloads the display cache).
+    pub fn set_cell_at(&mut self, row: usize, col: usize, value: String) {
+        if self.headers.is_empty() {
             return;
         }
-        match &mut self.kind {
-            SheetKind::Csv => {
-                self.rows[self.row][self.col] = value;
-            }
-            SheetKind::Xlsx(st) => {
-                let coord = ((self.col + 1) as u32, (self.row + 1) as u32);
-                let Ok(ws) = st.book.sheet_mut(st.sheet_idx) else {
-                    return;
-                };
-                let (display, is_formula) = {
-                    let cell = ws.cell_mut(coord);
-                    if let Some(f) = value.strip_prefix('=') {
-                        // Editing the formula itself; blank the cached
-                        // result so a stale value is never shown for the new
-                        // formula. fex has no calc engine: Excel
-                        // recalculates on open.
-                        cell.set_formula(f);
-                        cell.set_formula_result_blank();
-                        (value.clone(), true)
-                    } else if is_date_cell(cell) && parse_excel_date(&value).is_some() {
-                        let serial = parse_excel_date(&value).unwrap_or(0.0);
-                        cell.set_value_number(serial);
-                        (value.clone(), false)
-                    } else {
-                        // Smart typing: numbers/bools/empty become native types.
-                        cell.set_value(value.clone());
-                        (cell.value().to_string(), false)
-                    }
-                };
-                self.rows[self.row][self.col] = display;
-                if let Some(flags) = st.formulas.get_mut(self.row) {
-                    if let Some(f) = flags.get_mut(self.col) {
+        if matches!(self.kind, SheetKind::Csv) {
+            self.grow_to(row, col);
+            self.rows[row][col] = value;
+            self.dirty = true;
+            return;
+        }
+        // xlsx: write through the workbook, then rebuild the display
+        // cache when the write grew the sheet.
+        let grew = row >= self.rows.len() || col >= self.ncols();
+        let written = self.xlsx_write_cell(row, col, &value);
+        let Some((display, is_formula)) = written else {
+            return;
+        };
+        if grew {
+            let sheet_idx = match &self.kind {
+                SheetKind::Xlsx(st) => st.sheet_idx,
+                SheetKind::Csv => unreachable!(),
+            };
+            let (save_row, save_col) = (self.row, self.col);
+            self.load_xlsx_sheet(sheet_idx);
+            self.row = save_row.min(self.rows.len().saturating_sub(1));
+            self.col = save_col.min(self.ncols().saturating_sub(1));
+        }
+        if row < self.rows.len() && col < self.rows[row].len() {
+            self.rows[row][col] = display;
+            if let SheetKind::Xlsx(st) = &mut self.kind {
+                if let Some(flags) = st.formulas.get_mut(row) {
+                    if let Some(f) = flags.get_mut(col) {
                         *f = is_formula;
                     }
                 }
             }
         }
         self.dirty = true;
+    }
+
+    /// Grow a CSV grid so (row, col) exists, extending headers and rows
+    /// with blanks. Rows stay rectangular.
+    fn grow_to(&mut self, row: usize, col: usize) {
+        let ncols = self.ncols().max(col + 1);
+        while self.headers.len() < ncols {
+            self.headers.push(String::new());
+        }
+        for r in self.rows.iter_mut() {
+            while r.len() < ncols {
+                r.push(String::new());
+            }
+        }
+        while self.rows.len() <= row {
+            self.rows.push(vec![String::new(); ncols]);
+        }
+    }
+
+    /// Write one xlsx cell through the workbook only (no display-cache
+    /// reload; the caller reloads once after a batch). Returns the display
+    /// text and whether the value is a formula.
+    fn xlsx_write_cell(&mut self, row: usize, col: usize, value: &str) -> Option<(String, bool)> {
+        let coord = ((col + 1) as u32, (row + 1) as u32);
+        let SheetKind::Xlsx(st) = &mut self.kind else {
+            return None;
+        };
+        let Ok(ws) = st.book.sheet_mut(st.sheet_idx) else {
+            return None;
+        };
+        let cell = ws.cell_mut(coord);
+        if let Some(f) = value.strip_prefix('=') {
+            // Editing the formula itself; blank the cached
+            // result so a stale value is never shown for the new
+            // formula. fex has no calc engine: Excel
+            // recalculates on open.
+            cell.set_formula(f);
+            cell.set_formula_result_blank();
+            Some((value.to_string(), true))
+        } else if is_date_cell(cell) && parse_excel_date(value).is_some() {
+            let serial = parse_excel_date(value).unwrap_or(0.0);
+            cell.set_value_number(serial);
+            Some((value.to_string(), false))
+        } else {
+            // Smart typing: numbers/bools/empty become native types.
+            cell.set_value(value.to_string());
+            Some((cell.value().to_string(), false))
+        }
     }
 
     /// Text to pre-fill the cell editor: `=formula` for formula cells so
@@ -412,14 +470,26 @@ impl Sheet {
     /// Insert an empty row below the current one and select it.
     pub fn add_row(&mut self) {
         if self.is_xlsx() {
-            let (name, at) = match &self.kind {
-                SheetKind::Xlsx(st) => (st.names[st.sheet_idx].clone(), self.row + 1),
+            let (name, at, want_rows) = match &self.kind {
+                SheetKind::Xlsx(st) => (
+                    st.names[st.sheet_idx].clone(),
+                    self.row + 1,
+                    // 0-based index of the new row, and the row count the
+                    // grid should have afterwards.
+                    self.rows.len() + 1,
+                ),
                 SheetKind::Csv => unreachable!(),
             };
             // Excel rows are 1-based: insert below the current grid row.
             let idx = match &mut self.kind {
                 SheetKind::Xlsx(st) => {
                     st.book.insert_new_row(&name, (at + 1) as u32, 1);
+                    // insert_new_row only shifts existing cells: on a sparse
+                    // or empty sheet the dimension doesn't grow, so pin a
+                    // cell on the new last row.
+                    if let Ok(ws) = st.book.sheet_mut(st.sheet_idx) {
+                        let _ = ws.cell_mut((1u32, want_rows as u32));
+                    }
                     st.sheet_idx
                 }
                 SheetKind::Csv => unreachable!(),
@@ -448,8 +518,12 @@ impl Sheet {
     /// ignored: headers are always Excel column letters.
     pub fn add_column(&mut self, name: String) {
         if self.is_xlsx() {
-            let sheet_name = match &self.kind {
-                SheetKind::Xlsx(st) => st.names[st.sheet_idx].clone(),
+            let (sheet_name, want_cols) = match &self.kind {
+                SheetKind::Xlsx(st) => (
+                    st.names[st.sheet_idx].clone(),
+                    // The column count the grid should have afterwards.
+                    self.ncols() + 1,
+                ),
                 SheetKind::Csv => unreachable!(),
             };
             // Insert before the 1-based index right after the current
@@ -458,6 +532,12 @@ impl Sheet {
                 SheetKind::Xlsx(st) => {
                     st.book
                         .insert_new_column_by_index(&sheet_name, (self.col + 2) as u32, 1);
+                    // insert_new_column_by_index only shifts existing cells:
+                    // on a sparse or empty sheet the dimension doesn't grow,
+                    // so pin a cell on the new last column.
+                    if let Ok(ws) = st.book.sheet_mut(st.sheet_idx) {
+                        let _ = ws.cell_mut((want_cols as u32, 1u32));
+                    }
                     st.sheet_idx
                 }
                 SheetKind::Csv => unreachable!(),
@@ -483,6 +563,145 @@ impl Sheet {
     }
 
     pub fn move_cell(&mut self, dr: isize, dc: isize) {
+        self.sel_anchor = None;
+        self.move_cursor(dr, dc);
+    }
+
+    /// Shift+arrow block selection: pin the anchor at the cursor, then
+    /// move. The selected block spans the anchor and the new cursor.
+    pub fn extend_selection(&mut self, dr: isize, dc: isize) {
+        if self.rows.is_empty() || self.headers.is_empty() {
+            return;
+        }
+        if self.sel_anchor.is_none() {
+            self.sel_anchor = Some((self.row, self.col));
+        }
+        self.move_cursor(dr, dc);
+    }
+
+    /// Paste TSV from the system clipboard (e.g. cells copied in
+    /// Excel/Sheets: tabs between columns, newlines between rows),
+    /// filling the grid from the cursor cell right and down. Grows the
+    /// grid when the block overflows it.
+    pub fn paste_tsv(&mut self) {
+        if self.headers.is_empty() {
+            return;
+        }
+        let text = match crate::fs::read_clipboard() {
+            Some(t) if !t.trim().is_empty() => t,
+            _ => {
+                self.message = String::from("Clipboard is empty");
+                return;
+            }
+        };
+        self.paste_text(&text);
+    }
+
+    /// Apply TSV text as a cell block at the cursor (see `paste_tsv`).
+    pub fn paste_text(&mut self, text: &str) {
+        if text.trim().is_empty() || self.headers.is_empty() {
+            self.message = String::from("Clipboard is empty");
+            return;
+        }
+        let block: Vec<Vec<&str>> = text.lines().map(|l| l.split('\t').collect()).collect();
+        let nrows = block.len();
+        let ncols = block.iter().map(|r| r.len()).max().unwrap_or(0);
+        if nrows == 0 || ncols == 0 {
+            self.message = String::from("Clipboard is empty");
+            return;
+        }
+        let (r0, c0) = (self.row, self.col);
+        if matches!(self.kind, SheetKind::Csv) {
+            self.grow_to(r0 + nrows - 1, c0 + ncols - 1);
+            for (dr, line) in block.iter().enumerate() {
+                for (dc, cell) in line.iter().enumerate() {
+                    self.rows[r0 + dr][c0 + dc] = (*cell).to_string();
+                }
+            }
+        } else {
+            for (dr, line) in block.iter().enumerate() {
+                for (dc, cell) in line.iter().enumerate() {
+                    // Workbook-only writes; the display cache rebuilds once
+                    // below. Formulas flags refresh with the reload.
+                    let _ = self.xlsx_write_cell(r0 + dr, c0 + dc, cell);
+                }
+            }
+            let sheet_idx = match &self.kind {
+                SheetKind::Xlsx(st) => st.sheet_idx,
+                SheetKind::Csv => unreachable!(),
+            };
+            self.load_xlsx_sheet(sheet_idx);
+            self.row = r0.min(self.rows.len().saturating_sub(1));
+            self.col = c0.min(self.ncols().saturating_sub(1));
+        }
+        self.sel_anchor = None;
+        self.dirty = true;
+        self.ensure_visible();
+        self.message = if nrows == 1 && ncols == 1 {
+            String::from("Pasted cell")
+        } else {
+            format!("Pasted {nrows}×{ncols} cells")
+        };
+    }
+
+    /// The selected block as ((r0, c0), (r1, c1)) with r0 <= r1, c0 <= c1,
+    /// or `None` when only the cursor cell is selected.
+    pub fn selection_rect(&self) -> Option<((usize, usize), (usize, usize))> {
+        let (ar, ac) = self.sel_anchor?;
+        Some((
+            (ar.min(self.row), ac.min(self.col)),
+            (ar.max(self.row), ac.max(self.col)),
+        ))
+    }
+
+    /// TSV of the selected block (or the cursor cell when nothing is
+    /// selected): tabs between columns, newlines between rows.
+    pub fn selection_tsv(&self) -> Option<String> {
+        if self.rows.is_empty() || self.headers.is_empty() {
+            return None;
+        }
+        let ((r0, c0), (r1, c1)) = self
+            .selection_rect()
+            .unwrap_or(((self.row, self.col), (self.row, self.col)));
+        let mut tsv = String::new();
+        for r in r0..=r1 {
+            for c in c0..=c1 {
+                if c > c0 {
+                    tsv.push('\t');
+                }
+                if let Some(cell) = self.rows.get(r).and_then(|row| row.get(c)) {
+                    tsv.push_str(cell);
+                }
+            }
+            tsv.push('\n');
+        }
+        Some(tsv)
+    }
+
+    /// Copy the selected block (or the cursor cell when nothing is
+    /// selected) to the system clipboard as TSV, so it pastes straight
+    /// into Excel/Sheets as cells.
+    pub fn copy_block(&mut self) {
+        match self.selection_tsv() {
+            Some(tsv) if crate::fs::copy_to_clipboard(&tsv) => {
+                let ((r0, c0), (r1, c1)) = self
+                    .selection_rect()
+                    .unwrap_or(((self.row, self.col), (self.row, self.col)));
+                let n = r1 - r0 + 1;
+                let m = c1 - c0 + 1;
+                self.message = if n == 1 && m == 1 {
+                    String::from("Copied cell")
+                } else {
+                    format!("Copied {n}×{m} cells")
+                };
+            }
+            _ => {
+                self.message = String::from("Clipboard unavailable");
+            }
+        }
+    }
+
+    fn move_cursor(&mut self, dr: isize, dc: isize) {
         if self.rows.is_empty() || self.headers.is_empty() {
             return;
         }
@@ -498,6 +717,7 @@ impl Sheet {
         if self.rows.is_empty() || self.headers.is_empty() {
             return;
         }
+        self.sel_anchor = None;
         if self.col + 1 < self.ncols() {
             self.col += 1;
         } else if self.row + 1 < self.rows.len() {
@@ -697,6 +917,7 @@ impl Sheet {
         if self.rows.is_empty() || self.headers.is_empty() {
             return;
         }
+        self.sel_anchor = None;
         if self.col > 0 {
             self.col -= 1;
         } else if self.row > 0 {
@@ -778,6 +999,7 @@ impl Sheet {
         if let (Some(c), true) = (hit, row < self.rows.len()) {
             self.col = c;
             self.row = row;
+            self.sel_anchor = None;
             self.ensure_visible();
         }
     }
@@ -1059,5 +1281,135 @@ mod tests {
         assert!(sh.find.as_ref().unwrap().not_found);
         assert_eq!(sh.find_bar_text(), "Find: foox — not found");
         std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn selection_rect_pins_anchor_and_clears() {
+        let p = tmpcsv("sel.csv", "a,b,c\n1,2,3\n4,5,6\n");
+        let mut sh = open_sheet(&p).unwrap();
+        assert!(sh.selection_rect().is_none());
+        // Shift+Right, Shift+Down from (0,0): block is (0,0)-(1,1).
+        sh.extend_selection(0, 1);
+        sh.extend_selection(1, 0);
+        assert_eq!(sh.selection_rect(), Some(((0, 0), (1, 1))));
+        assert_eq!(sh.selection_tsv().as_deref(), Some("1\t2\n4\t5\n"));
+        // Plain moves clear the anchor.
+        sh.move_cell(0, 1);
+        assert!(sh.selection_rect().is_none());
+        assert_eq!(sh.selection_tsv().as_deref(), Some("6\n"));
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn paste_text_fills_from_cursor_and_grows() {
+        let p = tmpcsv("paste.csv", "a,b\n1,2\n");
+        let mut sh = open_sheet(&p).unwrap();
+        // Paste a 2x3 block at (0,0): overwrites and grows the grid.
+        sh.paste_text("x\ty\tz\n7\t8\t9");
+        assert_eq!(sh.rows[0], vec!["x", "y", "z"]);
+        assert_eq!(sh.rows[1], vec!["7", "8", "9"]);
+        assert_eq!(sh.ncols(), 3);
+        assert_eq!(sh.headers.len(), 3);
+        assert!(sh.dirty);
+        assert_eq!(sh.message, "Pasted 2×3 cells");
+        // Rows stay rectangular.
+        assert!(sh.rows.iter().all(|r| r.len() == 3));
+        // Paste at the bottom grows rows.
+        sh.row = 5;
+        sh.col = 0;
+        sh.paste_text("new");
+        assert_eq!(sh.rows.len(), 6);
+        assert_eq!(sh.rows[5][0], "new");
+        assert_eq!(sh.message, "Pasted cell");
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn paste_text_empty_is_noop() {
+        let p = tmpcsv("paste2.csv", "a,b\n1,2\n");
+        let mut sh = open_sheet(&p).unwrap();
+        sh.paste_text("   \n");
+        assert!(!sh.dirty);
+        assert_eq!(sh.message, "Clipboard is empty");
+        assert_eq!(sh.rows[0], vec!["1", "2"]);
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn paste_xlsx_roundtrip() {
+        // An xlsx paste writes through the workbook: save and re-read.
+        let dir =
+            std::env::temp_dir().join(format!("fex-sheettest-xlsxpaste-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("p.xlsx");
+        crate::fs::create_file(&dir, "p.xlsx").unwrap();
+        let mut sh = open_sheet(&p).unwrap();
+        sh.paste_text("10\t20\n30\t40");
+        sh.save().unwrap();
+        let sh2 = open_sheet(&p).unwrap();
+        assert_eq!(sh2.rows[0][0], "10");
+        assert_eq!(sh2.rows[0][1], "20");
+        assert_eq!(sh2.rows[1][0], "30");
+        assert_eq!(sh2.rows[1][1], "40");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn find_matches_cells_across_grid() {
+        let p = tmpcsv("findm.csv", "a,b\nfoo,bar\nbaz,foo\n");
+        let mut sh = open_sheet(&p).unwrap();
+        sh.open_find();
+        let key = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        for c in "foo".chars() {
+            sh.find_input(key(c));
+        }
+        let mut m = sh.find_matches();
+        m.sort();
+        assert_eq!(m, vec![(0, 0), (1, 1)]);
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn add_row_and_column_grow_empty_xlsx() {
+        // Regression: umya's insert only shifts existing cells, so on an
+        // empty sheet add_row/add_column visibly did nothing.
+        let dir = std::env::temp_dir().join("fex-test-xlsxgrow");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::fs::create_file(&dir, "t.xlsx").unwrap();
+        let p = dir.join("t.xlsx");
+        let mut sh = open_sheet(&p).unwrap();
+        sh.add_row();
+        assert_eq!(sh.rows.len(), 2);
+        assert_eq!(sh.message, "Added row");
+        sh.add_column("x".to_string());
+        assert_eq!(sh.ncols(), 2);
+        assert_eq!(sh.message, "Added column");
+        assert!(sh.rows.iter().all(|r| r.len() == 2));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn add_row_shifts_data_down_xlsx() {
+        let dir = std::env::temp_dir().join("fex-test-xlsxshift");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::fs::create_file(&dir, "t.xlsx").unwrap();
+        let p = dir.join("t.xlsx");
+        let mut sh = open_sheet(&p).unwrap();
+        sh.paste_text("a\nb\nc");
+        sh.row = 0;
+        sh.add_row();
+        assert_eq!(sh.rows.len(), 4);
+        assert_eq!(sh.rows[0][0], "a");
+        assert_eq!(sh.rows[1][0], "");
+        assert_eq!(sh.rows[2][0], "b");
+        assert_eq!(sh.rows[3][0], "c");
+        // The grid survives a save/reopen round trip.
+        sh.save().unwrap();
+        let sh2 = open_sheet(&p).unwrap();
+        assert_eq!(sh2.rows.len(), 4);
+        assert_eq!(sh2.rows[2][0], "b");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

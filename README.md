@@ -122,6 +122,10 @@ Inside a terminal tab almost every key goes straight to the shell, so
 above still work. The shell is a full pty: colors, prompts, `vim`, `ssh`,
 and full-screen programs all work.
 
+`Shift+PgUp` / `Shift+PgDn` scrolls the shell's scrollback history (the last
+2000 lines, shown as plain text); `End` — or any other key — returns to the
+live view. Long command output stays viewable after it scrolls past.
+
 ### Session restore
 
 Quitting (`q`) saves your tabs, and the next launch brings them back:
@@ -241,7 +245,7 @@ badges.
 | `o` | Open the selected folder — or the selected file's parent folder — in the OS file explorer (Finder on macOS, Explorer on Windows, the default file manager on Linux) |
 | `s` / `S` | Cycle sort key (Name → Size → Modified → Type) / toggle direction (works in column view too) |
 | `.` | Show / hide hidden files |
-| `?` | Help overlay |
+| `?` | Help overlay — tabbed: `1`–`5` jump to a tab, `←`/`→` step between tabs, or click a tab header |
 | `q` / `Esc` | Quit |
 
 Mouse: click a file or folder to select it, double-click to open it (works
@@ -249,6 +253,27 @@ in both list and column views — clicking a row in an earlier column jumps
 there). Scroll wheel moves the selection.
 (Hold `Alt`/`Option` while dragging if your terminal is set to pass mouse
 events to the app and you want the terminal's native text selection.)
+
+### Accessibility
+
+The help overlay's **Accessibility** tab (press `?`, then `5`) holds helpers
+for shaky hands — both off by default, applied immediately, and saved to
+`~/.config/fex/settings`:
+
+| Keys (on the Accessibility tab) | Action |
+|---|---|
+| `d` | Toggle the key-press delay between off and 200 ms |
+| `-` / `+` | Adjust the delay in 50 ms steps (0 = off, max 5000 ms) |
+| `a` | Toggle Alt-required navigation |
+
+The **key-press delay** (debounce) ignores a keypress that lands within the
+delay of the previous one, so an accidental double-hit can't trash, delete,
+or jump somewhere unexpected. It applies to folder navigation only.
+
+**Alt-required navigation** makes arrow keys and single-key shortcuts
+(`e`, `n`, `d`, …) work only while `Alt` is held. `?` and `Esc` always work
+without `Alt`, and `Ctrl` combinations are unaffected — so the help panel
+(and the switch itself) stays reachable.
 
 ### Browsing inside archives
 
@@ -321,9 +346,9 @@ status line instead.
   file, `Esc` cancels). Syntax highlighting picks up the new extension.
 - **Find** — `Ctrl+F` opens a find bar in the message line. The search is a
   case-insensitive substring match and jumps live to the first match at or
-  after the text cursor, wrapping around the buffer; the current match is
-  highlighted in the accent color (bold, so it stays distinct from a mouse
-  selection). `Enter` jumps to the
+  after the text cursor, wrapping around the buffer; every match is
+  highlighted in the accent color, with the current match bold so it stays
+  distinct (and distinct from a mouse selection). `Enter` jumps to the
   next match, `Shift+Enter` to the previous (only where the terminal
   delivers it), and `Esc` (or `Ctrl+C`) closes the bar, leaving the cursor
   on the last match. Typing, `Backspace`/`Delete`, and `←`/`→`/`Home`/`End` edit the
@@ -367,7 +392,10 @@ matching the editor's line numbers).
 | `Tab` / `Shift+Tab` | Next / previous cell |
 | `a` | Add an empty row below the current one |
 | `A` (`Shift+A`) | Add a column after the current one (a popup asks for the column name; blank becomes `colN`) |
-| `Ctrl+F` | Find a cell: case-insensitive substring search over the cell text, jumps live to the first match at/after the current cell (wraps), `Enter` next match, `Shift+Enter` previous, `Esc` closes; shows `Find: <q> [i/N]` |
+| `Ctrl+F` | Find a cell: case-insensitive substring search over the cell text, all matching cells highlight, jumps live to the first match at/after the current cell (wraps), `Enter` next match, `Shift+Enter` previous, `Esc` closes; shows `Find: <q> [i/N]` |
+| `Shift+Arrows` | Select a block of cells (any plain move clears it) |
+| `Ctrl+C` | Copy the selected block (or the current cell) to the system clipboard as tab-separated text — pastes straight into Excel/Sheets as cells |
+| `Ctrl+V` | Paste tab-separated clipboard text (e.g. cells copied in Excel/Sheets) starting at the current cell, extending right and down; the grid grows if needed |
 | `Ctrl+S` / `Ctrl+O` | Save back to the CSV file |
 | `Esc` | Close (asks about unsaved changes first) |
 | Mouse | Click a cell to select it; wheel scrolls |
@@ -382,7 +410,7 @@ tab strip in the footer lists the workbook's sheets.
 |---|---|
 | `[` / `]` | Previous / next sheet |
 | `Enter` | Edit the current cell. Formula cells pre-fill as `=formula`: keep the leading `=` to edit the formula, delete it to replace the cell with a plain value |
-| (same as CSV) | Arrows, `Tab`, `a`, `A` (the name popup is ignored — headers stay letters), `Ctrl+S` / `Ctrl+O`, `Esc`, mouse |
+| (same as CSV) | Arrows, `Tab`, `a`, `A` (the name popup is ignored — headers stay letters), `Shift+Arrows` select, `Ctrl+C` copy, `Ctrl+V` paste, `Ctrl+F` find, `Ctrl+S` / `Ctrl+O`, `Esc`, mouse |
 
 Typed values convert automatically: `25` becomes a number, `TRUE`/`FALSE`
 booleans, anything else text. Cells with a date format display as
