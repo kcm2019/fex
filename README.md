@@ -228,7 +228,7 @@ badges.
 | ↑ / ↓, PgUp / PgDn, Home / End | Move selection |
 | → / Enter | Enter directory · open file in the default app |
 | ← / Backspace | Parent directory |
-| `n` / `N` | New file / new directory |
+| `n` / `N` | New file / new directory (`.xlsx`, `.docx`, `.pptx` are created as valid empty documents that open right away) |
 | `r` | Rename |
 | `m` | Move the selected file(s) to another folder (popup dialog, starts in the current directory) |
 | `X` | Extract the selected archive(s) (`.zip`, `.7z`, `.tar`, `.tar.gz`/`.tgz`) into a new folder named after each archive; refuses password-protected archives and never overwrites existing files |

@@ -322,8 +322,94 @@ pub fn create_file(dir: &Path, name: &str) -> io::Result<()> {
             "already exists",
         ));
     }
-    File::create(path)?;
+    // Office documents are created as valid empty files, not 0-byte blobs,
+    // so they open straight away (in fex and in Word/Excel/PowerPoint).
+    let ext = Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "xlsx" => {
+            let book = umya_spreadsheet::new_file();
+            umya_spreadsheet::writer::xlsx::write(&book, &path)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            Ok(())
+        }
+        "docx" => write_ooxml(&path, &docx_parts()),
+        "pptx" => write_ooxml(&path, &pptx_parts()),
+        _ => {
+            File::create(path)?;
+            Ok(())
+        }
+    }
+}
+
+/// Write a minimal OOXML package (a zip of XML parts): enough for Word /
+/// PowerPoint to open the file as a blank document.
+fn write_ooxml(path: &Path, parts: &[(&str, &str)]) -> io::Result<()> {
+    use std::io::Write as _;
+    let f = File::create(path)?;
+    let mut w = zip::ZipWriter::new(f);
+    let opts = zip::write::SimpleFileOptions::default();
+    for (name, data) in parts {
+        w.start_file(*name, opts)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        w.write_all(data.as_bytes())?;
+    }
+    w.finish()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
     Ok(())
+}
+
+fn docx_parts() -> [(&'static str, &'static str); 3] {
+    [
+        (
+            "[Content_Types].xml",
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#,
+        ),
+        (
+            "_rels/.rels",
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#,
+        ),
+        (
+            "word/document.xml",
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p/></w:body></w:document>"#,
+        ),
+    ]
+}
+
+fn pptx_parts() -> [(&'static str, &'static str); 5] {
+    [
+        (
+            "[Content_Types].xml",
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/><Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/></Types>"#,
+        ),
+        (
+            "_rels/.rels",
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/></Relationships>"#,
+        ),
+        (
+            "ppt/presentation.xml",
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst></p:presentation>"#,
+        ),
+        (
+            "ppt/_rels/presentation.xml.rels",
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/></Relationships>"#,
+        ),
+        (
+            "ppt/slides/slide1.xml",
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/></p:spTree></p:cSld></p:sld>"#,
+        ),
+    ]
 }
 
 /// Create a directory inside `dir`. Errors if the name is taken.
@@ -1112,6 +1198,47 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn create_xlsx_makes_valid_workbook() {
+        let dir = tmpdir("xlsxnew");
+        create_file(&dir, "report.xlsx").unwrap();
+        let p = dir.join("report.xlsx");
+        assert!(p.metadata().unwrap().len() > 0);
+        // Reads back as a real workbook with one sheet.
+        let book = umya_spreadsheet::reader::xlsx::read(&p).unwrap();
+        assert_eq!(book.get_sheet_collection().len(), 1);
+        // Uppercase extension gets the same treatment.
+        create_file(&dir, "DATA.XLSX").unwrap();
+        umya_spreadsheet::reader::xlsx::read(&dir.join("DATA.XLSX")).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn create_docx_pptx_make_valid_packages() {
+        let dir = tmpdir("ooxmlnew");
+        create_file(&dir, "doc.docx").unwrap();
+        create_file(&dir, "deck.pptx").unwrap();
+        for (name, main_part) in [
+            ("doc.docx", "word/document.xml"),
+            ("deck.pptx", "ppt/slides/slide1.xml"),
+        ] {
+            let p = dir.join(name);
+            assert!(p.metadata().unwrap().len() > 0);
+            let mut z = zip::ZipArchive::new(File::open(&p).unwrap()).unwrap();
+            assert!(
+                z.by_name(main_part).is_ok(),
+                "{name} is missing {main_part}"
+            );
+            let mut ct = String::new();
+            z.by_name("[Content_Types].xml")
+                .unwrap()
+                .read_to_string(&mut ct)
+                .unwrap();
+            assert!(ct.contains(main_part), "{name} has a bad content type");
+        }
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

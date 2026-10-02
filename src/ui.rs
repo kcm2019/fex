@@ -1686,7 +1686,7 @@ fn render_help_popup(frame: &mut Frame, ws: &Workspace, area: Rect) {
             "git badges",
             "inside a git repository, each entry's name shows a dim status letter — M modified · A staged/added · D deleted · ? untracked · R renamed; folders show the highest-priority badge among the files under them",
         ),
-        ("n / N", "new file / new directory"),
+        ("n / N", "new file / new directory (.xlsx/.docx/.pptx are created as valid empty documents)"),
         ("r", "rename"),
         ("m", "move the selected file(s) to another folder (popup)"),
         (
