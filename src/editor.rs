@@ -1369,11 +1369,23 @@ impl Editor {
             self.push_undo();
         }
         self.remove_selection();
-        let b = char_idx_to_byte(&self.lines[self.row], self.col);
-        self.lines[self.row].insert(b, ch);
-        self.col += 1;
+        if ch == '\n' {
+            // A paste delivered as individual key events carries real
+            // newlines: split the line like Enter does. (Embedding the
+            // '\n' in the line made big pastes quadratic — every insert
+            // re-scanned one giant line — and corrupted the buffer.)
+            let r = self.row;
+            self.split_line();
+            self.invalidate_hl(r);
+        } else if ch != '\r' {
+            // A lone '\r' is dropped: pasted "\r\n" line endings split on
+            // the '\n', matching insert_text's normalization.
+            let b = char_idx_to_byte(&self.lines[self.row], self.col);
+            self.lines[self.row].insert(b, ch);
+            self.col += 1;
+            self.invalidate_hl(self.row);
+        }
         self.dirty = true;
-        self.invalidate_hl(self.row);
         self.last_insert = Some(Instant::now());
     }
 
@@ -1413,14 +1425,24 @@ impl Editor {
     pub fn newline(&mut self) {
         self.push_undo();
         self.remove_selection();
+        let r = self.row;
+        self.split_line();
+        self.dirty = true;
+        self.invalidate_hl(r);
+        self.ensure_visible();
+    }
+
+    /// Split the current line at the cursor (the Enter half of `newline`,
+    /// without the undo entry, so burst-typing shares one). No
+    /// `ensure_visible`: like the old `insert_char`, per-character scroll
+    /// adjustment would make big pastes quadratic; `newline` (the Enter
+    /// key) still adjusts.
+    fn split_line(&mut self) {
         let b = char_idx_to_byte(&self.lines[self.row], self.col);
         let rest = self.lines[self.row].split_off(b);
         self.lines.insert(self.row + 1, rest);
         self.row += 1;
         self.col = 0;
-        self.dirty = true;
-        self.invalidate_hl(self.row - 1);
-        self.ensure_visible();
     }
 
     pub fn backspace(&mut self) {
@@ -3033,6 +3055,64 @@ mod tests {
         ed.redo();
         assert_eq!(ed.lines[2], "Z!b");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn char_by_char_paste_matches_bulk_insert() {
+        // A paste arriving as individual key events (no bracketed paste, e.g.
+        // under tmux) must produce the same buffer as one bulk insert_text —
+        // newlines split lines instead of embedding in them — and stay fast
+        // (the old path was quadratic in the paste size).
+        use std::time::Instant;
+        let dir = std::env::temp_dir().join(format!("fex-edtest-paste2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("b.txt");
+        std::fs::write(&p, b"ab\ncd\n").unwrap();
+        let big: String = (0..2000)
+            .map(|i| format!("paste line {:05} with some content here\n", i))
+            .collect();
+
+        let mut ed = Editor::open(&p).unwrap();
+        ed.row = 0;
+        ed.col = 1;
+        let t = Instant::now();
+        for ch in big.chars() {
+            ed.insert_char(ch);
+        }
+        let elapsed = t.elapsed();
+
+        let mut ed2 = Editor::open(&p).unwrap();
+        ed2.row = 0;
+        ed2.col = 1;
+        ed2.insert_text(&big);
+
+        assert_eq!(ed.lines, ed2.lines);
+        assert_eq!((ed.row, ed.col), (ed2.row, ed2.col));
+        assert!(
+            elapsed.as_secs() < 2,
+            "char-by-char paste took too long: {:?}",
+            elapsed
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn insert_char_splits_lines_and_drops_lone_cr() {
+        let dir = std::env::temp_dir().join(format!("fex-edtest-cr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("c.txt");
+        std::fs::write(&p, b"ab\n").unwrap();
+        let mut ed = Editor::open(&p).unwrap();
+        ed.col = 1;
+        for ch in "X\nY\r\nZ\rW".chars() {
+            ed.insert_char(ch);
+        }
+        // X splits nothing; \n splits; \r\n splits once (the \r is dropped);
+        // a lone \r is dropped, joining Z and W.
+        assert_eq!(ed.lines, vec!["aX", "Y", "ZWb"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

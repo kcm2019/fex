@@ -61,6 +61,8 @@ pub enum InputKind {
     NewFile,
     NewDir,
     Rename,
+    /// Archive name for `z` (zip the selection).
+    ZipName,
     Filter,
     CsvCell,
     CsvColumn,
@@ -83,6 +85,7 @@ impl InputKind {
             InputKind::NewFile => "New file",
             InputKind::NewDir => "New directory",
             InputKind::Rename => "Rename",
+            InputKind::ZipName => "Create zip",
             InputKind::Filter => "Filter (live — Esc clears)",
             InputKind::Grep => "Find in files",
             InputKind::CsvCell => "Edit cell",
@@ -105,6 +108,9 @@ pub enum Mode {
     Normal,
     Input(InputKind),
     ConfirmDelete,
+    /// "Quit fex?" confirmation shown when Esc has nothing left to
+    /// dismiss, so spamming Esc can't quit by accident.
+    ConfirmQuit,
     Help,
     Editor,
     ConfirmDiscard,
@@ -773,9 +779,10 @@ impl App {
         }
     }
 
-    /// Open the selected folder — or the selected file's parent folder —
-    /// in the OS file explorer (Finder on macOS, Explorer on Windows, the
-    /// default file manager on Linux).
+    /// Reveal the selection in the OS file explorer: a selected file is
+    /// highlighted in its folder (Finder on macOS, Explorer on Windows);
+    /// a selected folder is opened itself. Linux opens the folder (or the
+    /// file's parent folder) in the default file manager.
     pub fn reveal_in_explorer(&mut self) {
         if self.deny_in_archive() {
             return;
@@ -1629,7 +1636,7 @@ impl App {
     pub fn start_input(&mut self, kind: InputKind) {
         if matches!(
             kind,
-            InputKind::NewFile | InputKind::NewDir | InputKind::Rename
+            InputKind::NewFile | InputKind::NewDir | InputKind::Rename | InputKind::ZipName
         ) && self.deny_in_archive()
         {
             return;
@@ -1645,6 +1652,10 @@ impl App {
                     self.input = entry.name.clone();
                     self.cursor = self.input.chars().count();
                 }
+            }
+            InputKind::ZipName => {
+                self.input = self.zip_default_name();
+                self.cursor = self.input.chars().count();
             }
             InputKind::Filter => {
                 self.input = self.filter.clone();
@@ -1720,8 +1731,8 @@ impl App {
         self.mode = Mode::Normal;
         match kind {
             InputKind::NewFile => {
-                if value.is_empty() {
-                    self.status = String::from("Name cannot be empty");
+                if let Some(reason) = fs::invalid_file_name(&value) {
+                    self.status = reason;
                     return;
                 }
                 match fs::create_file(&self.cwd, &value) {
@@ -1734,8 +1745,8 @@ impl App {
                 }
             }
             InputKind::NewDir => {
-                if value.is_empty() {
-                    self.status = String::from("Name cannot be empty");
+                if let Some(reason) = fs::invalid_file_name(&value) {
+                    self.status = reason;
                     return;
                 }
                 match fs::create_dir(&self.cwd, &value) {
@@ -1751,8 +1762,8 @@ impl App {
                 let Some(entry) = self.selected_entry().cloned() else {
                     return;
                 };
-                if value.is_empty() {
-                    self.status = String::from("Name cannot be empty");
+                if let Some(reason) = fs::invalid_file_name(&value) {
+                    self.status = reason;
                     return;
                 }
                 match fs::rename_entry(&entry.path, &value) {
@@ -1762,6 +1773,53 @@ impl App {
                         self.refresh();
                     }
                     Err(e) => self.status = format!("Could not rename: {e}"),
+                }
+            }
+            InputKind::ZipName => {
+                if value.is_empty() {
+                    self.status = String::from("Enter a name for the zip");
+                    return;
+                }
+                let mut name = value.clone();
+                if !name.to_lowercase().ends_with(".zip") {
+                    name.push_str(".zip");
+                }
+                if let Some(reason) = fs::invalid_file_name(&name) {
+                    self.status = reason;
+                    return;
+                }
+                let targets = self.op_targets();
+                if targets.is_empty() {
+                    self.status = String::from("Nothing selected");
+                    return;
+                }
+                let dest = fs::unique_name(&self.cwd, &name);
+                let dest_name = dest
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                match fs::create_zip(&dest, &targets) {
+                    Ok((files, skipped)) => {
+                        let items = if targets.len() == 1 {
+                            String::from("1 item")
+                        } else {
+                            format!("{} items", targets.len())
+                        };
+                        let skip_note = if skipped > 0 {
+                            format!(" ({skipped} skipped)")
+                        } else {
+                            String::new()
+                        };
+                        self.status =
+                            format!("Zipped {items} ({files} files) → {dest_name}{skip_note}");
+                        self.invalidate_git();
+                        self.refresh();
+                    }
+                    Err(e) => {
+                        // Don't leave a partial archive behind.
+                        let _ = std::fs::remove_file(&dest);
+                        self.status = format!("Could not create {dest_name}: {e}");
+                    }
                 }
             }
             InputKind::Filter => {
@@ -1972,6 +2030,35 @@ impl App {
         self.clear_multi();
         self.invalidate_git();
         self.refresh();
+    }
+
+    /// Suggested archive name for the `z` dialog: one target keeps its
+    /// name (a file loses its extension), several targets get
+    /// "archive.zip".
+    fn zip_default_name(&self) -> String {
+        let targets = self.op_targets();
+        if targets.len() == 1 {
+            let t = &targets[0];
+            let stem = if t.is_dir() {
+                t.file_name().map(|n| n.to_string_lossy().into_owned())
+            } else {
+                t.file_stem().map(|n| n.to_string_lossy().into_owned())
+            }
+            .unwrap_or_else(|| "archive".to_string());
+            format!("{stem}.zip")
+        } else {
+            "archive.zip".to_string()
+        }
+    }
+
+    /// Zip the multi-selection (or the cursor file) into a new archive:
+    /// `z` opens a name dialog; the archive lands in the current folder.
+    pub fn zip_selected(&mut self) {
+        if self.op_targets().is_empty() {
+            self.status = "Nothing selected".to_string();
+            return;
+        }
+        self.start_input(InputKind::ZipName);
     }
 
     /// Extract the selected archive(s) (X): each one goes into a new folder
@@ -2343,6 +2430,12 @@ pub struct MoveDialog {
     /// How many files are being moved (for the title line).
     pub count: usize,
     pub message: String,
+    /// Live folder-name filter, typed after pressing `f`.
+    pub filter: String,
+    /// True while the user is typing the filter.
+    pub filtering: bool,
+    /// Folder-list sort; defaults to Name ascending.
+    pub sort: SortOrder,
 }
 
 impl MoveDialog {
@@ -2353,38 +2446,97 @@ impl MoveDialog {
             selected: 0,
             count,
             message: String::new(),
+            filter: String::new(),
+            filtering: false,
+            sort: SortOrder {
+                key: SortKey::Name,
+                ascending: true,
+            },
         };
         dlg.read_dirs();
         dlg
     }
 
     fn read_dirs(&mut self) {
-        let mut dirs: Vec<PathBuf> = Vec::new();
+        let mut dirs: Vec<(PathBuf, u64, Option<SystemTime>)> = Vec::new();
         if let Ok(rd) = std::fs::read_dir(&self.cwd) {
             for e in rd.flatten() {
                 let p = e.path();
-                if p.is_dir() {
-                    dirs.push(p);
+                let md = e.metadata().ok();
+                if md.as_ref().is_some_and(|m| m.is_dir()) {
+                    let (size, modified) = md
+                        .map(|m| (m.len(), m.modified().ok()))
+                        .unwrap_or((0, None));
+                    dirs.push((p, size, modified));
                 }
             }
         }
-        dirs.sort_by(|a, b| a.file_name().cmp(&b.file_name()).then_with(|| a.cmp(b)));
-        self.dirs = dirs;
+        let sort = self.sort;
+        dirs.sort_by(|a, b| {
+            let ord = match sort.key {
+                SortKey::Name => dir_name(&a.0).cmp(&dir_name(&b.0)),
+                SortKey::Size => {
+                    a.1.cmp(&b.1)
+                        .then_with(|| dir_name(&a.0).cmp(&dir_name(&b.0)))
+                }
+                SortKey::Modified => {
+                    a.2.cmp(&b.2)
+                        .then_with(|| dir_name(&a.0).cmp(&dir_name(&b.0)))
+                }
+                // Folders only, so Type groups nothing: same as Name.
+                SortKey::Type => dir_name(&a.0).cmp(&dir_name(&b.0)),
+            };
+            if sort.ascending {
+                ord
+            } else {
+                ord.reverse()
+            }
+        });
+        self.dirs = dirs.into_iter().map(|(p, _, _)| p).collect();
         self.selected = 0;
+        self.clamp_selection();
+    }
+
+    /// Indices into `dirs` matching the live filter (all of them when the
+    /// filter is empty).
+    pub fn visible(&self) -> Vec<usize> {
+        let needle = self.filter.to_lowercase();
+        self.dirs
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| {
+                needle.is_empty()
+                    || p.file_name()
+                        .is_some_and(|n| n.to_string_lossy().to_lowercase().contains(&needle))
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn clamp_selection(&mut self) {
+        let n = self.visible().len();
+        if n == 0 {
+            self.selected = 0;
+        } else if self.selected >= n {
+            self.selected = n - 1;
+        }
     }
 
     fn move_selection(&mut self, delta: i32) {
-        if self.dirs.is_empty() {
+        let n = self.visible().len();
+        if n == 0 {
             return;
         }
-        let n = self.dirs.len() as i32;
-        self.selected = (self.selected as i32 + delta).rem_euclid(n) as usize;
+        self.selected = (self.selected as i32 + delta).rem_euclid(n as i32) as usize;
     }
 
     fn enter_selected(&mut self) {
-        if let Some(d) = self.dirs.get(self.selected).cloned() {
-            self.cwd = d;
-            self.read_dirs();
+        let vis = self.visible();
+        if let Some(&di) = vis.get(self.selected) {
+            if let Some(d) = self.dirs.get(di).cloned() {
+                self.cwd = d;
+                self.read_dirs();
+            }
         }
     }
 
@@ -2396,13 +2548,108 @@ impl MoveDialog {
     }
 
     pub fn key(&mut self, key: KeyEvent) -> MoveAction {
+        // While typing the filter, navigation keys first leave filter mode
+        // (keeping the filter text) so they keep working as usual.
+        if self.filtering {
+            match key.code {
+                KeyCode::Esc => {
+                    self.filtering = false;
+                    self.filter.clear();
+                    self.clamp_selection();
+                    return MoveAction::None;
+                }
+                KeyCode::Enter => {
+                    self.filtering = false;
+                    self.clamp_selection();
+                    return MoveAction::None;
+                }
+                KeyCode::Backspace => {
+                    self.filter.pop();
+                    self.selected = 0;
+                    self.clamp_selection();
+                    return MoveAction::None;
+                }
+                KeyCode::Up => {
+                    self.move_selection(-1);
+                    return MoveAction::None;
+                }
+                KeyCode::Down => {
+                    self.move_selection(1);
+                    return MoveAction::None;
+                }
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    self.filter.push(c);
+                    self.selected = 0;
+                    self.clamp_selection();
+                    return MoveAction::None;
+                }
+                // Ctrl+C cancels the whole dialog like Esc.
+                KeyCode::Char('c') | KeyCode::Char('C')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    return MoveAction::Cancel
+                }
+                _ => {
+                    // Any other key leaves filter mode, keeping the text.
+                    self.filtering = false;
+                    self.clamp_selection();
+                }
+            }
+        }
         match key.code {
-            KeyCode::Esc => return MoveAction::Cancel,
+            // Esc clears an active filter first; only then cancels.
+            KeyCode::Esc => {
+                if !self.filter.is_empty() {
+                    self.filter.clear();
+                    self.clamp_selection();
+                    return MoveAction::None;
+                }
+                return MoveAction::Cancel;
+            }
             // Ctrl+C cancels like Esc — it never quits the app.
             KeyCode::Char('c') | KeyCode::Char('C')
                 if key.modifiers.contains(KeyModifiers::CONTROL) =>
             {
                 return MoveAction::Cancel
+            }
+            KeyCode::Char('f') | KeyCode::Char('F')
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.filter.clear();
+                self.filtering = true;
+                self.selected = 0;
+            }
+            // `/` starts the filter too, matching the browser.
+            KeyCode::Char('/')
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.filter.clear();
+                self.filtering = true;
+                self.selected = 0;
+            }
+            KeyCode::Char('s')
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.sort.cycle_key();
+                self.read_dirs();
+            }
+            KeyCode::Char('S')
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.sort.ascending = !self.sort.ascending;
+                self.read_dirs();
             }
             KeyCode::Up => self.move_selection(-1),
             KeyCode::Down => self.move_selection(1),
@@ -2410,11 +2657,19 @@ impl MoveDialog {
             KeyCode::Left | KeyCode::Backspace => self.go_parent(),
             KeyCode::Home => self.selected = 0,
             KeyCode::End => {
-                self.selected = self.dirs.len().saturating_sub(1);
+                self.selected = self.visible().len().saturating_sub(1);
             }
             KeyCode::Enter => {
-                let Some(dest) = self.dirs.get(self.selected).cloned() else {
-                    self.message = String::from("No folders here — ← to go up");
+                let vis = self.visible();
+                let Some(&di) = vis.get(self.selected) else {
+                    self.message = if self.filter.is_empty() {
+                        String::from("No folders here — ← to go up")
+                    } else {
+                        format!("No folders match \"{}\"", self.filter)
+                    };
+                    return MoveAction::None;
+                };
+                let Some(dest) = self.dirs.get(di).cloned() else {
                     return MoveAction::None;
                 };
                 return MoveAction::Move(dest);
@@ -2423,6 +2678,13 @@ impl MoveDialog {
         }
         MoveAction::None
     }
+}
+
+/// Lowercase folder name for sorting, falling back to the full path.
+fn dir_name(p: &Path) -> String {
+    p.file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_else(|| p.display().to_string().to_lowercase())
 }
 
 /// Messages from network worker threads to the UI.
@@ -5534,6 +5796,111 @@ mod tests {
         app.git = GitState::Pending { dir: other.clone() };
         assert!(!app.poll_git());
         assert!(matches!(&app.git, GitState::Pending { dir: d } if *d == other));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn move_dialog_defaults_to_name_ascending() {
+        let (mut ws, dir) = test_workspace();
+        for name in ["Zebra", "apple", "Mango"] {
+            std::fs::create_dir(dir.join(name)).unwrap();
+        }
+        let app = app0_mut(&mut ws);
+        app.refresh();
+        app.open_move_dialog();
+        let dlg = app.move_dialog.as_ref().unwrap();
+        assert!(matches!(dlg.sort.key, SortKey::Name));
+        assert!(dlg.sort.ascending);
+        let names: Vec<String> = dlg
+            .dirs
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["apple", "Mango", "Zebra"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn move_dialog_filter_and_sort_keys() {
+        let (mut ws, dir) = test_workspace();
+        for name in ["alpha", "beta", "alphabet"] {
+            std::fs::create_dir(dir.join(name)).unwrap();
+        }
+        let app = app0_mut(&mut ws);
+        app.refresh();
+        app.open_move_dialog();
+        let ch = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        // `f` starts the filter; typing narrows the visible list.
+        app.move_dialog_key(ch('f'));
+        assert!(app.move_dialog.as_ref().unwrap().filtering);
+        for c in "alph".chars() {
+            app.move_dialog_key(ch(c));
+        }
+        {
+            let dlg = app.move_dialog.as_ref().unwrap();
+            assert_eq!(dlg.filter, "alph");
+            assert_eq!(dlg.visible().len(), 2);
+        }
+        // Enter leaves filter mode keeping the text; Esc clears it.
+        app.move_dialog_key(key_event(KeyCode::Enter));
+        {
+            let dlg = app.move_dialog.as_ref().unwrap();
+            assert!(!dlg.filtering);
+            assert_eq!(dlg.filter, "alph");
+            assert_eq!(dlg.visible().len(), 2);
+        }
+        // `S` flips direction: name descending now.
+        app.move_dialog_key(ch('S'));
+        {
+            let dlg = app.move_dialog.as_ref().unwrap();
+            assert!(!dlg.sort.ascending);
+            let first = dlg.dirs[0]
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            assert_eq!(first, "beta");
+        }
+        // `s` cycles the key: Size next.
+        app.move_dialog_key(ch('s'));
+        assert!(matches!(
+            app.move_dialog.as_ref().unwrap().sort.key,
+            SortKey::Size
+        ));
+        // Esc clears the filter first (dialog stays open).
+        app.move_dialog_key(key_event(KeyCode::Esc));
+        {
+            let dlg = app.move_dialog.as_ref().unwrap();
+            assert!(dlg.filter.is_empty());
+            assert_eq!(dlg.visible().len(), 3);
+        }
+        // Esc again (no filter left) cancels the dialog.
+        app.move_dialog_key(key_event(KeyCode::Esc));
+        assert!(app.move_dialog.is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn move_dialog_slash_starts_filter_like_f() {
+        let (mut ws, dir) = test_workspace();
+        for name in ["alpha", "beta"] {
+            std::fs::create_dir(dir.join(name)).unwrap();
+        }
+        let app = app0_mut(&mut ws);
+        app.refresh();
+        app.open_move_dialog();
+        let ch = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        // `/` starts the filter just like `f` (browser parity).
+        app.move_dialog_key(ch('/'));
+        assert!(app.move_dialog.as_ref().unwrap().filtering);
+        for c in "alp".chars() {
+            app.move_dialog_key(ch(c));
+        }
+        {
+            let dlg = app.move_dialog.as_ref().unwrap();
+            assert_eq!(dlg.filter, "alp");
+            assert_eq!(dlg.visible().len(), 1);
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

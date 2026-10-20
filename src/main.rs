@@ -17,7 +17,7 @@ use ratatui::{
     crossterm::{
         event::{
             self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
-            EnableMouseCapture, Event, KeyEventKind,
+            EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
         },
         execute,
         terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -56,6 +56,20 @@ fn main() -> io::Result<()> {
     };
     enable_raw_mode()?;
     let mut stdout = io::stdout();
+    // If we ever panic, restore the terminal first: otherwise the user is
+    // left in raw mode on the alternate screen with mouse capture and
+    // bracketed paste still enabled (and the panic message unreadable).
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            io::stdout(),
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        );
+        default_hook(info);
+    }));
     execute!(
         stdout,
         EnterAlternateScreen,
@@ -117,9 +131,22 @@ fn run(
             // arrives as individual key events (no bracketed paste, e.g.
             // under tmux) or fast typing is applied as one update instead
             // of flickering through one redraw per event.
+            let mut burst_chars = 0usize;
             loop {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        // Count plain character keys headed for the editor:
+                        // a paste-sized burst may still be trickling in.
+                        if matches!(key.code, KeyCode::Char(_))
+                            && !key
+                                .modifiers
+                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                            && ws
+                                .active_browser()
+                                .is_some_and(|a| matches!(a.mode, app::Mode::Editor))
+                        {
+                            burst_chars += 1;
+                        }
                         input::handle_key(ws, key)
                     }
                     // Bracketed paste: the terminal delivers a whole paste as one
@@ -136,9 +163,18 @@ fn run(
                 if ws.should_quit {
                     break;
                 }
-                if !event::poll(Duration::ZERO)? {
-                    break;
+                if event::poll(Duration::ZERO)? {
+                    continue;
                 }
+                // A large paste can arrive from the terminal in several
+                // chunks; when the burst looks paste-sized, wait a beat for
+                // the rest before drawing so it lands in one update instead
+                // of visibly stepping through partial states. (Normal
+                // typing never reaches the threshold, so it pays nothing.)
+                if burst_chars >= 64 && event::poll(Duration::from_millis(10))? {
+                    continue;
+                }
+                break;
             }
         } else {
             // No input this tick: pick up files that appeared or vanished

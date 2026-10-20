@@ -233,20 +233,22 @@ badges.
 | → / Enter | Enter directory · open file in the default app |
 | ← / Backspace | Parent directory |
 | `n` / `N` | New file / new directory (`.xlsx`, `.docx`, `.pptx` are created as valid empty documents that open right away) |
-| `r` | Rename |
-| `m` | Move the selected file(s) to another folder (popup dialog, starts in the current directory) |
+| `r` | Rename (names are checked against the OS's filename rules — e.g. `<>:"/\|?*` and reserved names like `CON` on Windows — with a plain message instead of an OS error) |
+| `m` | Move the selected file(s) to another folder (popup dialog, starts in the current directory; `f` or `/` live-filters the folder list with match highlighting, `s`/`S` sorts like the browser, default Name ascending; a `→ Move to:` line always shows the highlighted folder's full path) |
 | `X` | Extract the selected archive(s) (`.zip`, `.7z`, `.tar`, `.tar.gz`/`.tgz`) into a new folder named after each archive; refuses password-protected archives and never overwrites existing files |
+| `z` | Zip the selection into a new archive (acts on the multi-selection too; a name dialog suggests `<name>.zip`) |
 | `Enter` on an archive | Browse inside it in a new read-only tab (see below) |
 | `d` | Move the selection to the trash (asks first) |
 | `D` | Permanently delete the selection (asks first) |
 | `Shift+↑` / `Shift+↓` | Multi-select files — `y` / `x` / `m` / `d` then act on all of them, `Esc` clears |
 | `y` / `x` / `p` or `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / cut / paste files (acts on the multi-selection too) |
 | `Y` | Copy the selected file's full path to the system clipboard |
-| `o` | Open the selected folder — or the selected file's parent folder — in the OS file explorer (Finder on macOS, Explorer on Windows, the default file manager on Linux) |
+| `o` | Reveal the selection in the OS file explorer: a file is highlighted in its folder (`open -R` on macOS, `explorer /select` on Windows); a folder is opened itself |
 | `s` / `S` | Cycle sort key (Name → Size → Modified → Type) / toggle direction (works in column view too) |
 | `.` | Show / hide hidden files |
 | `?` | Help overlay — tabbed: `1`–`5` jump to a tab, `←`/`→` step between tabs, or click a tab header |
-| `q` / `Esc` | Quit |
+| `q` | Quit immediately |
+| `Esc` | Clear selection / filter, or ask "Quit fex?" when there's nothing left to dismiss (so spamming Esc can't quit by accident) |
 
 Mouse: click a file or folder to select it, double-click to open it (works
 in both list and column views — clicking a row in an earlier column jumps

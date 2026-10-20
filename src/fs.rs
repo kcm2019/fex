@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::SystemTime;
 
 #[derive(Debug, Clone)]
@@ -425,6 +425,87 @@ pub fn create_dir(dir: &Path, name: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Check a file/folder name against the current OS's restrictions, so the
+/// rename/new-file dialogs can refuse it with a clear message instead of
+/// failing deep in the OS call. Returns the reason when invalid.
+pub fn invalid_file_name(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return Some(String::from("Name cannot be empty"));
+    }
+    if name.contains('\0') {
+        return Some(String::from("Name cannot contain null characters"));
+    }
+    #[cfg(windows)]
+    {
+        if let Some(reason) = invalid_windows_name(name) {
+            return Some(reason);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        // Unix-likes only forbid '/' (and NUL, checked above); a leading
+        // dot just hides the file, which is allowed.
+        if name.contains('/') {
+            return Some(String::from("Name cannot contain '/'"));
+        }
+    }
+    // A name of only dots resolves to "." or ".." — never a real file.
+    if name.chars().all(|c| c == '.') {
+        return Some(String::from("Name cannot be only dots"));
+    }
+    None
+}
+
+/// The Windows-specific name rules, split out so tests can exercise them
+/// on any platform (only wired in on Windows).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn invalid_windows_name(name: &str) -> Option<String> {
+    // Windows forbids these characters anywhere in a name, control
+    // characters, and trailing dots/spaces (the OS strips those, so the
+    // result wouldn't match what the user typed).
+    const BAD: &[char] = &['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
+    if let Some(c) = name.chars().find(|c| BAD.contains(c) || c.is_control()) {
+        return Some(format!("Name cannot contain '{c}' on Windows"));
+    }
+    if name.ends_with('.') || name.ends_with(' ') {
+        return Some(String::from(
+            "Name cannot end with a dot or space on Windows",
+        ));
+    }
+    // Reserved device names (CON, PRN, AUX, NUL, COM1–9, LPT1–9), with
+    // or without an extension, in any case.
+    let stem = name.split('.').next().unwrap_or("").to_uppercase();
+    let reserved = matches!(
+        stem.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    );
+    if reserved {
+        return Some(format!("\"{stem}\" is a reserved name on Windows"));
+    }
+    None
+}
+
 /// Rename an entry, keeping it in the same directory. Errors if taken.
 pub fn rename_entry(path: &Path, new_name: &str) -> io::Result<()> {
     let parent = path
@@ -547,7 +628,13 @@ pub fn copy_to_clipboard(text: &str) -> bool {
 fn pipe_to_clipboard(cmd: &str, args: &[&str], text: &str) -> bool {
     use std::io::Write;
     use std::process::Stdio;
-    let mut child = match Command::new(cmd).args(args).stdin(Stdio::piped()).spawn() {
+    let mut child = match Command::new(cmd)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
         Ok(c) => c,
         Err(_) => return false,
     };
@@ -604,7 +691,12 @@ pub fn read_clipboard() -> Option<String> {
 pub fn open_with_default(path: &Path) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     {
-        Command::new("open").arg(path).spawn().map(|_| ())
+        Command::new("open")
+            .arg(path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map(|_| ())
     }
     #[cfg(target_os = "windows")]
     {
@@ -612,12 +704,19 @@ pub fn open_with_default(path: &Path) -> io::Result<()> {
         // an empty one before the path.
         Command::new("cmd")
             .args(["/C", "start", "", &path.to_string_lossy()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .map(|_| ())
     }
     #[cfg(target_os = "linux")]
     {
-        Command::new("xdg-open").arg(path).spawn().map(|_| ())
+        Command::new("xdg-open")
+            .arg(path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map(|_| ())
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
@@ -629,36 +728,62 @@ pub fn open_with_default(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Show a file or folder in the OS file explorer: Finder on macOS (`open -R`
-/// reveals a file and selects it; `open` opens a folder), Explorer on
-/// Windows (`/select,` highlights a file), the default file manager on Linux
-/// (`xdg-open` opens the folder itself — or the parent folder for a file,
-/// since `xdg-open` on a file would launch its default app instead).
+/// Show a file or folder in the OS file explorer, with a selected file
+/// highlighted in its folder: Finder on macOS (`open -R` reveals and
+/// selects the file; `open` opens a folder), Explorer on Windows
+/// (`explorer /select,` highlights the file; plain `explorer` opens a
+/// folder), the default file manager on Linux (`xdg-open` opens the folder
+/// itself — or the parent folder for a file, since it has no select flag
+/// and opening a file would launch its default app instead).
 pub fn reveal_in_explorer(path: &Path) -> io::Result<()> {
-    // Always open a folder: the selected directory itself, or the parent
-    // directory when a file is selected. The per-file reveal/select flags
-    // (`open -R`, `explorer /select,`) proved unreliable — on some machines
-    // they landed in the Documents folder instead of on the file.
-    let dir = if path.is_dir() {
-        path
-    } else {
-        path.parent().unwrap_or(path)
-    };
+    // The OS reveal flags need an absolute path: with a relative one they
+    // silently landed in the wrong folder on some machines (e.g. opening
+    // Documents instead of revealing the file).
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let is_dir = path.is_dir();
     #[cfg(target_os = "macos")]
     {
-        Command::new("open").arg(dir).spawn().map(|_| ())
+        let mut cmd = Command::new("open");
+        if !is_dir {
+            cmd.arg("-R");
+        }
+        cmd.arg(&abs)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map(|_| ())
     }
     #[cfg(target_os = "windows")]
     {
-        Command::new("explorer").arg(dir).spawn().map(|_| ())
+        let mut cmd = Command::new("explorer");
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        if is_dir {
+            cmd.arg(&abs);
+        } else {
+            // One argument, no space after the comma: that's the syntax
+            // Explorer expects. Passed as a single argv element, so spaces
+            // in the path are safe without extra quoting.
+            cmd.arg(format!("/select,{}", abs.display()));
+        }
+        cmd.spawn().map(|_| ())
     }
     #[cfg(target_os = "linux")]
     {
-        Command::new("xdg-open").arg(dir).spawn().map(|_| ())
+        let dir = if is_dir {
+            abs
+        } else {
+            abs.parent().map(Path::to_path_buf).unwrap_or(abs)
+        };
+        Command::new("xdg-open")
+            .arg(dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map(|_| ())
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
-        let _ = dir;
+        let _ = abs;
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "unsupported platform",
@@ -760,6 +885,109 @@ fn sevenz_err(e: sevenz_rust::Error) -> io::Error {
 /// written. Password-protected archives fail with a readable error.
 pub fn extract_archive(src: &Path, dest: &Path) -> io::Result<(usize, usize)> {
     extract_archive_filtered(src, dest, None)
+}
+
+/// Create a zip archive at `dest` containing `targets`. Files land at the
+/// archive root under their own name; directories are added recursively as
+/// `<dir-name>/<relative-path>`, including empty directories so they
+/// survive the round trip. `dest` itself is never added (so zipping a
+/// folder that will contain the archive is safe) and symlinks are skipped.
+/// Entries are written in sorted order so the archive is deterministic.
+/// Returns (files added, entries skipped).
+pub fn create_zip(dest: &Path, targets: &[PathBuf]) -> io::Result<(usize, usize)> {
+    let dest_canon = fs::canonicalize(dest).ok();
+    let is_dest = |p: &Path| {
+        p == dest
+            || dest_canon
+                .as_ref()
+                .is_some_and(|d| fs::canonicalize(p).ok().as_ref() == Some(d))
+    };
+    let f = File::create(dest)?;
+    let mut w = zip::ZipWriter::new(f);
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    let mut counts = (0usize, 0usize);
+    let mut sorted: Vec<&PathBuf> = targets.iter().collect();
+    sorted.sort();
+    for target in sorted {
+        if is_dest(target) {
+            counts.1 += 1;
+            continue;
+        }
+        let root = target
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "item".to_string());
+        let meta = fs::symlink_metadata(target)
+            .map_err(|e| other_err(format!("{}: {e}", target.display())))?;
+        if meta.file_type().is_symlink() {
+            counts.1 += 1;
+        } else if meta.is_dir() {
+            add_dir_to_zip(&mut w, opts, target, &root, &is_dest, &mut counts)?;
+        } else if meta.is_file() {
+            add_file_to_zip(&mut w, opts, target, &root, &mut counts)?;
+        } else {
+            counts.1 += 1;
+        }
+    }
+    w.finish().map_err(other_err)?;
+    Ok(counts)
+}
+
+fn add_file_to_zip(
+    w: &mut zip::ZipWriter<File>,
+    opts: zip::write::SimpleFileOptions,
+    path: &Path,
+    name: &str,
+    counts: &mut (usize, usize),
+) -> io::Result<()> {
+    w.start_file(name, opts).map_err(other_err)?;
+    let mut f = File::open(path).map_err(|e| other_err(format!("{}: {e}", path.display())))?;
+    std::io::copy(&mut f, w)?;
+    counts.0 += 1;
+    Ok(())
+}
+
+fn add_dir_to_zip(
+    w: &mut zip::ZipWriter<File>,
+    opts: zip::write::SimpleFileOptions,
+    dir: &Path,
+    prefix: &str,
+    is_dest: &impl Fn(&Path) -> bool,
+    counts: &mut (usize, usize),
+) -> io::Result<()> {
+    // The directory entry itself, so empty folders survive the round trip.
+    w.add_directory(format!("{prefix}/"), opts)
+        .map_err(other_err)?;
+    let mut entries: Vec<PathBuf> = fs::read_dir(dir)
+        .map_err(|e| other_err(format!("{}: {e}", dir.display())))?
+        .map(|e| e.map(|e| e.path()))
+        .collect::<Result<_, _>>()?;
+    entries.sort();
+    for path in entries {
+        if is_dest(&path) {
+            counts.1 += 1;
+            continue;
+        }
+        let name = format!(
+            "{prefix}/{}",
+            path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "item".to_string())
+        );
+        let meta = fs::symlink_metadata(&path)
+            .map_err(|e| other_err(format!("{}: {e}", path.display())))?;
+        if meta.file_type().is_symlink() {
+            counts.1 += 1;
+        } else if meta.is_dir() {
+            add_dir_to_zip(w, opts, &path, &name, is_dest, counts)?;
+        } else if meta.is_file() {
+            add_file_to_zip(w, opts, &path, &name, counts)?;
+        } else {
+            counts.1 += 1;
+        }
+    }
+    Ok(())
 }
 
 /// Extract an archive into `dest` (created when missing). When `prefix`
@@ -1801,5 +2029,118 @@ mod tests {
     fn parse_git_porcelain_empty_and_garbage() {
         assert!(parse_git_porcelain("").is_empty());
         assert!(parse_git_porcelain("\0\0").is_empty());
+    }
+
+    #[test]
+    fn invalid_file_name_rejects_bad_names() {
+        // Portable rules (active on this platform too).
+        assert!(invalid_file_name("").is_some());
+        assert!(invalid_file_name("a/b").is_some());
+        assert!(invalid_file_name("...").is_some());
+        assert!(invalid_file_name("a\0b").is_some());
+        assert!(invalid_file_name("normal-name_1.txt").is_none());
+        assert!(invalid_file_name(".hidden").is_none());
+        assert!(
+            invalid_file_name("weird: name?.txt").is_none() || cfg!(windows),
+            "colon/question-mark only rejected on Windows"
+        );
+        // Windows rules, exercised directly on any platform.
+        assert!(invalid_windows_name("a<b").is_some());
+        assert!(invalid_windows_name("a|b").is_some());
+        assert!(invalid_windows_name("a\u{7}b").is_some());
+        assert!(invalid_windows_name("trailing.").is_some());
+        assert!(invalid_windows_name("trailing ").is_some());
+        assert!(invalid_windows_name("CON").is_some());
+        assert!(invalid_windows_name("con.txt").is_some());
+        assert!(invalid_windows_name("COM1").is_some());
+        assert!(invalid_windows_name("lpt9.dat").is_some());
+        assert!(invalid_windows_name("console.txt").is_none());
+        assert!(invalid_windows_name("ordinary name.txt").is_none());
+    }
+
+    fn zip_names(dest: &Path) -> Vec<String> {
+        let mut ar = zip::ZipArchive::new(File::open(dest).unwrap()).unwrap();
+        let mut names: Vec<String> = (0..ar.len())
+            .map(|i| ar.by_index(i).unwrap().name().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn zip_content(dest: &Path, name: &str) -> String {
+        let mut ar = zip::ZipArchive::new(File::open(dest).unwrap()).unwrap();
+        let mut f = ar.by_name(name).unwrap();
+        let mut s = String::new();
+        std::io::Read::read_to_string(&mut f, &mut s).unwrap();
+        s
+    }
+
+    #[test]
+    fn create_zip_roundtrips_files() {
+        let dir = tmpdir("zipfiles");
+        fs::write(dir.join("a.txt"), "hello").unwrap();
+        fs::write(dir.join("b.txt"), "world").unwrap();
+        let dest = dir.join("out.zip");
+        let (files, skipped) = create_zip(&dest, &[dir.join("a.txt"), dir.join("b.txt")]).unwrap();
+        assert_eq!((files, skipped), (2, 0));
+        assert_eq!(zip_names(&dest), vec!["a.txt", "b.txt"]);
+        assert_eq!(zip_content(&dest, "a.txt"), "hello");
+        assert_eq!(zip_content(&dest, "b.txt"), "world");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn create_zip_includes_dirs_recursively_and_empty_dirs() {
+        let dir = tmpdir("zipdirs");
+        let sub = dir.join("photos");
+        fs::create_dir_all(sub.join("nested")).unwrap();
+        fs::create_dir_all(dir.join("empty")).unwrap();
+        fs::write(sub.join("a.jpg"), "data").unwrap();
+        fs::write(sub.join("nested").join("b.jpg"), "more").unwrap();
+        fs::write(dir.join("notes.txt"), "hi").unwrap();
+        let dest = dir.join("out.zip");
+        let (files, skipped) = create_zip(&dest, &[sub, dir.join("notes.txt")]).unwrap();
+        assert_eq!((files, skipped), (3, 0));
+        assert_eq!(
+            zip_names(&dest),
+            vec![
+                "notes.txt",
+                "photos/",
+                "photos/a.jpg",
+                "photos/nested/",
+                "photos/nested/b.jpg",
+            ]
+        );
+        // The selected empty dir is NOT in the targets here; check it is
+        // kept when selected explicitly.
+        let dest2 = dir.join("out2.zip");
+        create_zip(&dest2, &[dir.join("empty")]).unwrap();
+        assert_eq!(zip_names(&dest2), vec!["empty/"]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn create_zip_never_includes_dest_itself() {
+        let dir = tmpdir("zipself");
+        let sub = dir.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("f.txt"), "x").unwrap();
+        // The archive lives inside the folder being zipped.
+        let dest = sub.join("sub.zip");
+        let (files, skipped) = create_zip(&dest, &[sub.clone()]).unwrap();
+        assert_eq!((files, skipped), (1, 1));
+        let names = zip_names(&dest);
+        assert_eq!(names, vec!["sub/", "sub/f.txt"]);
+        assert!(!names.iter().any(|n| n.contains("sub.zip")));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn create_zip_missing_target_errors() {
+        let dir = tmpdir("zipmissing");
+        let dest = dir.join("out.zip");
+        let err = create_zip(&dest, &[dir.join("nope.txt")]).unwrap_err();
+        assert!(err.to_string().contains("nope.txt"), "err was {err}");
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

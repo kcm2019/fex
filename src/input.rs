@@ -67,6 +67,16 @@ pub fn handle_key(ws: &mut Workspace, mut key: KeyEvent) {
         ws.handle_shell_key(key);
         return;
     }
+    // Ctrl+J is the traditional Enter alias. In raw mode crossterm parses a
+    // 0x0A byte as Ctrl+J (not Enter), so a paste arriving as individual
+    // key events (no bracketed paste, e.g. under tmux) would otherwise lose
+    // every newline. Normalize it before anything else sees the key.
+    // (Shell tabs return above, so a shell still receives the real Ctrl+J.)
+    if key.modifiers == KeyModifiers::CONTROL
+        && matches!(key.code, KeyCode::Char('j') | KeyCode::Char('J'))
+    {
+        key = KeyEvent::new(KeyCode::Enter, KeyModifiers::empty());
+    }
     let Some(mode) = ws.active_browser().map(|app| app.mode) else {
         return;
     };
@@ -142,6 +152,18 @@ pub fn handle_key(ws: &mut Workspace, mut key: KeyEvent) {
                 handle_confirm(app, key);
             }
         }
+        Mode::ConfirmQuit => match key.code {
+            // A deliberate yes quits; spamming Esc just closes the dialog.
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter | KeyCode::Char('q') => {
+                ws.should_quit = true;
+            }
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                if let Some(app) = ws.active_browser_mut() {
+                    app.mode = Mode::Normal;
+                }
+            }
+            _ => {}
+        },
         Mode::Editor => {
             if let Some(app) = ws.active_browser_mut() {
                 handle_editor(app, key);
@@ -907,7 +929,12 @@ fn handle_normal(ws: &mut Workspace, key: KeyEvent) {
                     app.status.clear();
                     false
                 }
-                Some(app) if app.filter.is_empty() => true,
+                Some(app) if app.filter.is_empty() => {
+                    // Nothing left to dismiss: ask before quitting so a
+                    // run of Esc presses can't exit by accident.
+                    app.mode = Mode::ConfirmQuit;
+                    false
+                }
                 Some(app) => {
                     app.clear_filter();
                     false
@@ -991,6 +1018,8 @@ fn handle_normal(ws: &mut Workspace, key: KeyEvent) {
         KeyCode::Char('m') => app.open_move_dialog(),
         // X extracts archives; lowercase x still cuts.
         KeyCode::Char('X') if !ctrl => app.extract_selected(),
+        // z zips the selection (or cursor file) into a new archive.
+        KeyCode::Char('z') if !ctrl => app.zip_selected(),
         KeyCode::Char('Y') => app.copy_path(),
         KeyCode::Char('C') if !ctrl => app.copy_preview_text(),
         KeyCode::Char('e') => app.open_editor(),
@@ -1205,6 +1234,27 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_j_acts_as_enter_for_pasted_newlines() {
+        // In raw mode crossterm parses a 0x0A byte as Ctrl+J (not Enter), so
+        // a paste arriving as individual key events would lose every
+        // newline. Ctrl+J is normalized to Enter before dispatch.
+        let (mut ws, dir) = test_app();
+        browser_mut(&mut ws).open_editor();
+        assert!(matches!(browser(&ws).mode, Mode::Editor));
+        {
+            let ed = browser_mut(&mut ws).editor.as_mut().unwrap();
+            ed.row = 0;
+            ed.col = 5; // end of "hello"
+        }
+        handle_key(&mut ws, ctrl('j'));
+        let ed = browser(&ws).editor.as_ref().unwrap();
+        assert_eq!(ed.lines[0], "hello");
+        assert_eq!(ed.lines[1], "");
+        assert_eq!((ed.row, ed.col), (1, 0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn search_and_view_keys() {
         let (mut ws, dir) = test_app();
         // f enters search mode; typing narrows to the file.
@@ -1320,6 +1370,73 @@ mod tests {
             browser(&ws).mode
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn z_opens_zip_dialog_and_creates_archive() {
+        let (mut ws, dir) = test_app();
+        // a.txt is the selected entry; z opens the name dialog.
+        handle_key(&mut ws, key(KeyCode::Char('z'), KeyModifiers::NONE));
+        assert!(matches!(browser(&ws).mode, Mode::Input(InputKind::ZipName)));
+        // Suggested name is the file stem + .zip.
+        assert_eq!(browser(&ws).input, "a.zip");
+        // Accept it.
+        handle_key(&mut ws, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(browser(&ws).mode, Mode::Normal));
+        assert!(dir.join("a.zip").exists(), "archive was not created");
+        assert!(
+            browser(&ws).status.contains("Zipped 1 item"),
+            "status was {:?}",
+            browser(&ws).status
+        );
+        // The archive round-trips through the reader.
+        let mut ar = zip::ZipArchive::new(std::fs::File::open(dir.join("a.zip")).unwrap()).unwrap();
+        assert_eq!(ar.len(), 1);
+        assert_eq!(ar.by_index(0).unwrap().name(), "a.txt");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn q_quits_from_browser() {
+        let (mut ws, _dir) = test_app();
+        assert!(matches!(browser(&ws).mode, Mode::Normal));
+        handle_key(&mut ws, key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(ws.should_quit, "q did not set should_quit");
+    }
+
+    #[test]
+    fn esc_asks_before_quitting() {
+        let (mut ws, _dir) = test_app();
+        let esc = || key(KeyCode::Esc, KeyModifiers::NONE);
+        // Nothing to dismiss: Esc opens the quit confirmation, it does
+        // not quit.
+        handle_key(&mut ws, esc());
+        assert!(!ws.should_quit);
+        assert!(matches!(browser(&ws).mode, Mode::ConfirmQuit));
+        // Spamming Esc just toggles the dialog; it can never quit.
+        handle_key(&mut ws, esc());
+        assert!(!ws.should_quit);
+        assert!(matches!(browser(&ws).mode, Mode::Normal));
+        handle_key(&mut ws, esc());
+        assert!(matches!(browser(&ws).mode, Mode::ConfirmQuit));
+        assert!(!ws.should_quit);
+        // n cancels.
+        handle_key(&mut ws, key(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(!ws.should_quit);
+        assert!(matches!(browser(&ws).mode, Mode::Normal));
+        // y quits.
+        handle_key(&mut ws, esc());
+        handle_key(&mut ws, key(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(ws.should_quit);
+    }
+
+    #[test]
+    fn esc_quit_confirm_enter_quits() {
+        let (mut ws, _dir) = test_app();
+        handle_key(&mut ws, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(browser(&ws).mode, Mode::ConfirmQuit));
+        handle_key(&mut ws, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(ws.should_quit);
     }
 
     #[test]

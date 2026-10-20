@@ -144,6 +144,7 @@ pub fn render(frame: &mut Frame, ws: &mut Workspace) {
     match app.mode {
         Mode::Input(kind) => render_input_popup(frame, app, kind, content),
         Mode::ConfirmDelete => render_confirm_popup(frame, app, content),
+        Mode::ConfirmQuit => render_quit_popup(frame, ws, content),
         Mode::Help => render_help_popup(frame, ws, content),
         Mode::Normal
         | Mode::Editor
@@ -946,7 +947,6 @@ fn render_save_dialog(frame: &mut Frame, app: &App, area: Rect) {
             Constraint::Min(3),
             Constraint::Length(1),
             Constraint::Length(1),
-            Constraint::Length(1),
         ])
         .split(inner);
 
@@ -1037,6 +1037,39 @@ fn render_save_dialog(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Move-to-folder dialog: like the save dialog but with no name field —
 /// Enter moves the files into the highlighted folder.
+/// Split `name` into (before, match, after) around the first
+/// case-insensitive occurrence of `needle`. Returns `None` when there is
+/// no match, or when case folding would make the byte ranges unreliable
+/// (so callers simply skip highlighting instead of slicing wrong).
+fn split_match<'a>(name: &'a str, needle: &str) -> Option<(&'a str, &'a str, &'a str)> {
+    if needle.is_empty() {
+        return None;
+    }
+    let lneedle = needle.to_lowercase();
+    let start = name.to_lowercase().find(&lneedle)?;
+    let end = start + lneedle.len();
+    if end > name.len() || !name.is_char_boundary(start) || !name.is_char_boundary(end) {
+        return None;
+    }
+    if name[start..end].to_lowercase() != lneedle {
+        return None;
+    }
+    Some((&name[..start], &name[start..end], &name[end..]))
+}
+
+/// Shorten `s` to fit `w` columns, cutting from the left with an ellipsis.
+/// Char-boundary safe.
+fn truncate_left(s: &str, w: usize) -> String {
+    if s.len() <= w {
+        return s.to_string();
+    }
+    let mut start = s.len().saturating_sub(w.saturating_sub(1));
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…{}", &s[start..])
+}
+
 fn render_move_dialog(frame: &mut Frame, app: &App, area: Rect) {
     let th = app.theme();
     let Some(dlg) = app.move_dialog.as_ref() else {
@@ -1063,6 +1096,8 @@ fn render_move_dialog(frame: &mut Frame, app: &App, area: Rect) {
             Constraint::Min(3),
             Constraint::Length(1),
             Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
         ])
         .split(inner);
 
@@ -1082,42 +1117,107 @@ fn render_move_dialog(frame: &mut Frame, app: &App, area: Rect) {
         chunks[0],
     );
 
-    // Directory list, kept scrolled so the selection stays visible.
+    // Directory list (live-filtered), kept scrolled so the selection stays
+    // visible.
     let list_h = chunks[1].height as usize;
     let start = if dlg.selected + 1 > list_h.max(1) {
         dlg.selected + 1 - list_h.max(1)
     } else {
         0
     };
-    let rows: Vec<Line> = dlg
-        .dirs
+    let vis = dlg.visible();
+    let accent_bold = Style::default().fg(th.accent).add_modifier(Modifier::BOLD);
+    let rows: Vec<Line> = vis
         .iter()
         .enumerate()
         .skip(start)
         .take(list_h)
-        .map(|(i, d)| {
+        .map(|(i, &di)| {
+            let d = &dlg.dirs[di];
             let name = d
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| d.display().to_string());
             let label = format!("{}/", name);
-            if i == dlg.selected {
-                Line::from(vec![
-                    Span::styled(
-                        "▸ ",
-                        Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        label,
-                        Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-                    ),
-                ])
+            let selected = i == dlg.selected;
+            let prefix = if selected { "▸ " } else { "  " };
+            let prefix_style = if selected {
+                accent_bold
             } else {
-                Line::from(format!("  {}", label))
+                Style::default()
+            };
+            let base_style = if selected {
+                accent_bold
+            } else {
+                Style::default()
+            };
+            // While a filter is active, highlight the matching part of
+            // each folder name so it's clear why the row is shown.
+            let mut spans = vec![Span::styled(prefix, prefix_style)];
+            if !dlg.filter.is_empty() {
+                if let Some((before, hit, after)) = split_match(&label, &dlg.filter) {
+                    let hit_style = if selected {
+                        accent_bold.add_modifier(Modifier::UNDERLINED)
+                    } else {
+                        accent_bold
+                    };
+                    spans.push(Span::styled(before.to_string(), base_style));
+                    spans.push(Span::styled(hit.to_string(), hit_style));
+                    spans.push(Span::styled(after.to_string(), base_style));
+                    return Line::from(spans);
+                }
             }
+            spans.push(Span::styled(label, base_style));
+            Line::from(spans)
         })
         .collect();
-    frame.render_widget(Paragraph::new(rows), chunks[1]);
+    if rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "  (no matches)",
+                Style::default().fg(th.dim),
+            ))),
+            chunks[1],
+        );
+    } else {
+        frame.render_widget(Paragraph::new(rows), chunks[1]);
+    }
+
+    // Destination line: the full path of the highlighted folder, so it's
+    // unmistakable where Enter will move the file(s).
+    let dest_line = match vis.get(dlg.selected).and_then(|&di| dlg.dirs.get(di)) {
+        Some(d) => {
+            let mut path = d.display().to_string();
+            if !path.ends_with('/') {
+                path.push('/');
+            }
+            let show = truncate_left(&path, chunks[2].width as usize - "→ Move to: ".len());
+            Line::from(vec![
+                Span::styled("→ Move to: ", accent_bold),
+                Span::styled(show, accent_bold),
+            ])
+        }
+        None => Line::from(Span::styled(
+            "→ Move to: (no folder selected)",
+            Style::default().fg(th.dim),
+        )),
+    };
+    frame.render_widget(Paragraph::new(dest_line), chunks[2]);
+
+    // Filter + sort status line.
+    let mut status = vec![Span::styled(
+        format!("Sort: {}", dlg.sort.label()),
+        Style::default().fg(th.dim),
+    )];
+    if dlg.filtering || !dlg.filter.is_empty() {
+        let caret = if dlg.filtering { "▏" } else { "" };
+        status.push(Span::styled("   ", Style::default()));
+        status.push(Span::styled(
+            format!("Filter: {}{}", dlg.filter, caret),
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(status)), chunks[3]);
 
     // Message line (prompts and errors).
     let msg_style = if dlg.message.starts_with("Cannot") {
@@ -1127,15 +1227,15 @@ fn render_move_dialog(frame: &mut Frame, app: &App, area: Rect) {
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(dlg.message.clone(), msg_style))),
-        chunks[2],
+        chunks[4],
     );
 
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "↑↓ select · → open dir · ← up · Enter move here · Esc cancel",
+            "↑↓ select · → open dir · ← up · Enter move here · f or / filter · s/S sort · Esc cancel",
             Style::default().fg(th.dim),
         ))),
-        chunks[3],
+        chunks[5],
     );
 }
 
@@ -1392,6 +1492,35 @@ fn render_confirm_popup(frame: &mut Frame, app: &App, area: Rect) {
                 " Confirm delete "
             })
             .style(Style::default().fg(th.danger)),
+    );
+    frame.render_widget(confirm, popup);
+}
+
+/// "Quit fex?" confirmation: Esc with nothing left to dismiss lands here
+/// instead of exiting, so a run of Esc presses can't quit by accident.
+fn render_quit_popup(frame: &mut Frame, ws: &Workspace, area: Rect) {
+    let th = ws.theme();
+    let popup = centered_rect(50, 22, area);
+    frame.render_widget(Clear, popup);
+    let n = ws.tabs.len();
+    let tabs = if n == 1 {
+        String::from("1 tab open")
+    } else {
+        format!("{n} tabs open")
+    };
+    let text = vec![
+        Line::from(format!("Quit fex? ({tabs})")),
+        Line::from(""),
+        Line::from(Span::styled(
+            "y / Enter / q: quit    n / Esc: keep going",
+            Style::default().fg(th.dim),
+        )),
+    ];
+    let confirm = Paragraph::new(text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Quit ")
+            .style(Style::default().fg(th.accent)),
     );
     frame.render_widget(confirm, popup);
 }
@@ -1858,6 +1987,10 @@ fn help_browser_lines(th: &Theme, show_line_numbers: bool) -> Vec<Line<'static>>
             "X",
             "extract the selected archive(s) into a new folder named after each archive (inside an archive tab: extract the selected file or folder next to the archive)",
         ),
+        (
+            "z",
+            "zip the selection into a new archive (acts on the multi-selection too; asks for the archive name)",
+        ),
         ("d", "move the selection to the trash (asks first)"),
         ("D", "permanently delete the selection (asks first)"),
         (
@@ -1895,10 +2028,17 @@ fn help_browser_lines(th: &Theme, show_line_numbers: bool) -> Vec<Line<'static>>
         ),
         ("Ctrl+G then n / p", "next / previous tab"),
         ("click tab", "switch tabs with the mouse"),
-        ("o", "open the selected folder (or a file's parent folder) in the OS file explorer"),
+        (
+            "o",
+            "reveal in the OS file explorer: a file is highlighted in its folder, a folder is opened itself",
+        ),
         ("?", "this help"),
-        ("q / Esc", "quit"),
-        ("Ctrl+C", "quit (from dialogs)"),
+        ("q", "quit"),
+        (
+            "Esc",
+            "clear selection / filter, or ask before quitting (never quits by accident)",
+        ),
+        ("Ctrl+C", "cancel (never quits the app)"),
         (
             "mouse",
             "click selects a file/folder · double-click opens it · click+drag or Shift+arrows selects text in the editor",
@@ -2153,5 +2293,29 @@ mod tests {
             .join("\n");
         assert!(text.contains(th.name), "got:\n{text}");
         assert!(text.contains("line numbers: off"), "got:\n{text}");
+    }
+
+    #[test]
+    fn split_match_finds_case_insensitive_spans() {
+        assert_eq!(
+            split_match("Documents/", "doc"),
+            Some(("", "Doc", "uments/"))
+        );
+        assert_eq!(
+            split_match("my-photos/", "PHO"),
+            Some(("my-", "pho", "tos/"))
+        );
+        assert_eq!(split_match("abc/", ""), None);
+        assert_eq!(split_match("abc/", "z"), None);
+        assert_eq!(split_match("ab/", "abc"), None);
+    }
+
+    #[test]
+    fn truncate_left_keeps_char_boundaries() {
+        assert_eq!(truncate_left("abcdef", 10), "abcdef");
+        assert_eq!(truncate_left("abcdef", 6), "abcdef");
+        assert_eq!(truncate_left("abcdef", 4), "…def");
+        // Multibyte chars are never split.
+        assert_eq!(truncate_left("héllo wörld", 6), "…örld");
     }
 }
