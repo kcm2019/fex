@@ -1396,7 +1396,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let hints = if app.archive.is_some() {
         "↑↓ move · Enter open folder · ← back · X extract selection · Esc close tab · archives are read-only · ? help"
     } else {
-        "↑↓ move · →/Enter open · ← back · / filter · f find · Ctrl+F find in files · 1/2 list/columns · P preview · e edit · o explorer · n new · r rename · m move · X extract · d trash · D delete · y/x/p copy/cut/paste · Y path · C preview text · s sort · . hidden · * fav · F favorites · G network · ? help · q quit"
+        "↑↓ move · →/Enter open · ← back · / filter · f find · Ctrl+F find in files · 1/2 list/columns · P preview · e edit · o/O explorer · n new · r rename · m move · X extract · d trash · D delete · y/x/p copy/cut/paste · Y path · C preview text · s sort · . hidden · * fav · F favorites · G network · ? help · q quit"
     };
     let mut spans = vec![Span::styled(hints, Style::default().fg(theme.dim))];
     if !app.multi.is_empty() {
@@ -2029,8 +2029,8 @@ fn help_browser_lines(th: &Theme, show_line_numbers: bool) -> Vec<Line<'static>>
         ("Ctrl+G then n / p", "next / previous tab"),
         ("click tab", "switch tabs with the mouse"),
         (
-            "o",
-            "reveal in the OS file explorer: a file is highlighted in its folder, a folder is opened itself",
+            "o / O",
+            "reveal in the OS file explorer: the item's exact folder opens and a file is highlighted in it; a folder is opened itself",
         ),
         ("?", "this help"),
         ("q", "quit"),

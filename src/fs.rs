@@ -728,19 +728,73 @@ pub fn open_with_default(path: &Path) -> io::Result<()> {
     }
 }
 
+/// The exact on-disk path of `path`, resolved so the OS file explorer is
+/// handed the highlighted item's real folder: the path is made absolute,
+/// then its *parent folder* is canonicalized (resolving `..`, `.` and
+/// symlinked folders). The item's own name is re-appended untouched, so
+/// highlighting a symlink still reveals the symlink in its own folder
+/// rather than jumping to the link target's folder.
+fn exact_path(path: &Path) -> PathBuf {
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    match (abs.parent(), abs.file_name()) {
+        (Some(parent), Some(name)) => match parent.canonicalize() {
+            Ok(real_parent) => real_parent.join(name),
+            Err(_) => abs,
+        },
+        _ => abs,
+    }
+}
+
+/// Normalize a path for Windows Explorer's command line: backslash
+/// separators throughout (Explorer's `/select,` parsing rejects forward
+/// slashes) and no `\\?\` verbatim prefix (canonicalized paths carry one;
+/// Explorer doesn't understand it). `\\?\UNC\server\share` maps back to
+/// `\\server\share`. Pure string work, unit-tested on every platform.
+#[allow(dead_code)] // exercised by tests everywhere; called on Windows only
+fn windows_explorer_path(path: &Path) -> String {
+    let s = path.display().to_string();
+    let s = if let Some(unc) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        s
+    };
+    s.replace('/', r"\")
+}
+
+/// The Explorer `/select,` argument for a file: the path quoted, the flag
+/// itself not. Explorer parses `/select,"C:\folder\file.txt"`; wrapping
+/// the *whole* argument in quotes (what a normal argv pass does whenever
+/// the path contains a space) makes it fall back to opening Documents.
+#[allow(dead_code)] // exercised by tests everywhere; called on Windows only
+fn windows_select_arg(path: &Path) -> String {
+    format!("/select,\"{}\"", windows_explorer_path(path))
+}
+
 /// Show a file or folder in the OS file explorer, with a selected file
 /// highlighted in its folder: Finder on macOS (`open -R` reveals and
 /// selects the file; `open` opens a folder), Explorer on Windows
-/// (`explorer /select,` highlights the file; plain `explorer` opens a
+/// (`explorer /select,"…"` highlights the file; plain `explorer` opens a
 /// folder), the default file manager on Linux (`xdg-open` opens the folder
 /// itself — or the parent folder for a file, since it has no select flag
 /// and opening a file would launch its default app instead).
-pub fn reveal_in_explorer(path: &Path) -> io::Result<()> {
-    // The OS reveal flags need an absolute path: with a relative one they
-    // silently landed in the wrong folder on some machines (e.g. opening
-    // Documents instead of revealing the file).
-    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    let is_dir = path.is_dir();
+/// Returns the folder the explorer was asked to show (the folder itself
+/// for a directory selection, the containing folder for a file).
+pub fn reveal_in_explorer(path: &Path) -> io::Result<PathBuf> {
+    // The OS reveal flags need the item's exact folder: a relative path
+    // resolves against the process cwd (not necessarily the folder fex is
+    // browsing), and an unresolved parent can land the explorer in the
+    // wrong folder (e.g. opening Documents instead of revealing the file).
+    let abs = exact_path(path);
+    let is_dir = abs.is_dir();
+    let folder = if is_dir {
+        abs.clone()
+    } else {
+        abs.parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| abs.clone())
+    };
     #[cfg(target_os = "macos")]
     {
         let mut cmd = Command::new("open");
@@ -751,39 +805,34 @@ pub fn reveal_in_explorer(path: &Path) -> io::Result<()> {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .map(|_| ())
+            .map(|_| folder)
     }
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
         let mut cmd = Command::new("explorer");
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
         if is_dir {
-            cmd.arg(&abs);
+            cmd.raw_arg(format!("\"{}\"", windows_explorer_path(&abs)));
         } else {
-            // One argument, no space after the comma: that's the syntax
-            // Explorer expects. Passed as a single argv element, so spaces
-            // in the path are safe without extra quoting.
-            cmd.arg(format!("/select,{}", abs.display()));
+            // Raw command line, not argv: Explorer wants /select,"<path>"
+            // with only the path quoted (see windows_select_arg).
+            cmd.raw_arg(windows_select_arg(&abs));
         }
-        cmd.spawn().map(|_| ())
+        cmd.spawn().map(|_| folder)
     }
     #[cfg(target_os = "linux")]
     {
-        let dir = if is_dir {
-            abs
-        } else {
-            abs.parent().map(Path::to_path_buf).unwrap_or(abs)
-        };
         Command::new("xdg-open")
-            .arg(dir)
+            .arg(&folder)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .map(|_| ())
+            .map(|_| folder)
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
-        let _ = abs;
+        let _ = folder;
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "unsupported platform",
@@ -1681,6 +1730,75 @@ mod tests {
         assert!(d.is_dir && !d.is_hidden);
         let h = entries.iter().find(|e| e.name == ".hidden").unwrap();
         assert!(!h.is_dir && h.is_hidden);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // -- reveal in explorer -------------------------------------------------
+
+    #[test]
+    fn exact_path_resolves_parent_but_keeps_item_name() {
+        let dir = tmpdir("exact");
+        let sub = dir.join("sub");
+        fs::create_dir(&sub).unwrap();
+        create_file(&sub, "file.txt").unwrap();
+        let real_root = dir.canonicalize().unwrap();
+        // `..` and `.` in the folder part resolve to the item's real folder.
+        let messy = sub.join("..").join("sub").join(".").join("file.txt");
+        assert_eq!(exact_path(&messy), real_root.join("sub").join("file.txt"));
+        // An already-exact path passes through unchanged.
+        assert_eq!(
+            exact_path(&sub.join("file.txt")),
+            real_root.join("sub").join("file.txt")
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn windows_explorer_path_strips_verbatim_and_uses_backslashes() {
+        // Pure string helper: fed Windows-style paths on every platform.
+        assert_eq!(
+            windows_explorer_path(Path::new(r"\\?\C:\Users\Kurt\My Files\a.txt")),
+            r"C:\Users\Kurt\My Files\a.txt"
+        );
+        assert_eq!(
+            windows_explorer_path(Path::new(r"\\?\UNC\server\share\a.txt")),
+            r"\\server\share\a.txt"
+        );
+        assert_eq!(
+            windows_explorer_path(Path::new("C:/Users/Kurt/file.txt")),
+            r"C:\Users\Kurt\file.txt"
+        );
+    }
+
+    #[test]
+    fn windows_select_arg_quotes_only_the_path() {
+        // Spaces in the path must not get the whole argument quoted:
+        // Explorer only parses /select,"<path>".
+        assert_eq!(
+            windows_select_arg(Path::new(r"C:\Users\Kurt\My Files\a.txt")),
+            r#"/select,"C:\Users\Kurt\My Files\a.txt""#
+        );
+        assert_eq!(
+            windows_select_arg(Path::new(r"\\?\D:\work\file.rs")),
+            r#"/select,"D:\work\file.rs""#
+        );
+    }
+
+    #[test]
+    fn reveal_reports_the_folder_it_opens() {
+        let dir = tmpdir("reveal");
+        let sub = dir.join("sub");
+        fs::create_dir(&sub).unwrap();
+        create_file(&sub, "file.txt").unwrap();
+        let real_sub = sub.canonicalize().unwrap();
+        // Where an explorer can be spawned, it must be aimed at the
+        // file's own folder (and at the folder itself for a directory).
+        if let Ok(folder) = reveal_in_explorer(&sub.join("file.txt")) {
+            assert_eq!(folder, real_sub);
+        }
+        if let Ok(folder) = reveal_in_explorer(&sub) {
+            assert_eq!(folder, real_sub);
+        }
         fs::remove_dir_all(&dir).unwrap();
     }
 

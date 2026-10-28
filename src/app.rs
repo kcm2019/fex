@@ -792,8 +792,16 @@ impl App {
             return;
         };
         match fs::reveal_in_explorer(&entry.path) {
-            Ok(()) => {
-                self.status = format!("Opened {} in the file explorer", entry.name);
+            Ok(folder) => {
+                self.status = if entry.is_dir {
+                    format!("Opened {} in the file explorer", folder.display())
+                } else {
+                    format!(
+                        "Opened {} in the file explorer · {} selected",
+                        folder.display(),
+                        entry.name
+                    )
+                };
             }
             Err(e) => {
                 self.status = format!("Could not open the file explorer: {e}");

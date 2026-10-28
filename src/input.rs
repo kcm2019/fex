@@ -1025,7 +1025,7 @@ fn handle_normal(ws: &mut Workspace, key: KeyEvent) {
         KeyCode::Char('e') => app.open_editor(),
 
         // Reveal the selected file/folder in the OS file explorer.
-        KeyCode::Char('o') => app.reveal_in_explorer(),
+        KeyCode::Char('o') | KeyCode::Char('O') => app.reveal_in_explorer(),
 
         // Network: discover SMB devices on the LAN and mount their shares.
         KeyCode::Char('G') => app.open_network(),
@@ -1810,6 +1810,18 @@ mod tests {
     fn o_key_reveals_in_explorer() {
         let (mut ws, dir) = test_app();
         handle_key(&mut ws, key(KeyCode::Char('o'), KeyModifiers::empty()));
+        let status = browser(&ws).status.clone();
+        assert!(
+            status.starts_with("Opened ") || status.starts_with("Could not open"),
+            "unexpected status: {status}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn shift_o_key_also_reveals_in_explorer() {
+        let (mut ws, dir) = test_app();
+        handle_key(&mut ws, key(KeyCode::Char('O'), KeyModifiers::SHIFT));
         let status = browser(&ws).status.clone();
         assert!(
             status.starts_with("Opened ") || status.starts_with("Could not open"),

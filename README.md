@@ -243,7 +243,7 @@ badges.
 | `Shift+↑` / `Shift+↓` | Multi-select files — `y` / `x` / `m` / `d` then act on all of them, `Esc` clears |
 | `y` / `x` / `p` or `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / cut / paste files (acts on the multi-selection too) |
 | `Y` | Copy the selected file's full path to the system clipboard |
-| `o` | Reveal the selection in the OS file explorer: a file is highlighted in its folder (`open -R` on macOS, `explorer /select` on Windows); a folder is opened itself |
+| `o` / `O` | Reveal the selection in the OS file explorer: the item's exact folder is opened and a file is highlighted in it (`open -R` on macOS, `explorer /select,"<path>"` on Windows); a folder is opened itself |
 | `s` / `S` | Cycle sort key (Name → Size → Modified → Type) / toggle direction (works in column view too) |
 | `.` | Show / hide hidden files |
 | `?` | Help overlay — tabbed: `1`–`5` jump to a tab, `←`/`→` step between tabs, or click a tab header |
