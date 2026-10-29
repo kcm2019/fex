@@ -1,0 +1,28 @@
+[package]
+name = "fex"
+version = "0.1.0"
+edition = "2021"
+description = "A terminal file explorer written in Rust"
+license = "MIT"
+
+[dependencies]
+ratatui = "0.29"
+chrono = "0.4"
+csv = "1.3"
+pdf-extract = "0.12.1"
+pulldown-cmark = "0.13.4"
+portable-pty = "0.8"
+vt100 = "0.15"
+mdns-sd = "0.21.4"
+sysinfo = "0.39.6"
+umya-spreadsheet = "3"
+# default-features off: the full set pulls zstd-sys, which needs a C
+# cross-compiler for the Windows GNU target. deflate (+ stored) covers
+# the archives we extract; encrypted entries are refused, not decrypted.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# Pure-Rust XML reader/writer for the .docx editor (word/document.xml).
+quick-xml = "0.37"
+sevenz-rust = "0.6"
+tar = "0.4"
+flate2 = "1"
+trash = "5.2.9"
